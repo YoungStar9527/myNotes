@@ -556,3 +556,9 @@ gossip协议包含多种消息，包括ping,pong,meet,fail,等等
 ### 5.3.4 与哨兵比较
 
 ​	整个流程跟哨兵相比，非常类似，所以说，redis cluster功能强大，直接集成了replication和sentinal的功能
+
+
+
+林镇锋是个沙雕!!!
+
+![image-20210527212244528](RedisCluster.assets/image-20210527212244528.png)
