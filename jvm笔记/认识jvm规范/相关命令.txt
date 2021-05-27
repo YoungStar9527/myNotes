@@ -1,0 +1,2 @@
+运行asm代码工具
+java -cp .\lib\* org.objectweb.asm.util.ASMifier .\Cc.class

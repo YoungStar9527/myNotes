@@ -1,0 +1,17 @@
+statd.policy文件内容(jdk13版本)
+grant codebase "jrt:/jdk.jstatd" {
+	permission java.security.AllPermission;
+};
+grant codebase "jrt:/jdk.internal.jvmstat" {
+	permission java.security.AllPermission;
+};
+
+执行jstatd指令
+./jstatd -J-Djava.rmi.server.hostname=192.168.31.101 -J-Djava.security.policy=./statd.policy -p 1099 &
+
+-J-Djava.security.policy 为statd.policy的路径
+
+
+用命令： netstat -ntlp 找到 jstatd 需要的端口,再开启对应端口
+firewall-cmd --zone=public --add-port=38689/tcp --permanent 
+firewall-cmd --zone=public --query-port=80/tcp
