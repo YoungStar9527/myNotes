@@ -16,11 +16,11 @@
 
 ​	redis cluster
 
-​	支撑N个redis master node，每个master node都可以挂载多个slave node 读写分离的架构，对于每个master来说，写就写到master，然后读就从mater对应的slave去读
+​	支撑N个redis master node，每个master node都可以挂载多个slave node 的架构，对于每个master来说，写就写到master，然后读就从mater对应的slave去读
 
-​	高可用，因为每个master都有salve节点，那么如果mater挂掉，redis cluster这套机制，就会自动将某个slave切换成masterredis cluster（多master +读写分离＋高可用)
+​	高可用，因为每个master都有salve节点，那么如果mater挂掉，redis cluster这套机制，就会自动将某个slave切换成masterredis cluster（多master＋高可用)
 
-​	我们只要基于redis cluster去搭建redis集群即可，不需要手工去搭建replication复制+主从架构+读写分离+哨兵集群+高可用
+​	我们只要基于redis cluster去搭建redis集群即可，不需要手工去搭建replication复制+主从架构+哨兵集群+高可用
 
 ## 1.4、redis cluster  vs replication + sentinal
 
