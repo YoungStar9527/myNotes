@@ -557,3 +557,42 @@ gossip协议包含多种消息，包括ping,pong,meet,fail,等等
 
 ​	整个流程跟哨兵相比，非常类似，所以说，redis cluster功能强大，直接集成了replication和sentinal的功能
 
+# 6 redis cluster使用注意点
+
+​	hash_tag可以将多个key强制分配到一个节点上，它的操作时间=1次网络时间+n次命令时间。
+
+​	具体方法为：选定某一个tag，比如test，然后将它用大括号{}括起来，粘贴到key里面。比如key1和key2，这两个key有可能分配到不同的node。但是，如果是{test}key1和{test}key2，redis集群在判断时，就会取出大括号里面的字符串作为hashtag来计算节点。因此，{test}key1和{test}key2会被分配到一个节点中
+
+使用大括号（槽(slot)按照大括号中的key进行分配）
+
+**redis3.2.5高版本支持大括号内分配slot(未验证低版本是否可行)**
+
+```java
+Long msetnx = jedisCluster.mset(
+                "{blogauthor}11", "xjx",
+                "{blogauthor}22", "大数据库",
+                "{blogauthor}33", "略略略略略",
+                "{blogauthor}44", "123");
+```
+
+不加大括号
+
+```Java
+Long msetnx = jedisCluster.mset(
+                "{blogauthor}11", "xjx",
+                "{blogauthor}22", "大数据库",
+                "{blogauthor}33", "略略略略略",
+                "{blogauthor}44", "123");
+```
+
+​	不加则会抛出异常No way to dispatch this command to Redis Cluster because keys have different slots.意思就是批量操作key，在不同的槽(slot)，无法进行一次性操作
+
+![image-20210602204431125](RedisCluster.assets/image-20210602204431125.png)
+
+![image-20210602204241926](RedisCluster.assets/image-20210602204241926.png)
+
+引用：
+
+​	https://blog.csdn.net/qq_30431719/article/details/81121688
+
+​	https://blog.csdn.net/weixin_34334744/article/details/92088324
