@@ -172,3 +172,65 @@ mset,mget,msetnx 为批量操作key，m->multi的意思
     }
 ```
 
+## 3.5 社交网站的网址点击追踪机制/hash相关命令
+
+​	hset,hget,hincrBy等
+
+​	完整代码见 com.star.jvm.demo.redis.hash.ShortUrlDemo
+
+​	社交网站（微博）一般会把你发表的一些微博里的长连接转换为短连接，这样可以利用短连接进行点击数量追踪，然后再让你进入短连接对应的长连接地址里去，所以可以利用hash数据结构去实现网址点击追踪机制
+
+**为什么使用短连接来实现点击追踪**
+
+​	1 原始url链接可能过长，短连接比较精简
+
+​	2 某个用户发表的微博中的链接使用短连接追踪可靠性更高（因为不同的用户发表的微博的链接地址可能相同，而短连接生成是唯一的）
+
+​	3 原始url连接字符比较复杂，各种不同情况的字符都可能会有，作为key不太靠谱，而使用短连接作为key相对可靠很多
+
+使用
+
+​	**核心代码**
+
+```java
+private static final String[] X36_ARRAY = "0,1,2,3,4,5,6,7,8,9,A,B,C,D,E,F,G,H,I,J,K,L,M,N,O,P,Q,R,S,T,U,V,W,X,Y,Z".split(",");   
+	/**
+     * 获取短连接网址
+     * 每次调用都生成新的短连接地址，新的短连接地址和参数url绑定
+     * url地址和短连接生成没有关系，同一个url重复调用该方法，也会生成新的短连接，造成不同的短连接指向同一个url
+     * @param url
+     * @return
+     */
+    public String getShortUrl(String url) {
+        long shortUrlSeed = jedis.incr("short_url_seed");
+
+        StringBuffer buffer = new StringBuffer();
+        //利用redis的incr自增长，然后10进制转36进制，接着hset存放在hash数据结构里，再提供一个映射转换的hget获取方法
+        while(shortUrlSeed > 0) {
+            buffer.append(X36_ARRAY[(int)(shortUrlSeed % 36)]);
+            shortUrlSeed = shortUrlSeed / 36;
+        }
+        String shortUrl = buffer.reverse().toString();
+        //重置对应key的访问次数
+        jedis.hset("short_url_access_count", shortUrl, "0");
+        //关联短连接和url,每次新生成的短连接关联url
+        //放在url_mapping中的hash结构内，url_mapping对应的数据相当于java的一个HashMap实例
+        jedis.hset("url_mapping", shortUrl, url);
+        return shortUrl;
+    }
+	
+    /**
+     * 给短连接地址进行访问次数的增长
+     * 每调用一次+1
+     * @param shortUrl
+     */
+    public void incrementShortUrlAccessCount(String shortUrl) {
+        //value设置为多少每次调用就增加多少
+        jedis.hincrBy("short_url_access_count", shortUrl, 1);
+    }
+```
+
+
+
+
+
