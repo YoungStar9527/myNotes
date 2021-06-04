@@ -230,7 +230,53 @@ private static final String[] X36_ARRAY = "0,1,2,3,4,5,6,7,8,9,A,B,C,D,E,F,G,H,I
     }
 ```
 
+## 3.6 博客代码重构/批量操作/hash操作
 
+​	发布/修改/查看/查看次数/点赞次数 等操作提取方法重构
 
+​	利用mset,mget等批量操作或者,hset,hget等hash操作都可以实现代码重构
 
+​	完整代码见 com.star.jvm.demo.redis.hash.BlogDemo
+
+```java
+	/**
+     * 发表一篇博客
+     */
+    public boolean publishBlog(long id, Map<String, String> blog) {
+        //hexists判断key中的键是否存在，存在title说明该博客已经发表过
+        if(jedis.hexists("article::" + id, "title")) {
+            return false;
+        }
+        blog.put("content_length", String.valueOf(blog.get("content").length()));
+
+        jedis.hmset("article::" + id, blog);
+
+        return true;
+    }
+
+    /**
+     * 查看一篇博客
+     * @param id
+     * @return
+     */
+    public Map<String, String> findBlogById(long id) {
+        //hgetAll一次性拿出对应的map结构数据
+        Map<String, String> blog = jedis.hgetAll("article::" + id);
+        incrementBlogViewCount(id);
+        return blog;
+    }
+    /**
+     * 增加博客浏览次数
+     * @param id
+     */
+    public void incrementBlogViewCount(long id) {
+        jedis.hincrBy("article::" + id, "view_count", 1);
+    }
+```
+
+hash的数据结构比较适合放java对象，hash键值对对应java对象中属性和值
+
+getrange，setrange，append等，对字符串的复杂操作hash是不支持的
+
+**PS:hash不可以设置hashkey的过期时间**
 
