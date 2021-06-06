@@ -150,11 +150,11 @@ sdown到odown转换的条件很简单，如果一个哨兵在指定时间内，�
 
 ### 2.5.2 哨兵集群的自动发现机制
 
-​	哨兵互相之间的发现，是通过redis的pub/sub系统实现的，每个哨兵都会往 _ sentinel _ :hello这个channel里发送一个消息，这时候所有其他哨兵都可以销费到这个消息，并感知到其他的哨兵的存在
+​	哨兵互相之间的发现，是通过redis的pub/sub系统实现的，每个哨兵都会往 _ sentinel _ :hello这个channel里发送一个消息，这时候所有其他哨兵都可以消费到这个消息，并感知到其他的哨兵的存在
 
 ​	每隔两秒钟，每个哨兵都会往自己监控的某个master+slaves对应的 _ sentinel _ :hello channel里发送一个消息，内容是自己的host、ip和runid还有对这个master的监控配置
 
-​	每个哨兵也会去监听自己监控的每个master+slaves对应的_ sentinel _:hello chanmel，然后去感知到同样在监听这个 master+slaves的其他哨兵的存在每个哨兵还会跟其他哨兵交换对master的监拉配置，互相进行监控配置的同步
+​	每个哨兵也会去监听自己监控的每个master+slaves对应的_ sentinel _:hello  channel，然后去感知到同样在监听这个 master+slaves的其他哨兵的存在每个哨兵还会跟其他哨兵交换对master的监拉配置，互相进行监控配置的同步
 
 ​	**PS:哨兵监听的端口未开发时，初始化时能发现其他哨兵，但是过了超时时间后，哨兵之间会出现sdown**
 
@@ -174,14 +174,14 @@ sdown到odown转换的条件很简单，如果一个哨兵在指定时间内，�
 
 ​	(2) slave优先级
 
-​	(3)复制offset
+​	(3) 复制offset
 
 ​	(4) run id
 
 ​	如果一个slave跟master断开连接已经超过了down-after-milliseconds的10倍，外加master宕机的时长，那么slave就被认为不适合选举为master(down-after-milliseconds * 10) + milliseconds_since_master_is_in_SDOMN_state
 接下来会对slave进行排序
 
-​	(1)按照slave优先级进行排序，slave priority越低，优先级就越高
+​	(1) 按照slave优先级进行排序，slave priority越低，优先级就越高
 
 ​	(2）如果slave priority相同，那么看replica offset，哪个slave复制了越多的数据，offset越靠后，优先级就越高
 

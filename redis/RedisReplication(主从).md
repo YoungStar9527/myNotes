@@ -54,7 +54,7 @@ redis主从架构 ->读写分离架构 ->可支持水平扩展的读高并发架
 
 ## 2.2、master持久化对于主从架构的安全保障的意义
 
-​	如果采用了主从架构，那么建议**必须开启master node的持久化**!
+​	如果采用了主从架构，那么建议**必须开启master node的持久化**
 
 ​	不建议用slave node作为master node的数据热备，因为那样的话，如果你关掉master的持久化，可能在master宕机重启的时候数据是空的，然后可能一经过复制，salve node数据也丢了
 
@@ -74,7 +74,7 @@ redis主从架构 ->读写分离架构 ->可支持水平扩展的读高并发架
 
 ​	当启动一个slave node的时候，它会发送一个PSYNC命令给master node
 
-​	如果达是slave move重新连接master move，那么master move仅仅会复制给slave部分缺少的数据，否则如果是slave node第一次连接master node，那么会触发一次full resynchronization
+​	如果这是slave move重新连接master move，那么master move仅仅会复制给slave部分缺少的数据，否则如果是slave node第一次连接master node，那么会触发一次full resynchronization
 
 ​	开始full resynchronization的时候，master会启动一个后台线程，开始生成一份RDB快照文件，同时还会将从客户增收到的所有写全会缓存在内存中。RDB文件生成完毕之后， master 会将这个RDB发送给slave， slave会先写入本地磁盘，然后再从本地磁盘加载到内存中。然后master会将内存中缓存的写命令发送给slave， slave也会同步这些数据。
 
@@ -134,7 +134,7 @@ repl-diskless-sync-delay 5
 ​	(1) master和slave都会维护一个offset slave每秒都会上报自己的offset给master，同时master也会保存每个slave的offset
 这个倒不是说特定就用在全量复制的，主要是master和slave都要知道各自的数据的offset，才能知道互相之间的数据不一致的情况
 
-​	(2) backlog master node有一个backlog，驮认是1MB大小 master node给slave node复制数据时，也会将数据在backlog中同步写一份backlog主要是用来做全量复制中断候的增量复制的
+​	(2) backlog master node有一个backlog，驮认是1MB大小 master node给slave node复制数据时，也会将数据在backlog中同步写一份backlog主要是用来做全量复制中断后的增量复制的
 
 ​	(3) master run id
 

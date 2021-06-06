@@ -280,3 +280,104 @@ getrange，setrange，append等，对字符串的复杂操作hash是不支持的
 
 **PS:hash不可以设置hashkey的过期时间**
 
+## 3.7 基于令牌的登录会话机制/hash操作
+
+​	用户每次登陆都需要持有令牌token，通过redis验证token是否存在等，如果token存在则通过登录。	通过hash记录所有用户的登录token，并在对应hash属性中设置超时时间。
+
+完整代码见 com.star.jvm.demo.redis.hash.SessionDemo
+
+```java
+    /**
+     * 模拟的登录方法
+     * @param username
+     * @param password
+     * @return
+     */
+    public String login(String username, String password) {
+        // 基于用户名和密码去登录
+        System.out.println("基于用户名和密码登录：" + username + ", " + password);
+        Random random = new Random();
+        long userId = random.nextInt() * 100;
+        // 登录成功之后，生成一块令牌
+        String token = UUID.randomUUID().toString().replace("-", "");
+        // 基于令牌和用户id去初始化用户的session
+        initSession(userId, token);
+        // 返回这个令牌给用户
+        return token;
+    }
+
+    /**
+     * 用户登录成功之后，初始化一个session
+     * @param userId
+     * @param token
+     */
+    public void initSession(long userId, String token) {
+        SimpleDateFormat dateFormat = new SimpleDateFormat(
+                "yyyy-MM-dd HH:mm:ss");
+
+        Calendar calendar = Calendar.getInstance();
+        calendar.setTime(new Date());
+        calendar.add(Calendar.HOUR, 24);
+        Date expireTime = calendar.getTime();
+
+        jedis.hset("sessions",
+                "session::" + token, String.valueOf(userId));
+        jedis.hset("sessions::expire_time",
+                "session::" + token, dateFormat.format(expireTime));
+    }
+```
+
+
+
+## 3.8 秒杀活动下的公平队列抢购机制/list操作
+
+​	秒杀系统有很多实现方案，其中有一种技术方案，就是对所有涌入系统的秒杀抢购请求，都放入redis的一个list数据结构里去，进行公平队列排队，然后入队之后就等待秒杀结果，专门搞一个消费者从list里按顺序获取抢购请求，按顺序进行库存扣减，扣减成功了就让你抢购成功
+
+​	对于抢购请求入队列，就用**lpush** list request就可以了，然后对于出队列进行抢购，就用**rpop** list就可以了，**lpush**就是左边推入，**rpush**就是右边推入，**lpop**就是左边弹出，rpop就是右边弹出
+
+​	所以你**lpush+rpop**，就是做了一个左边推入和右边弹出的先入先出的公平队列
+
+​	完整代码见 com.star.jvm.demo.redis.list.SecKillDemo
+
+```java
+    /**
+     * 秒杀抢购请求入队
+     * @param secKillRequest
+     */
+    public void enqueueSecKillRequest(String secKillRequest) {
+        jedis.lpush("sec_kill_request_queue", secKillRequest);
+    }
+
+    /**
+     * 秒杀抢购请求出队
+     * @return
+     */
+    public String dequeueSecKillRequest() {
+        return jedis.rpop("sec_kill_request_queue");
+    }
+
+    public static void main(String[] args) throws Exception {
+        SecKillDemo demo = new SecKillDemo();
+
+        for(int i = 0; i < 10; i++) {
+            demo.enqueueSecKillRequest("第" + (i + 1) + "个秒杀请求");
+        }
+
+        while(true) {
+            String secKillRequest = demo.dequeueSecKillRequest();
+
+            if(secKillRequest == null
+                    || "null".equals(secKillRequest)
+                    || "".equals(secKillRequest)) {
+                break;
+            }
+
+            System.out.println(secKillRequest);
+        }
+    }
+```
+
+## 3.9 OA系统中代办事项列表管理
+
+lindex，lset，linsert，ltrim，lrem
+
