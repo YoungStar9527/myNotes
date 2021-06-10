@@ -65,15 +65,10 @@ mvn help:system
 快速构建maven项目
 
 ```shell
-mvn archetype:generate 
-#快速构建maven项目 下面对应包名,id等需要指定，但是一起输入会pom文件错误·
--DgroupId=com.zhss.maven 
--DartifactId=maven-first-app 
--DarchetypeArtifactId=maven
--archetype
--quickstart 
--DinteractiveMode=false
-##########################
+mvn archetype:generate    -DgroupId=com.zhss.maven     -DartifactId=maven-first-app     -DarchetypeArtifactId=maven   -archetype         -quickstart  -DinteractiveMode=false
+#快速构建maven项目 下面对应包名,id等需要指定，组合命令的情况，需要在cmd命令行中运行组合命令，如果是在powershell中需要在后续命令加双引号(双引号不是很稳定，最好还是用cmd执行)
+#运行后续组合命令不能换行，换行相当于下一个命令了，就不是组合命令
+mvn archetype:generate    "-DgroupId=com.zhss.maven     -DartifactId=maven-first-app     -DarchetypeArtifactId=maven   -archetype         -quickstart  -DinteractiveMode=false"
 java -cp target/maven-first-app-1.0-SNAPSHOT.jar com.zhss.maven.App
 #执行jar包
 
@@ -245,3 +240,181 @@ mvn dependency:tree
 （4）具体用什么命令和配置去解决
 
 用mvn dependency:tree找出所有依赖关系，再用exclusion将低版本包排除
+
+# 3 扩展
+
+**maven-model-builder 查看maven基础配置**
+
+![image-20210609071325795](maven小知识.assets/image-20210609071325795.png)
+
+![image-20210609071245677](maven小知识.assets/image-20210609071245677.png)
+
+**PS:maven/nexus索引就是pom对应相关定位信息，将相关定位信息索引就能更快加载包(相当于pom文件定位信息关联本地仓库/远程仓库的jar包位置，就是索引),本地有包，pom文件找不到就是索引失效了，idea可以通过reload project的方式(转圈)手动更新索引**
+
+# 4 mvn命令的说明
+
+```shell
+mvn clean package：
+#清理、编译、测试、打包
+
+mvn clean install：
+#清理、编译、测试、打包、安装到本地仓库，比如你自己负责了3个工程的开发，互相之间有依赖，那么如果你开发好其中一个工程，需要在另外一个工程中引用它，此时就需要将开发好的工程jar包安装到本地仓库，然后才可以在另外一个工程声明对它的依赖，此时会直接取用本地仓库中的jar包
+
+mvn clean deploy：
+#清理、编译、测试、打包、安装到本地仓库、部署到远程私服仓库，这个其实就是你负责的工程写好了部分代码，别人需要依赖你的jar包中提供的接口来写代码和测试。此时你需要将snapshot jar包发布到私服的maven-snapshots仓库中。供别人在本地声明对你的依赖和使用
+```
+
+# 5 maven生命周期
+
+![image-20210611070809041](maven小知识.assets/image-20210611070809041.png)
+
+
+
+maven生命周期，就是去解释mvn各种命令背后的原理
+
+maven的生命周期，就是对传统软件项目构建工作的抽象
+
+清理、初始化、编译、测试、打包、集成测试、验证、部署、站点生成
+
+​	**maven有三套完全独立的生命周期，clean，default、site**。**每套生命周期都可以独立运行，每个生命周期的运行都会包含多个phase**，**每个phase又是由各种插件的goal来完成的，一个插件的goal可以认为是一个功能**。
+
+​	**PS:每个生命周期中的后面的阶段会依赖于前面的阶段，当执行某个阶段的时候，会先执行其前面的阶段。比如default生命周期中的package阶段，就会执行前面所有包括comlile的阶段(phase)**
+
+**clean生命周期包含的phase如下：**
+
+pre-clean
+clean
+post-clean
+
+**default生命周期包含的phase如下：**
+
+validate：校验这个项目的一些配置信息是否正确
+initialize：初始化构建状态，比如设置一些属性，或者创建一些目录
+generate-sources：自动生成一些源代码，然后包含在项目代码中一起编译
+process-sources：处理源代码，比如做一些占位符的替换
+generate-resources：生成资源文件，才是干的时我说的那些事情，主要是去处理各种xml、properties那种配置文件，去做一些配置文件里面占位符的替换
+process-resources：将资源文件拷贝到目标目录中，方便后面打包
+**compile：**编译项目的源代码
+process-classes：处理编译后的代码文件，比如对java class进行字节码增强
+generate-test-sources：自动化生成测试代码
+process-test-sources：处理测试代码，比如过滤一些占位符
+generate-test-resources：生成测试用的资源文件
+process-test-resources：拷贝测试用的资源文件到目标目录中
+test-compile：编译测试代码
+process-test-classes：对编译后的测试代码进行处理，比如进行字节码增强
+test：使用单元测试框架运行测试
+prepare-package：在打包之前进行准备工作，比如处理package的版本号
+**package：**将代码进行打包，比如jar包
+pre-integration-test：在集成测试之前进行准备工作，比如建立好需要的环境
+integration-test：将package部署到一个环境中以运行集成测试
+post-integration-test：在集成测试之后执行一些操作，比如清理测试环境
+verify：对package进行一些检查来确保质量过关
+**install：**将package安装到本地仓库中，这样开发人员自己在本地就可以使用了
+**deploy：**将package上传到远程仓库中，这样公司内其他开发人员也可以使用了
+
+**site生命周期的phase：**
+
+pre-site
+site
+post-site
+site-deploy
+
+引用：https://blog.csdn.net/xyz9353/article/details/104302978?utm_medium=distribute.pc_relevant.none-task-blog-baidujs_title-0&spm=1001.2101.3001.4242
+
+## 5.1 生命周期阶段与插件的默认绑定(phase与goal的默认绑定)
+
+默认的phase和plugin绑定
+
+但是问题来了，那么我们直接运行mvn clean package的时候，每个phase都是由插件的goal来完成的，phase和plugin绑定关系是？
+
+实际上，默认maven就绑定了一些plugin goal到phase上去，比如：
+
+类似于resources:resources这种格式，说的就是resources这个plugin的resources goal（resources功能，负责处理资源文件）
+
+**default生命周期的默认绑定：**
+
+process-resources				resources:resources
+
+compile							compiler:compile
+
+process-test-resources			resources:testResources
+
+test-compile					compiler:testCompile
+
+test								surefire:test
+
+package							jar:jar或者war:war
+
+install							install:install
+
+deploy							deploy:deploy
+
+**site生命周期的默认绑定：**
+
+site								site:site
+
+site-deploy						site:deploy
+
+**clean生命周期的默认绑定：**
+
+clean							clean:clean
+
+## 5.2 自定义声明周期绑定插件(phase自定义绑定goal)
+
+**PS:生命周期不执行任何操作,都是抱插件大腿，如果对应阶段(phase)没有maven默认绑定的插件就不执行任何操作**
+
+​	除了内置绑定（默认绑定）以外，用户还能够自己选择将某个插件目标绑定到生命周期的某个阶段上，这种自定义绑定方式能让Maven项目在构建过程中执行更多更富特色的任务。
+
+​	一个常见的例子是创建项目的源码jar包。内置的插件绑定关系中没有涉及这一任务，因此需要用户自行配置。**maven-source-plugin可以帮助我们完成该任务，它的jar-no-fork目标能够将项目的主代码打包成jar文件，可以将其绑定到default生命周期的verify阶段上，在执行完集成测试后和安装构件之前创建源码jar包**。具体配置见下：
+
+```xml
+<build>
+      <plugins>
+          <plugin>
+              <groupId>org.apache.maven.plugins</groupId>
+              <artifactId>maven-source-plugin</artifactId>
+              <version>2.1.1</version>
+              <executions>
+                  <execution>
+                      <id>attach-sources</id>
+                      <phase>verify</phase>
+                      <goals>
+                          <goal>jar-no-fork</goal>
+                      </goals>
+                  </execution>
+              </executions>
+          </plugin>
+      </plugins>
+  </build>
+
+```
+
+引用：https://blog.csdn.net/bobozai86/article/details/106179052
+
+## 5.3 maven的命令行和生命周期
+
+**1 执行对应phase(阶段)**
+
+比如mvn clean package
+
+clean是指的clean生命周期中的clean phase
+
+package是指的default生命周期中的package phase
+
+此时就会执行clean生命周期中，在clean phase之前的所有phase和clean phase，pre clean，clean
+
+同时会执行default生命周期中，在package phase之前的所有phase和package phase
+
+**2 直接执行插件(goal)**
+
+mvn dependency:tree
+
+mvn deploy:deploy-file
+
+就是不执行任何一个生命周期的任何一个phase
+
+直接执行指定的插件的一个goal
+
+比如mvn dependency:tree，就是直接执行dependency这个插件的tree这个goal，这个意思就是会自动分析pom.xml里面的依赖声明，递归解析所有的依赖，然后打印出一颗依赖树
+
+mvn deploy:depoy-file，就是直接执行deploy这个插件的deploy-file这个goal，这个意思就是说将指定目录的jar包，以指定的坐标，部署到指标的maven私服仓库里去，同时使用指定仓库id对应的server的账号和密码。
