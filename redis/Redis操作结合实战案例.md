@@ -379,5 +379,122 @@ getrange，setrange，append等，对字符串的复杂操作hash是不支持的
 
 ## 3.9 OA系统中代办事项列表管理
 
-lindex，lset，linsert，ltrim，lrem
+​	OA系统，自动化办公系统，说白了就是把企业日常运行的办公的日常事务都在OA系统里来做，请假，审批，开会，项目，任务，待办事项列表
+
+​	lindex，lset，linsert，ltrim，lrem
+
+​	插入待办事项，linsert list index event(根据position策略插入)
+
+​	查询待办事项列表，lrange list 0 -1，所有都查询出来(下标范围查询)
+
+​	完成待办事项，lrem list 0 event，就把这个待办事项给删了(根据value是否相同删除)
+
+​	批量完成待办事项，ltrim list start_index end_index()(保留下标范围的value)
+
+​	修改待办事项，lindex和lset(lindex获取下标，lset根据下标修改)
+
+```java
+    /**
+     * 分页查询待办事项列表
+     * @param userId
+     * @param pageNo
+     * @param pageSize
+     * @return
+     */
+    public List<String> findTodoEventByPage(long userId, int pageNo, int pageSize) {
+        int startIndex = (pageNo - 1) * pageSize;
+        int endIndex = pageNo * pageSize - 1;
+        return jedis.lrange("todo_event::" + userId, startIndex, endIndex);
+    }
+
+    /**
+     * 插入待办事项
+     */
+    public void insertTodoEvent(long userId,
+                                ListPosition position,
+                                String targetTodoEvent,
+                                String todoEvent) {
+        jedis.linsert("todo_event::" + userId, position, targetTodoEvent, todoEvent);
+    }
+
+    /**
+     * 修改一个待办事项
+     * @param userId
+     * @param index
+     * @param updatedTodoEvent
+     */
+    public void updateTodoEvent(long userId, int index, String updatedTodoEvent) {
+        jedis.lset("todo_event::" + userId, index, updatedTodoEvent);
+    }
+
+    /**
+     * 完成一个待办事项
+     * @param userId
+     * @param todoEvent
+     */
+    public void finishTodoEvent(long userId, String todoEvent) {
+        jedis.lrem("todo_event::" + userId, 0, todoEvent);
+```
+
+
+
+## 3.10 网站注册邮件发送机制/list-brpop操作
+
+​	网站注册成功后一般会发送一份验证邮件到邮箱，但是邮件发送是比较慢的，这个时候就利用队列，将邮件发送任务放到队列去，让邮件发送系统从队列中获取任务来发送邮件
+
+​	**利用brpop阻塞式获取队列中的任务**
+
+完整代码见 com.star.jvm.demo.redis.list.SendMailDemo
+
+```java
+    /**
+     * 让发送邮件任务入队列
+     * @param sendMailTask
+     */
+    public void enqueueSendMailTask(String sendMailTask) {
+        jedis.lpush("send_mail_task_queue", sendMailTask);
+    }
+
+    /**
+     * 阻塞式获取发送邮件任务
+     * @return
+     */
+    public List<String> takeSendMailTask() {
+        return jedis.brpop(5, "send_mail_task_queue");
+    }
+```
+
+
+
+## 3.11 网站每日UV数据指标去重统计/set集合操作
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
