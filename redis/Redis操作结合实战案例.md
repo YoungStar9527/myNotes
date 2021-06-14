@@ -468,11 +468,38 @@ getrange，setrange，append等，对字符串的复杂操作hash是不支持的
 
 ## 3.11 网站每日UV数据指标去重统计/set集合操作
 
+​	set数据结构，跟Java里的set是一样的，就是说放无序的、不重复的数据集合，list一般来说做一个操作，时间复杂度都是O(n)，set一般的操作，时间复杂度是O(1)，无序的，不重复的数据集合
 
+​	网站的uv，有多少用户访问了你的网站，但是一个用户可能会访问多次，此时要对多次访问进行去重
 
+**scard 获取集合内成员数量**
 
+**sadd 添加元素**
 
+完整代码见 com.star.jvm.demo.redis.set.UVDemo
 
+```java
+    /**
+     * 添加一次用户访问记录
+     */
+    public void addUserAccess(long userId) {
+        SimpleDateFormat dateFormat = new SimpleDateFormat(
+                "yyyy-MM-dd");
+        String today = dateFormat.format(new Date());
+        jedis.sadd("user_access::" + today, String.valueOf(userId));
+    }
+
+    /**
+     * 获取当天的网站uv的值
+     * @return
+     */
+    public long getUV() {
+        SimpleDateFormat dateFormat = new SimpleDateFormat(
+                "yyyy-MM-dd");
+        String today = dateFormat.format(new Date());
+        return jedis.scard("user_access::" + today);
+    }
+```
 
 
 

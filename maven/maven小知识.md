@@ -276,7 +276,7 @@ maven的生命周期，就是对传统软件项目构建工作的抽象
 
 清理、初始化、编译、测试、打包、集成测试、验证、部署、站点生成
 
-​	**maven有三套完全独立的生命周期，clean，default、site**。**每套生命周期都可以独立运行，每个生命周期的运行都会包含多个phase**，**每个phase又是由各种插件的goal来完成的，一个插件的goal可以认为是一个功能**。
+​	**maven有三套完全独立的生命周期，clean，default、site**。**每套生命周期都可以独立运行，每个生命周期的运行都会包含多个phase**，**每个phase又是由各种插件的goal来完成的，一个插件的goal可以认为是一个功能(一个插件多个goal)**。
 
 ​	**PS:每个生命周期中的后面的阶段会依赖于前面的阶段，当执行某个阶段的时候，会先执行其前面的阶段。比如default生命周期中的package阶段，就会执行前面所有包括comlile的阶段(phase)**
 
@@ -381,6 +381,7 @@ clean							clean:clean
                       <goals>
                           <goal>jar-no-fork</goal>
                       </goals>
+                      <!--一个phase可以配置多个goal，每个goal都是一个具体的功能-->
                   </execution>
               </executions>
           </plugin>
@@ -418,3 +419,572 @@ mvn deploy:deploy-file
 比如mvn dependency:tree，就是直接执行dependency这个插件的tree这个goal，这个意思就是会自动分析pom.xml里面的依赖声明，递归解析所有的依赖，然后打印出一颗依赖树
 
 mvn deploy:depoy-file，就是直接执行deploy这个插件的deploy-file这个goal，这个意思就是说将指定目录的jar包，以指定的坐标，部署到指标的maven私服仓库里去，同时使用指定仓库id对应的server的账号和密码。
+
+# 6 maven插件
+
+在maven官网搜索对应插件配置
+
+http://maven.apache.org/plugins/index.html
+
+## 6.1 配置插件
+
+如果在命令行执行插件，可以用-Dkey=value来进行插件的设置
+
+ 比如mvn install -Dmaven.test.skip=true，就是surefire插件在测试的时候提供的参数，设置为true就会跳过测试
+
+此外也可以在pom.xml中用来配置
+
+```xml
+<build>
+<plugins>
+	<plugin>
+		<groupId>org.apache.maven.plugins</groupId>
+		<artifactId>maven-compiler-plugin</artifactId>
+		<version>2.1</version>
+		<configuration>
+			<source>1.5</source>
+			<target>1.5</target>
+		</configuration>
+        <!--不同的插件configuration配置不一样，可以参考官网配置-->
+	</plugin>
+</plugins>
+</build>
+```
+
+**PS:其实每个插件你只要定义它的坐标，默认情况下，它自己内部就带了要把哪些goal绑定到哪个phase上去,默认如果没有特殊的要求，用默认的参数就够了**
+
+##  6.2 插件解析
+
+先从本地仓库找插件，没有则从远程仓库找插件
+
+插件的远程仓库也需要配置，maven默认配置了远程的插件仓库（超级仓库配置在maven-model-builder下对应pom文件的默认配置）
+
+```xml
+  <pluginRepositories>
+    <pluginRepository>
+      <id>central</id>
+      <name>Central Repository</name>
+      <url>https://repo.maven.apache.org/maven2</url>
+      <layout>default</layout>
+      <snapshots>
+        <enabled>false</enabled>
+      </snapshots>
+      <releases>
+        <updatePolicy>never</updatePolicy>
+      </releases>
+    </pluginRepository>
+  </pluginRepositories>
+```
+
+也可以在在setting文件中改为nexus私仓库地址，统一走配置的私仓镜像地址，或者配置阿里云镜像地址
+
+# 7 统一构建工程
+
+​	一般来说会将模块统一放在父工程的目录下，这样就可以用下面形式，否则如果多个工程平级，则要用类似于../oa-organ的相对路径。
+
+接着对oa-parent运行mvn clean install，此时就会对**oa-parent中所有的工程都进行统一的构建**
+
+**在父工程下加入以下配置**
+
+```xml
+<groupId>com.zhss.oa</groupId>
+<artifactId>oa-parent</artifactId>
+<version>1.0.0-SNAPSHOT</version>
+<packaging>pom</packaging>
+<!--父工程packaging是pom,子工程是jar-->
+<name>oa parent project</name>
+
+<modules>
+	<module>oa-organ</module>
+	<module>oa-auth</module>
+	<module>oa-flow</module>
+</modules>
+```
+
+# 8 统一约束
+
+## 8.1 版本号约束
+
+​	一般都会**在properties元素里面，统一定义一个版本号，然后在这个类似spring的依赖里面，全部用${}占位符来引用一个版本号**，那么每次修改，升级spring版本，就直接修改properties元素中的一个地方就可以了，不会出错
+
+```xml
+<properties>
+        <maven.compiler.source>8</maven.compiler.source>
+        <maven.compiler.target>8</maven.compiler.target>
+        <springframework.version>5.2.15.RELEASE</springframework.version>
+    <!--定义变量-->
+ </properties>
+ <dependency>
+     <groupId>org.springframework</groupId>
+     <artifactId>spring-core</artifactId>
+     <version>${springframework.version}</version>
+     <!--统一使用变量的版本号-->
+</dependency>
+```
+
+
+
+## 8.2 继承父项目版本
+
+​	推荐使用dependencyManagement、pluginManagement的方式在父工程定义依赖
+
+```xml
+<!--父工程来声明要被子工程继承的依赖和插件-->
+<dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.springframework</groupId>
+                <artifactId>spring-core</artifactId>
+                <version>${springframework.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.springframework</groupId>
+                <artifactId>spring-webmvc</artifactId>
+                <version>${springframework.version}</version>
+            </dependency>
+        </dependencies>
+</dependencyManagement>
+
+<build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>3.2</version>
+                    <configuration>
+                        <source>1.8</source>
+                        <target>1.8</target>
+                        <encoding>UTF-8</encoding>
+                    </configuration>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+</build>
+```
+
+
+
+​	在子工程引入父工程的依赖，如果父工程是通过dependencies、plugins 直接定义依赖，那么子工程会全部继承父工程的所有依赖。
+
+​	推荐使用dependencyManagement、pluginManagement的方式在父工程定义依赖，此时不会强制性继承所有的依赖和插件，子工程需要同时声明，自己要继承哪些依赖和插件，但是只要声明groupId和artifactId即可，不需要声明version版本号，因为version全部放在父工程中统一声明，强制约束所有子工程的相同依赖的版本要一样
+
+```xml
+<!--子工程引入父工程pom文件-->
+<parent>
+	<groupId>com.zhss.oa</groupId>
+	<artifactId>oa-parent</artifactId>
+	<version>1.0.0-SNAPSHOT</version>
+</parent>
+```
+
+​	**PS:parent标签 子工程引入父工程pom文件，会继承parent工程的所有标签属性，除了pluginManagement、dependencyManagement等一些特殊标签是灵活继承，大部分标签会全部继承**
+
+## 8.3 基于import、pom来规范约束依赖的版本号
+
+在项目中先引入bom
+
+```xml
+<dependencyManagement>
+       <dependencies>
+           <dependency>
+               <groupId>com.zhss.commons</groupId>
+               <artifactId>commons-flow-bom</artifactId>
+               <version>1.2.9</version> 
+               <type>pom</type>
+               <scope>import</scope>
+			<!--scope import 相当于直接将commons-flow-bom中的dependencyManagement写在这里-->
+           </dependency>
+       </dependencies>
+   	</dependencyManagement>
+```
+
+再引入包
+
+```xml
+<dependency>
+       <groupId>com.zhss.commons</groupId>
+       <artifactId>commons-flow</artifactId>
+      <version>1.0.0-SNAPSHOT</version>
+</dependency>
+```
+
+**流程思路**
+
+（1）如果你是公司基础组件的开发人，你的组件依赖了很多重要的第三方的开源框架，然后你为了保证依赖你的组件的人，不会自行导入一些开源框架的过旧的版本，导致跟你的组件出现依赖冲突
+
+（2）你需要为你的组件开发一个类型为pom的工程，后缀名为bom，这个工程，要声明一套dependencyManagement，里面声明好对你的组件的依赖的版本号，还有你的组件使用的重要的第三方开源框架的版本号
+
+（3）然后依赖方在引用你的组件的时候，需要在自己的dependencyManagement中，加一个scope范围为import，类型为pom的这么依赖导入，此时就可以将你的bom包声明的那一套依赖的版本号导入他那里，作为版本的约束
+
+（4）然后依赖方接着在dependencies里面可以声明对你的组件的依赖，此时版本号都不用写，因为已经被你约束了
+
+（5）同时，假设依赖方要自己依赖一个过旧的开源框架的版本，会有提示报警，不让他自行定义过旧版本的框架
+
+**PS:总结就是公司内部开发，一些比较重要的包，采用bom包装的方式，约束比较重要的第三方开源框架的版本号，避免依赖冲突**
+
+# 9 自动化测试
+
+## 9.1 surefire插件
+
+​	maven的自动化运行单元测试的插件，surefire
+
+​	maven中默认内置了surefire插件来运行单元测试，与最新流行的junit单元测试框架整合非常好。一般是在default生命周期的test阶段，会运行surefire插件的test goal，然后执行src/test/java下面的所有单元测试的
+
+​	而surefire插件会根据一定的规则在sre/test/java下面找单元测试类，具体规则如下：
+
+**/Test*.java
+
+**/*Test.java
+
+**/*TestCase.java
+
+通常比较流行的是用*Test.java格式类命名单元测试的类
+
+不常用命令：
+
+```shell
+mvn package -DskipTests
+#跳过单元测试
+mvn test -Dtest=**Test
+#指定运行某个测试类
+```
+
+不常用配置
+
+```xml
+<!--自定义包含与排除测试类-->
+<plugin>
+  <groupId>org.apache.maven.plugins</groupId>
+  <artifactId>maven-surefire-plugin</artifactId>
+  <version>2.5</version>
+  <configuration>
+    <includes>
+      <include>**/*Tests.java</include>
+    </includes>
+    <excludes>
+      <exclude>**/*TempTest.java</exclude>
+    </excludes>
+  </configuration>
+</plugin>
+```
+
+
+
+## 9.2 测试覆盖率报告
+
+引入插件
+
+```xml
+<plugin>
+    <groupId>org.codehaus.mojo</groupId>
+    	<artifactId>cobertura-maven-plugin</artifactId>
+    <version>2.7</version>
+</plugin>
+```
+
+运行插件，生产测试覆盖率报告
+
+![image-20210613101856874](maven小知识.assets/image-20210613101856874.png)
+
+或命令执行
+
+```shell
+ mvn cobertura:cobertura
+```
+
+查看测试覆盖率报告
+
+![image-20210613101942159](maven小知识.assets/image-20210613101942159.png)
+
+**Line Coverage 行覆盖率**
+
+一般单元测试覆盖率，要求的是，两种，方法覆盖率，行覆盖率
+
+该插件目前只有行覆盖率，没有方法覆盖率
+
+# 10 基于jetty的web工程
+
+加入jetty插件
+
+```xml
+<plugin>
+    <groupId>org.mortbay.jetty</groupId>
+    <artifactId>jetty-maven-plugin</artifactId>
+    <version>8.1.16.v20140903</version>
+    <configuration>
+        <scanIntervalSeconds>10</scanIntervalSeconds>
+        <webAppConfig>
+            <contextPath>/</contextPath>
+            <!--contextPath 访问路径后缀！！！-->
+        </webAppConfig>
+    </configuration>
+</plugin>
+```
+
+启动jetty
+
+![image-20210614160838808](maven小知识.assets/image-20210614160838808.png)
+
+**PS:需注意jetty/tomcat等容器版本、servlet版本、spring版本需要相互对应，否则会出现servlet或者spring异常**
+
+命令启动：
+
+```shell
+mvn jetty:run
+#后续加 -Djetty.port=8081可以修改端口号
+```
+
+​	自定义添加的插件可以选择在**setting文件中添加pluginGroups配置**，将插件与自定义配置的groupId关联起来。
+
+​	有的时候还是需要你去手动做一下配置的，不然在某些环境下可能直接运行类似jetty:run的命令可能会有问题。
+
+​	maven默认自带绑定的插件不需要额外配置。
+
+```xml
+<pluginGroups>
+	<pluginGroup>org.mortbay.jetty</pluginGroup>
+</pluginGroups>
+```
+
+# 11 自动化部署及发布环境配置自动适配
+
+## 11.1 cargo插件自动化热部署tomcat
+
+pom添加配置
+
+```xml
+ <!-- 自动化部署远程Tomcat插件 -->
+            <plugin>
+                <groupId>org.codehaus.cargo</groupId>
+                <artifactId>cargo-maven2-plugin</artifactId>
+                <version>1.6.0</version>
+                <!--cargo、tomcat、spring、servlet版本需要相互对应-->
+                <configuration>
+                    <container>
+                        <containerId>tomcat8x</containerId>
+                        <type>remote</type>
+                    </container>
+                    <configuration>
+                        <type>runtime</type>
+                        <properties>
+                            <cargo.remote.username>admin</cargo.remote.username>
+                            <cargo.remote.password>admin</cargo.remote.password>
+                            <cargo.tomcat.manager.url>http://localhost:8080/manager</cargo.tomcat.manager.url>
+                            <!--需要开启tomcat，配置tomcat的manager访问-->
+                            <cargo.servlet.port>8080</cargo.servlet.port>
+                        </properties>
+                    </configuration>
+                </configuration>
+            </plugin>
+```
+
+执行自动化部署deploy为直接部署，需要删除之前部署的，如果不是第一次部署的话。redeploy是覆盖之前的(先删除后部署)。
+
+![image-20210614204344593](maven小知识.assets/image-20210614204344593.png)
+
+命令部署
+
+```shell
+mvn cargo:deploy
+```
+
+​	**直接cargo:deploy，第一次部署，在http://localhost:8080/oa-web/，跟上接口，就可以去访问了(不用重启tomcat，直接生效)，非第一次部署使用cargo:redeploy即可(自动会先卸载，然后再重新部署)**
+
+**注意事项**
+
+​	1 在执行cargo命令的时候，切记，不要打开tomcat的任何配置问加你，因为也许会因为文件打开占用，导致一些不必要的bug	
+
+​	2 如果在实验过程中，遇到一些奇怪的问题，可以考虑在tomcat的webapps下面，删除oa-web目录和oa-web.war，接着重新先关闭tomcat，再启动tomcat，然后再次把你的工程package打包，然后cargo:deploy部署
+
+![image-20210614203043257](maven小知识.assets/image-20210614203043257.png)
+
+### 11.1.1 配置tomcat的manager访问
+
+apache-tomcat-8.5.66\conf\tomcat-users.xml添加管理员账号，拥有所有角色权限
+
+```xml
+<role rolename="manager-script"/>
+<role rolename="manager-jmx"/>
+<role rolename="manager-status"/>
+<role rolename="admin-gui"/>
+<role rolename="admin-script"/>
+<user username="admin" password="admin" roles="manager-gui,manager-script,manager-jmx,manager-status,admin-gui,admin-script"/>
+<!--对应角色名是内置固定的，不是自定义名字-->
+<!--该配置仅针对于tomcat8.0，其他版本可能有部分区别-->
+```
+
+在 apache-tomcat-8.5.66\webapps\manager\META-INF\context.xml中注释掉Valve
+
+```xml
+ <!-- <Valve className="org.apache.catalina.valves.RemoteAddrValve"
+         allow="127\.\d+\.\d+\.\d+|::1|0:0:0:0:0:0:0:1" />-->
+<!--因为tomcat8.0对manager访问做了限制，需要注释访问限制-->
+```
+
+引用：https://blog.csdn.net/fly_leopard/article/details/79654254
+
+
+
+## 11.2 基于profile配置自动适配发布环境
+
+## 11.2.1 利用占位符来配置properties文件
+
+pom文件配置profiles
+
+```xml
+    <profiles>
+        <profile>
+            <id>dev</id>
+            <activation>
+                <activeByDefault>true</activeByDefault>
+            </activation>
+            <!--activation activeByDefault 设置默认profile的配置-->
+            <properties>
+                <database.jdbc.driverClass>com.mysql.jdbc.Driver</database.jdbc.driverClass>
+                <database.jdbc.connectionURL>jdbc:mysql://192.168.31.101:3306/oa</database.jdbc.connectionURL>
+                <database.jdbc.username>root</database.jdbc.username>
+                <database.jdbc.password>Trsadmin123!@#</database.jdbc.password>
+            </properties>
+        </profile>
+        <profile>
+            <id>beta</id>
+            <properties>
+                <database.jdbc.driverClass>com.mysql.jdbc.Driver</database.jdbc.driverClass>
+                <database.jdbc.connectionURL>jdbc:mysql://192.168.31.101:3306/oa_beta</database.jdbc.connectionURL>
+                <database.jdbc.username>beta</database.jdbc.username>
+                <database.jdbc.password>beta</database.jdbc.password>
+            </properties>
+        </profile>
+    </profiles>
+```
+
+properties文件配置
+
+```properties
+jdbc.driverClassName=${database.jdbc.driverClass}
+jdbc.url=${database.jdbc.connectionURL}
+jdbc.username=${database.jdbc.username}
+jdbc.password=${database.jdbc.password}
+```
+
+**激活profile，开启资源过滤**
+
+```xml
+	<build>
+		<resources>
+  			<resource>
+  				<directory>src/main/java</directory>
+  				<includes>
+  					<include>**/*.xml</include>
+  				</includes>
+  				<filtering>true</filtering>
+  			</resource>
+  			<resource>
+  				<directory>src/main/resources</directory>
+  				<includes>
+  					<include>**/*.xml</include>
+  					<include>**/*.properties</include>
+  				</includes>
+                 <!--目录位置可自定义-->
+  				<filtering>true</filtering>
+  			</resource>
+  		</resources>
+	</build>
+```
+
+自适配配置文件命令
+
+```shell
+mvn clean package -Pdev
+#加-P就是激活profile 加-Pdev就是激活了dev的profile
+#profile有很多种激活的方式，但是常用的其实就是-P这一种激活方式即可，因为都是部署的时候用不同的-P来激活
+```
+
+### 11.2.2  不同地方配置profile
+
+​	profile实际上是可以在不同的地方配置的
+
+​	比如说在settings.xml里，我们也通过配置profile以及激活一些profile配置了maven私服仓库地址，在maven的超级pom里，也有一些profile激活
+
+### 11.2.3 利用profile替换资源目录
+
+​	1 将resource目录下的文件清空，新建立profiles文件夹，放入对应不同环境的配置文件
+
+![image-20210614205846367](maven小知识.assets/image-20210614205846367.png)
+
+2 同上，激活profile，开启资源过滤
+
+3 配置pom的profile对应
+
+```xml
+    <profiles>
+        <!-- 每个profile对应了一个环境下的一套配置 -->
+        <profile>
+            <id>dev</id>
+            <activation>
+                <activeByDefault>true</activeByDefault>
+            </activation>
+            <!--activation activeByDefault 设置默认profile的配置-->
+            <build>
+                <resources>
+                    <resource>
+                        <directory>src/main/profiles/dev</directory>
+                        <includes>
+                            <include>**/*.xml</include>
+                            <include>**/*.properties</include>
+                        </includes>
+                        <filtering>true</filtering>
+                    </resource>
+                </resources>
+            </build>
+        </profile>
+        <profile>
+            <id>prod</id>
+            <build>
+                <resources>
+                    <resource>
+                        <directory>src/main/profiles/prod</directory>
+                        <includes>
+                            <include>**/*.xml</include>
+                            <include>**/*.properties</include>
+                        </includes>
+                         <!--目录位置可自定义-->
+                        <filtering>true</filtering>
+                    </resource>
+                </resources>
+            </build>
+        </profile>
+    </profiles>
+```
+
+
+
+4 同样使用自适配配置文件命令mvn clean package -Pdev即可将不同目录下的配置替换到resource目录中去，可利用**mvn clean process-resources -Pdev** (替换资源目录)，在target\classes查看效果是否成功
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
