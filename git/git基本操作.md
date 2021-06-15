@@ -87,3 +87,6 @@ git push -u origin master
 
 ![image-20210530104036222](git基本操作.assets/image-20210530104036222.png)
 
+## 1.4 gitignore配置
+
+引用：https://www.cnblogs.com/xuanjiange/p/13458618.html
