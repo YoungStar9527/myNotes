@@ -62,10 +62,12 @@ mvn help:system
 
 ## 2.4 相关命令
 
+**PS:-D 参数表明properties属性(相当于xml的该属性，配置了就能通过$占位符来使用)  -P表示profiles配置文件**
+
 快速构建maven项目
 
 ```shell
-mvn archetype:generate    -DgroupId=com.zhss.maven     -DartifactId=maven-first-app     -DarchetypeArtifactId=maven   -archetype         -quickstart  -DinteractiveMode=false
+mvn archetype:generate    -DgroupId=com.zhss.maven     -DartifactId=maven-first-app    -DarchetypeArtifactId=maven-archetype-quickstart  -DinteractiveMode=false
 #快速构建maven项目 下面对应包名,id等需要指定，组合命令的情况，需要在cmd命令行中运行组合命令，如果是在powershell中需要在后续命令加双引号(双引号不是很稳定，最好还是用cmd执行)
 #运行后续组合命令不能换行，换行相当于下一个命令了，就不是组合命令
 mvn archetype:generate    "-DgroupId=com.zhss.maven     -DartifactId=maven-first-app     -DarchetypeArtifactId=maven   -archetype         -quickstart  -DinteractiveMode=false"
@@ -241,13 +243,15 @@ mvn dependency:tree
 
 用mvn dependency:tree找出所有依赖关系，再用exclusion将低版本包排除
 
-# 3 扩展
+# 3 maven项目对象模型
 
-**maven-model-builder 查看maven基础配置**
+**maven-model-builder 查看maven项目对象模型**
 
 ![image-20210609071325795](maven小知识.assets/image-20210609071325795.png)
 
 ![image-20210609071245677](maven小知识.assets/image-20210609071245677.png)
+
+超级POM，所有的项目都依赖于超级POM，超级POM是最基础的。超级POM定义了一组被所有项目共享的默认设置，位置是\apache-maven-3.0.5\lib 下的 maven-model-builder-3.0.5.jar 中的 org/apache/maven/model/pom-4.0.0.xml
 
 **PS:maven/nexus索引就是pom对应相关定位信息，将相关定位信息索引就能更快加载包(相当于pom文件定位信息关联本地仓库/远程仓库的jar包位置，就是索引),本地有包，pom文件找不到就是索引失效了，idea可以通过reload project的方式(转圈)手动更新索引**
 
@@ -312,7 +316,7 @@ verify：对package进行一些检查来确保质量过关
 **install：**将package安装到本地仓库中，这样开发人员自己在本地就可以使用了
 **deploy：**将package上传到远程仓库中，这样公司内其他开发人员也可以使用了
 
-**site生命周期的phase：**
+**site生命周期的phase(生成api 在浏览器中查看项目的站点)：**
 
 pre-site
 site
@@ -962,23 +966,171 @@ mvn clean package -Pdev
 
 4 同样使用自适配配置文件命令mvn clean package -Pdev即可将不同目录下的配置替换到resource目录中去，可利用**mvn clean process-resources -Pdev** (替换资源目录)，在target\classes查看效果是否成功
 
+# 12 版本管理与版本控制
+
+**版本管理：通常指的是maven中的version**
+
+通常version有三位数，第三位一般为bug修复，第二位为新模块发布，第一位一般为大版本重构或重大功能变更
+
+**版本控制：提交到git的代码，每次提交都是该分支的一个版本**
+
+其实一般就是一个版本对应一个分支，各种开发+测试
+
+搞定之后就会merge到主干
+
+然后就会给这个时候的主干打一个tag作为主干在这个版本的代码，以后任何时候都可以使用主干的某个tag，也就是某个时刻的某个版本的代码
+
+![img](maven小知识.assets/}E`V8F]9}LJB1FS1JHBHHQ8.png)
 
 
 
+# 13 利用archetype为项目创建统一框架
 
 
 
+​	artchetype其实就是个maven项目模板
+
+​	**常用的maven archetype**
+
+​	如果只是一个模块，或者不需要web容器的支持，那就是maven-archetype-quickstart即可
+
+​	如果是一个web工程，那可以用maven-archetype-webapp
+
+![image-20210615211931155](maven小知识.assets/image-20210615211931155.png)
+
+在 **2.4 相关命令** 中就是使用archetype来快速建立maven工程
+
+## 13.1 建立一个自己的项目统一框架
+
+**1 利用命令快速建立archetype的模板**
+
+```shell
+mvn archetype:generate -DarchetypeGroupId=org.apache.maven.archetypes -DarchetypeArtifactId=maven-archetype-archetype -DarchetypeVersion=1.4
+```
+
+​	也可以在idea添加archetype模板后，利用idea建立(idea默认archetype没有maven-archetype-archetype，需要添加)，添加后就会生成对应archetype模板。后续就无须再添加，直接使用之前添加模板的即可
+
+![image-20210615214253806](maven小知识.assets/image-20210615214253806.png)
 
 
 
+**2 在archetype自己的pom中添加私服配置**
+
+```xml
+	<distributionManagement>
+		<repository>
+			<id>nexus-releases</id>
+			<name>Nexus Release Repository</name>
+			<url>http://192.168.31.101:8081/repository/maven-releases/</url>
+		</repository>
+		<snapshotRepository>
+			<id>nexus-snapshots</id>
+			<name>Nexus Snapshot Repository</name>
+			<url>http://192.168.31.101:8081/repository/maven-snapshots/</url>
+		</snapshotRepository>
+	</distributionManagement>
+```
+
+**2 定义archetype的元数据**
+
+接着要编写src/main/resources/META-INF/maven/archetype-metadata.xml
+
+这个文件两个作用，
+
+​		第一个作用是定义将这个archetype中的哪些java代码和测试代码以及资源文件，都包含到创建好的项目中去
+
+​		第二个作用是定义创建项目的时候需要输入的参数是什么
+
+package是创建项目的时候必须输入的，就是你的包基础路径。一般是需要将代码放到包路径下的，而资源文件不需要放到包路径下。
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<archetype-descriptor name="archetype-oa">
+	<fileSets>
+		<fileSet filtered="true" packaged="true">
+            <!--filtered参数表示是否对文件启用占位符替换，packaged表示是否将文件放到包路径下-->
+			<directory>src/main/java</directory>
+			<includes>
+				<include>**/*.java</include>
+			</includes>
+		</fileSet>
+		
+		<fileSet filtered="true" packaged="true">
+			<directory>src/test/java</directory>
+			<includes>
+				<include>**/*.java</include>
+			</includes>
+		</fileSet>
+		
+		<fileSet filtered="true" packaged="false">
+			<directory>src/main/resources</directory>
+			<includes>
+				<include>**/*.properties</include>
+				<include>**/*.xml</include>
+			</includes>
+		</fileSet>
+        <!--定义需要加载的各目录位置-->
+	</fileSets>
+	
+	<requiredProperties>
+		<requiredProperty key="oaParentVersion" />
+		<requiredProperty key="shortName" /> 
+	</requiredProperties>
+    <!--定义创建工程必须输入的参数，通过占位符来动态填充-->
+</archetype-descriptor>
+```
 
 
 
+**3 配置生成项目的pom及对应java、resource、test等文件**
+
+​	1 在pom中通过${}占位符的方式灵活配置，在生成项目的时候自己输入对应占位符信息
+
+​	2 在archetype-resource下的相关代码及配置就是生成新项目的代码与配置
+
+![image-20210615215255198](maven小知识.assets/image-20210615215255198.png)
+
+**4 同时对于你写的一些基础的类，一般是可以用package占位符的，到时候创建出来就会替换package**
+
+```java
+package ${package}
+
+public class Application {
 
 
+}
+```
 
+**5 部署arthcetype到私服**
 
+mvn clean deploy安装到本地仓库和私服，都可以使用了
 
+**6 生成项目**
+
+```shell
+mvn archetype:generate -DarchetypeGroupId=com.zhss.archetypes -DarchetypeArtifactId=archetype-oa -DarchetypeVersion=1.0.0
+#注意版本号等参数需要和私服中上传的包对应
+```
+
+## 13.2 扩展
+
+也可以做到不需要输入archetype的坐标就可以使用，就是要将archetype加入一个archetype列表供用户选择，这个archetype列表就是在archetype-catalog.xml文件中。
+
+maven默认会从几个地方去读取archetype-catalog.xml的内容：
+
+（1）internal：maven-archetype-plugin内置了几十个archetype
+
+（2）local：从~/.m2/archetype-catalog.xml读取，默认不存在，要自己创建
+
+（3）remote：读取maven中央仓库的archetype-catalog.xml，大概有几百个archetype
+
+（4）file：读取本机任何一个文件
+
+（5）http：读取任何一个网络上的文件
+
+默认maven会从local+remote去读取archetype列表供选择
+
+可以用mvn archetype:crawl来自动化扫描本地仓库中的archetype，然后生成一份archetype-catalog.xml，放在~/.m2/目录下，但是一般不用这种方式。
 
 
 
