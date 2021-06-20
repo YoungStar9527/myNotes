@@ -442,13 +442,13 @@ HEAD，指针，指向了我们当前所处的分支，因为当前我们默认�
 git log --patch -2，
 #--patch可以显示每次提交之间的diff，同时-n可以指定显示最近几个commit。这个是很有用的，可以看最近两次commit之间的代码差异，进行code review是比较方便的。
  
-用git log --stat
+git log --stat
 #可以显示每次commit的统计信息，包括修改了几个文件，有多少行插入，多少行删除。
  
-用git log --pretty=oneline
+git log --pretty=oneline
 #可以每个commit显示一行，就是一个commit SHA-1和一个提交说明。用git log --pretty=format:"%h - %an, %ar : %s"，可以显示短hash、作者、多长时间以前、提交说明。
  
-用git log --oneline --abbrev-commit --graph
+git log --oneline --abbrev-commit --graph
 #这是最有用的，可以看到整个commit树结构，包括如何合并的，就显示每个commit的SHA-1和提交说明，同时SHA-1显示短值。
 
 #--oneline：显示一行，不要显示多行那么多东西，一行里，就显示commit的标识符，SHA-1 hash值，40位的；提交备注；显示分支和HEAD指向哪个commit
@@ -494,13 +494,33 @@ git reset
 #如果我要回来呢？重新回到之前add methods for classes那个commit对应的版本
 git reflog
 #查看git reflog 可以查看所有分支的所有操作记录（包括已经被删除的 commit 记录和 reset 的操作）
+git show master
+#可以查看master分支指向的那个commit
+git show HEAD^
+git show HEAD~2
+#HEAD，指针，指向的是当前的那个分支，当前的那个分支又是指向某个commit
+#HEAD，就可以指代当前你所处的那个commit对应的版本
+#HEAD^，就是说，HEAD对应的commit的上一个commit，HEAD^^，上两个commit，HEAD^^^，上三个commit
+#HEAD~5，就是说HEAD之前的第5个commit
 ```
 
-git最核心的原理
+**PS:我们不一定就是要用40位完整的SHA-1 hash值来选择一个commit，也可以只是提供hash值的前几位就可以了，至少要4位以上，同时在git仓库中就这前几位可以唯一定位一个commit就ok.就是说，我们如果提供hash值的前7位，git会自动唯一定位出来这个前7位对应的是哪个commit**
 
-（1）三个区域：工作区、暂存区、仓库
+**git log和git reflog的区别：**
+
+​	**git log：**是你当前的分支指向的commit之前的所有commit会显示出来，你的分支指向的那个commit之后的commit是不会显示的
+
+​	**git reflog：**是会显示最近几个月，完整的一个commit历史的（reflog是每个研发人员自己本地的电脑上的记录，跟git log显示出来的提交历史不同，不会同步到远程仓库上去的）
+
+**git最核心的原理**
+
+（1）三个区域（三棵树）：工作区、暂存区、仓库
 
 （2）提交历史：在仓库中，blob->tree->commit->master-HEAD，这套东西形成了git的数据结构
+
+（3）commit树+分支指针：无论在哪个分支上做开发和提交，都是在这个项目公共的一个commit树上在添加不同的commit，形成一颗越来越长的树。分支只是指向某个commit的一个指针而已。然后每个commit就代表了那个时刻下，项目的一个完整的历史快照版本。
+
+（4）因为分支实际上就是一些指针，所以分支是指向commit的，也可以直接用分支名称来指代它目前指向的那个commit
 
 ![image-20210617214833936](git基本操作.assets/image-20210617214833936.png)
 
@@ -594,7 +614,7 @@ git项目有3个主要的部分组成：
 
 **PS:必须git add到暂存区里的修改，才会被git commit时提交到仓库里，否则就是停留在工作区中**
 
-# 5 功能分支工作流实战以及深度解析分支内幕原理
+# 5 深度解析分支内幕原理
 
 ## 5.1 基于git远程仓库的多人协作开发
 
@@ -673,6 +693,8 @@ git log --oneline --decorate --graph --all
 
 ### 5.2.5  远程分支
 
+**分支的提交与更新**
+
 ```shell
 	git push -u origin 分支名称
 	#将本地分支推送到远程仓库，默认分支名称一般为master
@@ -683,6 +705,7 @@ git log --oneline --decorate --graph --all
 	#此时你本地的commit树也会推送到远程版本库，跟远程版本库的commit树进行合并
 	git pull
 	#将当前分支在远程仓库的代码拉取下来，跟本地分支的代码进行合并
+	#只会更新当前分支,其他分支新增的代码并不会合并
 ```
 
 ​	远程版本库的分支，在本地都有追踪分支(remote-tracking 分支)
@@ -695,26 +718,35 @@ git log --oneline --decorate --graph --all
 
 ​	此时，如果在本地你做了不少开发，然后本地master移动了好几个commit，同时origin/master还是指向最开始的那个commit；而同时，远程版本库上，其他同事也提交了几次代码，因此远程版本库上的commit也移动了几个commit。
 
+**拉取远程仓库分支并进行关联**
+
 ```shell
 git fetch origin
-#要让本地和远程保持同步,该命令会将远程版本库的commit树和所有的分支都拉取下来，跟本地的commit树进行合并
+#要让本地和远程保持同步
 #同时拉取下来所有最新的远程分支
-#此时可能就会在本地形成一棵有两个分叉的commit树
 #本地的origin/master会指向远程版本库的master指向的那个commit，本地的master继续指向之前本地最新的那个commit
-git merge 远程分支
-#将远程分支代码合并到本地分支上去
+git checkout -b 分支名称 origin/分支名称
+#可以将本地获取到一个分支跟origin/分支名称 关联起来，然后就可以跟你一起对一个分支进行修改了(因为git fetch origin获取到新分支时，这个新分支是只读的，需要关联起来，就可以对这个分支进行修改了)
+#创建出来的本地分支叫做tracking brach，而这个本地分支track的远程分支叫做upstream branch。此时本地分支就会track那个远程分支，跟远程分支之间会建立关联关系
+
+```
+
+**分支合并与创建分支本地分支**
+
+```shell
+git merge 分支名称
+#将分支代码合并到当前所在分支上去
 #先git fetch origin，然后git merge 远程分支(如果冲突的话，可以一个一个解决)，相当于git pull(可能会冲突，形成冲突文件，是可读的)
 git checkout -b 分支名称
 #这个命令就是创建本地分支，本地分支指针指向最新一个commit，同时HEAD指针指向本地分支指针
 #git checkout -b，相当于两个命令，git branch dev，git checkout dev，先创建分支，再切换到分支
-git checkout -b 分支名称 origin/分支名称
-#可以将本地获取到一个分支跟origin/分支名称 关联起来，然后就可以跟你一起对一个分支进行修改了(因为git fetch origin获取到新分支时，这个新分支是只读的，需要关联起来，就可以对这个分支进行修改了)
-#创建出来的本地分支叫做tracking brach，而这个本地分支track的远程分支叫做upstream branch。此时本地分支就会track那个远程分支，跟远程分支之间会建立关联关系
 ```
 
 ​	如果我们在tracking分支上，执行git pull命令，git就会自动将对应的远程分支在远程版本库上的代码拉取下来跟本地的tracking分支做合并，如果有冲突的话，还需要解决冲突。
 
 ​	如果我们是使用clone命令克隆的远程版本库，那么默认就会将本地的master分支创建为追踪origin/master远程分支的。
+
+**分支的版本控制**
 
 ```shell
 git branch
@@ -728,7 +760,7 @@ git branch -vv
 git branch
 #显示出当前所有分支列表，以及你在哪个分支上工作
 git branch --merged
-#可以看到哪些分支被merge进了当前分支；
+#可以看到哪些分支被merge进了当前分支
 git branch --no-merged
 #可以看到哪些分支还没有被merge进当前分支
 git branch -d 分支名称
@@ -743,6 +775,8 @@ git push origin --delete 分支名称
 
 ### 5.2.6 分支知识总结
 
+#### 5.2.6.1 基础知识总结
+
 ​	1 git分支的一些基础知识：commit提交历史，分支就是指针，HEAD指向当前分支
 
 ​	2 拉不同的分支，就是不同的指针，基于指针指向的那个版本的代码，你在分支上做开发提交，其实就是在commit提交树上长出来不同的枝丫
@@ -754,6 +788,20 @@ git push origin --delete 分支名称
 ​	5 origin/master对应的就是远程仓库的master
 
 ​	6 本地仓库和远程仓库之间推送和拉取代码，实际上就是在同步整套commit提交历史，包括进行一些分支指针的合并
+
+PS:不同分支查看git log只是查看当前分支的log
+
+#### 5.2.6.2 知识结合实战总结
+
+​	1、不管是谁，不管在哪里，不管是哪个分支，你做提交，其实就是在自己本地的提交历史树上加一个新的commit，然后你当前的分支就指向最新的那个commit而已
+
+​	2、你切换分支，新建分支，只不过是在切换指向的commit而已；因为不同的分支是指向不同的commit的，对应的是不同版本的代码；新建分支只不过是多一个指针而已，指向当前的这个commit
+
+​	3、在本地基于各种分支完成了代码开发，每个分支指向对应的一个commit之后，完成了自己本地的提交历史树的修改了，就可以将本地的提交历史树，推送到远程仓库，跟远程仓库的提交历史树进行合并
+
+​	4、此时远程仓库会和你的本地的提交历史树保持一致
+
+​	5、其他研发人员跟你一样，同时可以从远程仓库拉取代码，也就是拉取提交历史树，跟自己本地的提交历史树进行合并，可能会出现代码冲突。你和其他人都对同一个分支进行修改，此时你们俩的提交历史是不一样的。对你来说，一个分支是指向一个commit，对他来说，同一个分支是指向了不同的commit。此时就需要对这个分支指向的两个commit进行代码合并，可能需要解决冲突。合并之后会出现一个新的commit，就是合并了你们两个人的代码的一个commit，然后分支指向那个commit。
 
 ### 5.2.7 解决分支冲突
 
@@ -775,11 +823,163 @@ System.out.println(“I liike storm......”);
 
 ​	一般来说尽量避免冲突，让不同的人负责不同的独立的模块对应的工程，大家修改的代码都是不一样的，从根本上避免代码出现冲突
 
-##  5.3 功能分支工作流
+### 5.2.8 commit内幕原理深入探究流程图
+
+ 地址：https://www.processon.com/view/link/60cf1c40e401fd0e51f39fff
+
+![git commit 深入探究](git基本操作.assets/git commit 深入探究.jpg)
+
+# 6 基于CentOS7安装部署企业私有的GitLab服务器
+
+## 6.1 安装GitLab
+
+参考官方文档安装：https://about.gitlab.com/install/#centos-7
+
+#### 1 安装并配置必要的依赖
+
+```shell
+sudo yum install -y curl policycoreutils-python openssh-server perl
+sudo systemctl enable sshd
+sudo systemctl start sshd
+sudo firewall-cmd --permanent --add-service=http
+#开放http访问
+sudo firewall-cmd --permanent --add-service=https
+#开放https访问
+sudo systemctl reload firewalld
+```
+
+安装Postfix 以发送通知电子邮件
+
+```shell
+sudo yum install postfix
+sudo systemctl enable postfix
+sudo systemctl start postfix
+```
+
+#### 2 添加GitLab包仓库并安装包
+
+添加 GitLab 包存储库
+
+```shell
+curl https://packages.gitlab.com/install/repositories/gitlab/gitlab-ee/script.rpm.sh | sudo bash
+```
+
+安装 GitLab 包
+
+```shell
+sudo EXTERNAL_URL="https://gitlab.example.com" yum install -y gitlab-ee
+#https://gitlab.example.com为指定访问的url地址， 这个url需要设置为本地安装的ip地址，默认80端口无须加端口号
+#例如sudo EXTERNAL_URL="https://192.168.31.101" yum install -y gitlab-ee
+```
+
+查看gitlab状态，是否安装成功
+
+```shell
+gitlab-ctl status
+```
+
+按照上面指定的url访问gitlab
+
+重新设置密码，然后使用**root和自己设置的密码来访问gitlab**
+
+**PS:默认管理员账户为root**
+
+## 6.2 使用GitLab
+
+### 6.2.1 创建group组
+
+**PS:下列对应配置操作需要使用root管理员账户，其他账户无此权限**
+
+![image-20210619164923558](git基本操作.assets/image-20210619164923558.png)
+
+可选对应组的访问权限，公司内部开发建议使用private权限，只允许组内成员使用
+
+![image-20210619165012008](git基本操作.assets/image-20210619165012008.png)
+
+### 6.2.2 创建user用户并绑定对应组
+
+#### 6.2.2.1 创建用户
+
+![image-20210619165234851](git基本操作.assets/image-20210619165234851.png)
+
+密码需要发送邮箱验证输入密码，服务器没配置邮箱验证的情况，可以通过修改用户信息来设置对应密码
+
+![image-20210619165323987](git基本操作.assets/image-20210619165323987.png)
+
+#### 6.2.2.2 用户绑定对应组
+
+进入组
+
+![image-20210619165525997](git基本操作.assets/image-20210619165525997.png)
+
+从上到下分别为：选择用户、设置用户权限(建议设置为maintainer或者development)、确认创建用户按钮
+
+![image-20210619165614061](git基本操作.assets/image-20210619165614061.png)
+
+### 6.2.3 使用开发者账户关联本地git
+
+使用开发者账户登录，并进入配置界面
+
+![image-20210619170442740](git基本操作.assets/image-20210619170442740.png)
+
+将本地生成的公钥添加到gitlab，点击确定
+
+![image-20210619170518617](git基本操作.assets/image-20210619170518617.png)
+
+将本地已有git项目关联到gitlab(也可以直接git clone GitLab上的项目(通过ssh))
+
+```shell
+git remote remove origin
+#先删除本地项目关联的远程仓库(如果之前没关联，无须执行改命令)
+git remote add origin gitlab项目地址
+#添加gitlab远程仓库地址，gitlab项目地址就是对应项目的ssh地址，如：git@192.168.31.101:oa/oa-parent.git
+git pull origin master --allow-unrelated-histories
+#拉取远程仓库，并合并本地和远程两个独立启动仓库的历史
+#在pull命令后紧接着使用--allow-unrelated-history选项来解决问题（该选项可以合并两个独立启动仓库的历史）
+#直接clone的方式在本地建立起远程github仓库的克隆本地仓库无须执行改命令
+git branch --set-upstream-to=origin/master master
+#指定本地master到远程的master
+#上面操作是更改了一下remote origin 所以这里要重新手动将本地master分支和远程origin/master分支做一下关联
+#如果不指定的话直接pull，会出现There is no tracking information for the current branch的异常
+git push -u origin master
+#将本地仓库的代码推送到gitlab上去
+#如果事先未执行git pull origin master --allow-unrelated-histories来合并本地和远程两个独立仓库，会报fatal: refusing to merge unrelated histories（拒绝合并不相关历史的异常）
+```
+
+引用：https://blog.csdn.net/u012145252/article/details/80628451
+
+引用：https://blog.csdn.net/sinat_36246371/article/details/79738782
+
+## 6.3 维护gitlab
+
+```shell
+gitlab：gitlab-ctl start
+#启动
+gitlab：gitlab-ctl stop
+#停止
+gitlab：gitlab-ctl restart
+#重启
+/var/log/gitlab
+#gitlab日志：
+gitlab-ctl tail
+#查看gitlab日志：
+gitlab-ctl tail nginx/gitlab_access.log
+#查看gitlab对应的Nginx访问日志
+gitlab-ctl tail postgresql
+#查看gitlab对应的数据库postgre-sql的日志
+/var/opt/gitlab/git-data
+#gitlab数据存放目录
+```
+
+gitlab使用文档：http://docs.gitlab.com/ce/
+
+# 7 工作流分析
 
 ​	**集中式工作流、功能分支工作流、GitFlow工作流、互联网公司一种GitFlow工作流的变种，每种工作流都没有绝对的好坏，主要是适用于某个场景下，某种类型的项**
 
-### 5.3.1 功能分支工作流概述
+##  7.1功能分支工作流
+
+### 7.1.1 功能分支工作流概述
 
 ​	一般来说，都会准备一个master分支，作为你的稳定分支，这里的代码是随时可以上线的；有多个feature分支，每个feature分支用来开发一个功能。
 
@@ -791,37 +991,296 @@ System.out.println(“I liike storm......”);
 
 **功能分支工作流非常适合对公司内部的系统、平台或者工具，5人以内小团队，3人左右，去开发一个比如公司内使用工具，报表平台**
 
-# 6 基于CentOS7安装部署企业私有的GitLab服务器
+## 7.2 集中式工作流
+
+**集中式工作流：2人以内的项目，1人单独维护的一个项目**
+
+​	某2个同学，负责维护了一个小型的工具类的系统，比如发短信/邮件/消息的这么一个工具；某2个同学，负责维护大数据计算作业类的工程，比如说spark作业，spark就是一个工程，然后在里面你要去维护一套代码，但是这套代码的话呢就是实现一套不同类型的计算任务
+
+​	比如spark工程中，有的作业是用来分析用户行为的；有的作业是用来分析用户活跃度的
+
+​	**不需要分支，直接每个人都是这个项目的master，都可以直接push代码，需求更新频率也很低，不是经常要修改代码的**
+
+​	**两个人都直接基于master分支去做开发，也不涉及什么code review，pull request**
+
+​	**基于gitlab的集中式工作流，就是这么玩儿的，说实话，因为就一两个人开发，所以不需要使用太多的gitlab的功能，就是基于一个master分支开发**
+
+**实战一下集中式工作流：**
+
+（1）张三和李四都在master分支上
+
+（2）张三先修改一下代码，然后直接push到gitlab上去
+
+（3）李四也修改代码，同时跟张三修改了同一行代码，跟张三会出现冲突，此时push失败，要求先pull，pull之后会要求解决冲突
+
+（4）解决冲突，提交代码，再次push
+
+![image-20210620103918081](git基本操作.assets/image-20210620103918081.png)
+
+## 7.3 基于rebase优化集中式工作流的提交历史
+
+​	rebase在实际工作场景中很少用，他的适用场景也有限，但是不是说rebase就没用，也有用，是有其适用的场景的
+
+​	集中式工作流这个场景结合起来去讲解rebase，一方面是讲解你的这个rebase的原理，一方面是讲解rebase在集中式工作流场景下，使用它的作用是什么呢？
+
+在刚才那种普通的集中式工作流开发流程下，会有一个问题，就是每次如果某个人push了代码到master，然后另外一个哥儿们也要push会失败
+
+此时那个哥儿们就要git pull拉取和合并master分支的代码
+
+坑爹的事情来了，每次都这样合并的话，会导致你最后发现看到这个项目，它的提交历史就是各种分叉，各种合并，提交历史感觉很难看
+
+实际上来说，对于一个普通的集中式工作流开发的小项目，是不需要这样分叉的提交历史的，我们希望的是那种很平滑的，就一条线一样的提交历史，看起来会比较清爽
+
+要优化集中式工作流的提交历史成为一条线，看起来非常的清晰和清爽，此时就要使用rebase命令
+
+```shell
+git pull --rebase
+#rebase：变基，就是改变commit之前依赖的基础commit
+```
+
+通过git pull --rebase，执行变基式的合并，改变commit历史，看起来提交历史就是一条直线，张三先提交，李四再提交，李四再提交，张三再提交
+
+集中式工作流的项目，看起来比较清爽
+
+```shell
+git rebase feature/001
+#比如说我们有一个master分支，还有另外一个分支比如feature/001
+#也可以是合并的时候，采取git rebase feature/001来合并
+```
+
+你就全部都采取git pull --rebase来跟其他人对master分支的修改进行合并，就能保持项目的提交历史就是一条直线
+
+![image-20210620184421117](git基本操作.assets/image-20210620184421117.png) 
+
+**PS:rebase适用于优化集中式工作流的提交历史，变成一条线，没那么多分叉，变得清爽美观**
+
+**PS:rebase：变基，就是改变commit之前依赖的基础commit**
+
+## 7.4 GitFlow工作流
+
+### 7.4.1 版本稳定迭代项目的中小型团队的GitFlow工作流实战
 
 
 
+![image-20210620190542574](git基本操作.assets/image-20210620190542574.png)
+
+**GitFlow工作流流程**
+
+​	1 项目刚开始建立，就两个分支，**master**分支和**develop**分支，指向的commit是一样的，代码是一样的
+
+​	2 后续每个人从**develop**分支拉一个**feature**分支出来
+
+​	3 对应**feature**分支开发好了，再合并到**develop**分支中
+
+​	4 **develop**分支经过联调测试完成后，从**develop**分支拉取一个**release**分支进行QA测试
+
+​	4 QA测试结束后，将**release**分合并到**master**进行预发布测试，**master**分支的代码在预发布环境，模拟线上的环境，进行测试和验证。
+
+​	5 同时QA和PM，一起进行最后的验收和验证后，直接用**master**分支的代码进行v1.0版本的上线,上线之前需要对该**master**分支打一个tag，便于以后代码的回退(可以在GitLab或者命令等方式对改版本打tag)。
+
+​	6 上线之后发现有bug，此时需要从**master**分支拉一个**bugfix**分支下来，快速进行bug复现，修复，合并到**master**和**develop**两个分支
+
+**PS:每次master代码上线之前，都必须对master打一个标签，v1.0，v1.1。tag，标签，是什么？其实简单来说，就是指向master指向的那个commit的一个指针而已，tag指针是不能移动。说明这个commit就是一个可以稳定的可以上线的某个版本的代码**
+
+**PS:feature分支用完了之后，是要删除掉的；release分支测试完了之后，也是要删除掉的；bugfix分支用完了之后，也是要删除掉的；唯一长期保存的只有master和develop两个分支，一个用于持续集成，一个用于稳定上线**
+
+**GitFlow工作流适用的场景是什么**
+
+​	适合的就是版本稳定迭代的项目，一个版本，接一个版本，接一个版本。面向企业内部的系统或者项目，OA系统，CRM系统，ERP系统，或者面向外部的系统，比如说电商系统，但是系统已经成熟稳定了，版本稳定迭代
+
+**GtiFlow工作流的不足之处在于什么**
+
+​	如果是做一些互联网公司里面，面向外部的重要的业务系统，业务发展的过程中，快速迭代，同时5个版本，8个版本，10个版本，**多达几十号人频繁的拉出多个版本并行开发**
+
+​	**develop分支会处于一个极其不稳定的状态**
+
+​	**而且不同版本的测试和开发进度不一样的**
+
+​	比如v1.0已经集成测试完了，要进入QA测试了，但是此时develop分支还混合了v1.1版本的多个代码，你如果此时直接基于develop分支拉一个release/1.0分支，会把develop分支里面的v1.1的代码也带进去
 
 
 
+### 7.4.2 互联网公司多版本频繁并行场景下的GitFlow变种工作流实战
 
 
 
+![image-20210620192958558](git基本操作.assets/image-20210620192958558.png)
+
+基于GitFlow工作流去一点点改进
+
+整个依赖的稳定的和基准的分支只有一个，就是master分支，全部以master分支为基准和基础
+
+（1）比如说启动一个版本
+
+​	v1.0，涉及3个功能，投入了3个RD（resourch developer，研发工程师），直接从master分支拉3个feature分支下来，不是从develop分支拉了，也没有develop分支了；
+
+​	同时要做一个v1.1，涉及5个功能，投入了5个RD去开发，直接从master分支拉5个feature下来，每个人就基于自己的feature去开发，搞
+
+​	同时的话呢，每个版本，刚开始启动，除了拉一堆feature分支，还需要同时从master分支拉一个develop分支下来，专门用于这个版本的集成测试
+
+（2）一个版本ready之后，要进入集成测试了
+
+​	很多时候，v1.1.0这样的版本，会比v1.0.0版本先上线
+
+​	快速发展的业务和项目，不断的招人，不断的进新人，不断的开启各种版本，经常出现v1.5.3先上线了，但是v1.2.0还没上线
+
+​	**基准代码只有master**
+
+​	**feature和develop都从master拉取，以master为准**
+
+​	每个版本的RD各自迭代，各自独立开发，独立测试，加速开发和测试的进度
+
+​	**直接跟master分支拉出来的staging分支去合并，release分支跟master分支的代码，以staging分支为基础进行合并，到这一步才进行多个版本之间的代码集成**
+
+​	到这一步，master代码一定是稳定的，即使master分支混合了别的版本的代码，但是代码基本上都已经趋向于稳定了，所以此时进行多个版本的代码集成，风险是比较低的
+
+​	staging代码，回归测试，QA仔细回归一遍，要把集成在一起的多个版本的代码对应的功能，全部回归测试，确保每个版本的代码对应的功能都正常运行
+
+​	staging代码和master分支合并在一起，打tag，准备上线，这个版本就实现了上线
+
+**PS:适用于多版本频繁并行的大型项目基于GitFlow的变种工作流，与GitFlow主要区别**
+
+​	**1 feature改为从master拉取，只有master一个基准**
+
+​	**2 多出一个staging分支，用于合并release和master代码，然后再讲staging合并master，相当于一个中间缓冲分支**
+
+# 8 Git高阶实战技巧
+
+## 8.1 比较不同分支之间差了哪些代码改动
+
+```shell
+git log --abbrev-commit feature/001..master
+#或
+git log --abbrev-commit HEAD..master
+#可以看一下，feature/001分支比master分支落后了哪些commit，不是需要跟master保持一下同步
+#HEAD就是执行当前分支最新commit的指针，当前分支是feature/001,HEAD..master和feature/001..master就是一个效果
+git log --abbrev-commit HEAD..origin/master
+#也可以查看当前分支和远程分支落后了哪些commit
+#需注意，领先commit的分支需要放在..后面，否则命令无效果
+
+========以下较为少用
+git log --abbrev-commit feature/001 feature/002
+#同时也可以看一下哪些commit是存在于两个分支中的某一个，但是不是两个分支都有的
+git log --abbrev-commit feature/001 feature/002 --not master
+#还可以看一下，在两个feature分支中都有的commit，但是在master分支中还没有
+```
 
 
 
+## 8.2 查看不同版本之间的代码差异具体是什么
+
+```shell
+git diff
+#工作区和暂存区
+git diff --cached
+#暂存区和仓库
+git diff HEAD
+#工作区和仓库
+git diff feature/001 master
+#两个分支之间的差异
+git diff HEAD HEAD^
+#最近两次提交之间的差异
+```
 
 
 
+## 8.3 将暂存区中的多个功能代码分成多次提交
+
+```shell
+git add -i
+#进入交互模式
+#2 update是放入暂存区，3：revert是从暂存区里挪出来
+#输入对应文件的数字，回车，对应文件就会变成*开头，就说明针对当前操作成功。再回车就推出当前操作，进入交互模式主界面
+#7 quit退出交互模式
+```
+
+![image-20210620203334091](git基本操作.assets/image-20210620203334091.png)
+
+**PS:可以通过git add -i交互模式中的revert操作将暂存区的代码挪出来，然后在分批add再commit就可以实现将暂存区中的多个功能代码分成多次提交**
 
 
 
+## 8.4 feature分支开发到一半时切换到bugfix分支
+
+当前分支存在没有commit的代码时，直接切换分支会警告异常，提示未提交代码会被覆盖，无法切换分支
+
+![image-20210620204453249](git基本操作.assets/image-20210620204453249.png)
+
+```shell
+git stash
+#将代码暂存起来
+#暂存起来后就可以切换分支了
+git stash --list
+#查看暂存列表
+git stash apply stash@{0}
+#恢复到指定的一次stash
+git stash apply
+#将暂存的代码恢复
+git stash drop stash名称
+#手动删除掉某个stash
+```
 
 
 
+## 8.5 对本地不规范的提交历史进行修改和调整
 
+**1 修改提交日志**
 
+```shell
+git commit --amend
+#直接就可以修改上一个commit的备注信息，补充更多的提交说明
+#相当于是将上一个commit删除掉，然后基于上一个commit对应的代码及当前暂存区的代码重新构建一个commit object
+#如果当前暂存区有代码，也会将当前暂存区的代码提交上去
+```
 
+​	场景1：如果你刚刚执行了一个commit，结果发现，不好，我其实应该补充更多的备注，才能符合公司对commit备注这块的规范的，刚才写的太简单了。git commit --amend。直接就可以修改上一个commit的备注信息，补充更多的提交说明
 
+​	场景2：你刚执行了一个commit，结果扫了一眼代码，发现今天忘记修改几行代码了，需要修改之后补充到上一个commit中去，没关系。先修改你的代码，同时加入暂存区，然后再次执行：git commit --amend
 
+**PS:说白了就是将上一个commit删掉，重新提交，重新提交代码自然会将暂存区的代码提交**
 
+**PS:但是这里要注意，git commit --amend是会修改commit的SHA-1 hash值的，所以如果一个commit已经push到了远程仓库，就不要再去修改了，否则的话会造成提交历史的一个混乱**
 
+**2 修改历史版本的commit**
 
+```shell
+git rebase -i HEAD~3
+#编辑前3个版本，将对应版本的pick改成edit
+#然后就回到了最早的edit版本，使用git commit --amend修改
+git rebase --continue
+#修改完成后，在使用git rebase --continue继续修改下一个版本
+#反复使用git commit --amend修改,git rebase --continue到下一个版本，最后一次git rebase --continue就完成了所有修改
+```
 
+git rebase -i HEAD~3效果图
+
+![image-20210620212635770](git基本操作.assets/image-20210620212635770.png)
+
+![image-20210620212503184](git基本操作.assets/image-20210620212503184.png)
+
+git commit --amend及git rebase --continue效果图
+
+![image-20210620212556180](git基本操作.assets/image-20210620212556180.png)
+
+**3 删除commit**
+
+​	也可以通过git rebase -i HEAD~3在编辑器里删除对应commit，就实现了删除commit
+
+**4 将多个commit合并为一个commit**
+
+​	通过git rebase -i HEAD~3，可以将多个commit前面的命令修改为squash，就会自动将这些commit合并为一个commit
+
+​	提示一下，如果要合并多个commit，那么一定要往前多选择一个commit
+
+**5 将一个commit切分为多个commit**
+
+通过git rebase -i HEAD~3，将要拆分开来的commit前面的指令，修改为edit
+
+然后你就会回到那个commit对应的版本，此时执行git reset HEAD^，此时会直接回退到之前的状态，然后此时可以执行多次git add和git commit，形成多个commit
+
+接着最后执行git rebase --continue结束这次commit拆分
+
+**PS:8.5 本小节针对的全部都是本地的提交历史**
 
 
 
