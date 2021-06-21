@@ -1210,7 +1210,7 @@ git add -i
 git stash
 #将代码暂存起来
 #暂存起来后就可以切换分支了
-git stash --list
+git stash list
 #查看暂存列表
 git stash apply stash@{0}
 #恢复到指定的一次stash
@@ -1282,5 +1282,243 @@ git commit --amend及git rebase --continue效果图
 
 **PS:8.5 本小节针对的全部都是本地的提交历史**
 
+## 8.7 对本地刚做出的修改、暂存和提交进行撤回
+
+```shell
+git reset --hard HEAD
+#或
+git reset --hard commit的hash值
+#HEAD一般是最新提交的commit指针,将本地为提交的修改变为全部撤回到该commit
+#HEAD^,加一个^就是再上一个commit版本
+#指定commit的hash值，就是撤回到该hash值的commit版本
+git checkout -- 文件名
+#就是将该文件撤回到最新commit的版本
+```
 
 
+
+## 8.8 远程和本地同时撤回分支合并操作
+
+本地
+
+```shell
+git merge --abrort
+#两个分支merge出现了冲突，还原到未合并的状态
+git reset --hard HEAD^
+#如果仅仅是在本地完成了merge后想要撤回
+#很简单，直接执行,将分支挪回merge之前的那个commit即可，就相当于没执行过merge
+```
+
+远程仓库撤回上一个commit
+
+```shell
+#先
+git revert HEAD
+#回到了上一个commit的状态
+#再
+git push origin master
+#同步撤回远程仓库的commit操作
+```
+
+远程撤回分支merge操作
+
+（1）如果是要撤回已经push到远程仓库的merge操作
+
+（2）在本地执行
+
+```shell
+git revert -m 1 HEAD
+#再执行
+git push origin master
+```
+
+此时本地和远程的提交历史都会多一个commit出来，该commit的内容和合并之前的master指向的那个commit是一样的，同时master此时指向最新的那个commit
+
+（3）但是后面，如果要再次将release分支和master分支进行合并，此时是需要特殊处理的，再次在本地执行：
+
+```shell
+git revert HEAD
+git push origin master
+```
+
+就是再次将master还原到指向一个新的commit，该commit的内容与上一次merge后的那个commit一样，包含merge的内容
+
+（4）最后再次将release分支与master分支进行合并，此时可以保证release分支所有的内容，都是合并到master分支的
+
+
+
+## 8.9 二分查找哪一次提交引入了线上bug
+
+```shell
+git bisect start
+#开始二分查找
+git bisect bad
+#标注当前这个commit是有bug的
+#输入
+git bisect good
+#会继续往后面二分查找；如果这个版本就有bug，那么说明是之前引入的bug
+#输入
+git bisect bad
+#最后需要执行
+git bisect reset
+#就是从二分查找状态中恢复到之前的状态
+```
+
+​	**每次输入git bisect good或者git bisect bad之后，git会根据二分查找并回滚对应的git版本，用该版本进行对应测试，无bug就打good标签，有bug就继续打bad标签，直到定位到具体bug的版本**
+
+![image-20210621220849262](git基本操作.assets/image-20210621220849262.png)
+
+![image-20210621221310901](git基本操作.assets/image-20210621221310901.png)
+
+**该提示信息就是当前git二分定位到的commit版本**
+
+## 8.10 让多个项目共享一个子项目的代码修改权利
+
+**PS:较为少用，一般一个子项目最好是独立拉一个项目版本，而不是多个项目共享**
+
+**PS:8.10小结 欠账，未实操。。**
+
+一般来说，submodule使用的场景，就是要在一个父项目下，再建立一个子项目。
+
+（1）我们先建立一个DbConnector子项目
+
+```shell
+git clone git@192.168.31.80:OA/DbConnector.git
+cd DbConnector
+touch README.md
+git add README.md
+git commit -m "add README"
+git push -u origin master
+```
+
+（2）将所有工程师的父项目中都注册DbConnector这个子项目
+
+```shell
+#进入某一个父项目，然后在其下创建一个submodule：
+git submodule add git@192.168.31.80:OA/DbConnector.git
+#这个时候，会出现一个新的目录，就是DbConnector。而且此时用git status命令，会发现说有.gitmodules和DbConnector两个东西等待提交。
+#.gitmodules里面保存了你的子模块和其对应的git url之间的映射关系
+#然后执行下面的命令，将子模块提交：
+git add --all .
+git commit -m ‘added DbConnector module’
+git push origin master
+```
+
+接着别的研发人员，可以将这个包含了一个子模块的项目克隆到自己本地，但是此时默认是只有一个子模块的目录，里面是空的，没有文件的。
+
+```shell
+git clone git@192.168.31.80:OA/oa-parent.git
+#或者是
+git pull
+#此时需要运行两个命令：
+git submodule init
+git submodule update
+```
+
+才能初始化子模块的目录，同时拉取子模块的文件
+
+或者也可以简化一点，通过给下面的命令，一次性把上述工作都干了：
+
+```shell
+git clone --recursive git@192.168.31.80:OA/oa-parent.git
+```
+
+（3）对子项目进行代码修改
+
+1）无论谁都可以跟平时一样，在DbConnector里面，当做是一个完全独立的项目，在里面可以修改源代码，包括说修改之后提交，分支操作，在DbConnector里面去执行就可以了
+
+2）以后每次如果某个人要更新子模块中的数据，那么执行以下命令即可：
+
+进入子模块的目录
+
+```shell
+git fetch
+git merge origin/master
+```
+
+**2、Subtree**
+
+**git以前是推荐使用submodule来管理子项目，但是git 1.5.2之后就推荐使用subtree了。subtree的优点，就是子项目的维护对我们来说几乎就是透明的，不需要引入太多的维护成本。**
+
+cd P1项目的路径
+
+```shell
+git subtree add --prefix=用来放S项目的相对路径 S项目git地址 xxx分支
+```
+
+上面的代码，就会把s项目的代码（指定分支）下载到本地放入指定的目录中，同时提交到本地p1项目中
+
+对于P2项目也做一样的事情
+
+直接在p1中各种修改代码和提交，包括s项目的代码，都没有关系
+
+接着某一天，p1项目负责人想把对s项目的代码更改提交到远程仓库，此时执行下面的命令：
+
+```shell
+git subtree push --prefix=S项目的路径 S项目git地址 xxx分支
+```
+
+这个时候，git会找到所有对s目录的commit，然后一起提交到其对应的远程版本库中
+
+接着p2项目的负责人知道了这个事情，需要将s项目最新的代码更新到自己本地，此时就执行下面的命令即可：
+
+git subtree pull --prefix=S项目的路径 S项目git地址 xxx分支
+
+3、最后的一个总结
+
+如果有多个仓库，多个项目，要共享对同一个子项目的修改权限的话，那么可以这么玩儿
+
+子项目其实是有一个单独的仓库的
+
+但是在父项目中可以为其注册子项目，接着不同仓库的人，就可以很方便的在自己的仓库代码中，修改子项目的代码，同时互相之间都可以push代码，也可以pull到别人push的代码
+
+就算真的有类似的场景，我也不推荐使用，太复杂了
+
+## 8.11 团队拆分迁移项目代码时简化提交历史
+
+**PS:8.11小结 欠账，未实操。。**
+
+将原来的一个仓库拆分成两个仓库
+
+```shell
+echo 'get history from blah blah blah' | git commit-tree 9c68fdc^{tree}
+```
+
+我们从要截断的那个commit的上一个commit，创建一个基准commit出来，比如用倒数第二个commit
+
+```shell
+git rebase--onto 622e88 9c68fdc
+```
+
+接着，执行git rebase --onto命令，将倒数第二个commit之后的commit重新基于那个commit基础之上来构建提交历史
+
+此时，master分支代码就会只保留了2个commit
+
+然后可以将这个master分支的代码和commit历史提交到另外一个新的代码仓库上去，那个代码仓库就会仅仅保留两个commit了
+
+## 8.12 将新版本的功能放到上一个版本提前上线
+
+通过合并其他分支的对应commit版本实现
+
+```shell
+git cherry-pick 其他分支的某个commit的hash
+#当前分支就会合并其他分支的某个commit
+```
+
+
+
+## 8.13 基于GitLab的代码权限控制以及强制代码审查
+
+**PS:8.13小结 欠账，未实操。。**
+
+（1）第一件事情，有些分支是需要被保护起来的，就是说不能直接被push，尤其是master分支。
+
+（2）仓库全都是private私有的，如果在一个部门中建立了一个项目，那么默认这个部门下的研发人员对这个项目都是有权限的，但是有的人是master，有的人是developer
+
+（3）实践过的一个技巧：强制code review
+
+将develop分支设置为protected
+
+将develop分支保护起来之后，就是说，每个研发人员第一次写好feature分支的代码，有对应权限的才能合并develop分支，需要先对merge request往develop分支进行code review
+
+review通过之后，可以合并到develop分支，做持续集成
