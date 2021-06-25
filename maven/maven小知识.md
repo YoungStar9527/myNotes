@@ -287,33 +287,57 @@ maven的生命周期，就是对传统软件项目构建工作的抽象
 **clean生命周期包含的phase如下：**
 
 pre-clean
+
 clean
+
 post-clean
 
 **default生命周期包含的phase如下：**
 
 validate：校验这个项目的一些配置信息是否正确
+
 initialize：初始化构建状态，比如设置一些属性，或者创建一些目录
+
 generate-sources：自动生成一些源代码，然后包含在项目代码中一起编译
+
 process-sources：处理源代码，比如做一些占位符的替换
+
 generate-resources：生成资源文件，才是干的时我说的那些事情，主要是去处理各种xml、properties那种配置文件，去做一些配置文件里面占位符的替换
+
 process-resources：将资源文件拷贝到目标目录中，方便后面打包
+
 **compile：**编译项目的源代码
+
 process-classes：处理编译后的代码文件，比如对java class进行字节码增强
+
 generate-test-sources：自动化生成测试代码
+
 process-test-sources：处理测试代码，比如过滤一些占位符
+
 generate-test-resources：生成测试用的资源文件
+
 process-test-resources：拷贝测试用的资源文件到目标目录中
+
 test-compile：编译测试代码
+
 process-test-classes：对编译后的测试代码进行处理，比如进行字节码增强
+
 test：使用单元测试框架运行测试
+
 prepare-package：在打包之前进行准备工作，比如处理package的版本号
+
 **package：**将代码进行打包，比如jar包
+
 pre-integration-test：在集成测试之前进行准备工作，比如建立好需要的环境
+
 integration-test：将package部署到一个环境中以运行集成测试
+
 post-integration-test：在集成测试之后执行一些操作，比如清理测试环境
+
 verify：对package进行一些检查来确保质量过关
+
 **install：**将package安装到本地仓库中，这样开发人员自己在本地就可以使用了
+
 **deploy：**将package上传到远程仓库中，这样公司内其他开发人员也可以使用了
 
 **site生命周期的phase(生成api 在浏览器中查看项目的站点)：**
