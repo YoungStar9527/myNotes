@@ -1788,6 +1788,8 @@ git tag -a v1.1 -m 'test tag'
 #此时查看cat .git/refs/tags/v1.2，会发现返回的不是我们指定的那个commit object，是另外一个新创建的tag object的SHA-1 hash
 ```
 
+**PS:tag不是一个独立的分支，tag只是附属于某个分支的tag标签。拉取远程分支的话需要将tag所属的分支拉取关联。对应远程分支的提交历史就有tag了。然后可以再创建一个本地分支来关联这个tag。**
+
 ![image-20210624205338158](git基本操作.assets/image-20210624205338158.png)
 
 ### 9.3.4 remote
