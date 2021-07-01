@@ -310,5 +310,312 @@ eureka.server.enable-self-preservation: false
 
 ​	在生产环境里面，他怕自己因为自己有网络问题，导致别人没法给自己发心跳，就不想胡乱把别人给摘除，他就进入保护模式，不再摘除任何实例，等到自己网络环境恢复。
 
+## 1.10 扩展
+
+eureka server的启动，相当于是注册中心的启动
+
+eureka client的启动，相当于是服务的启动
+
+**eureka运行的核心的流程，eureka client往eureka server注册的过程**，
+
+​	1 服务注册；服务发现，eureka client从eureka server获取注册表的过程；
+
+​	2 服务心跳，eureka client定时往eureka server发送续约通知（心跳）；
+
+​	3 服务实例摘除；通信，限流，自我保护，server集群
+
+eureka server怎么启动的？
+
+​	**eureka server是依赖eureka client的**，为啥呢？eureka server也是一个eureka client，因为后面我们讲到eureka server集群模式的时候，eureka server也要扮演eureka client的角色，往其他的eureka server上去注册。
+
+​	**eureka core**，扮演了核心的注册中心的角色，接收别人的服务注册请求，提供服务发现的功能，保持心跳（续约请求），摘除故障服务实例。**eureka server依赖eureka core的，基于eureka core的功能对外暴露接口**，提供注册中心的功能
+
+# 2 Eureka Server启动源码
+
+## 2.1 Eureka Server的web工程结构分析以及web.xml解读
+
+### 2.1.1 gradle主要引用
+
+**jersey框架(国内基本没人用):**
+
+​	1 eureka server依赖jersey框架，你可以认为jersey框架类比于spring web mvc框架，支持mvc模式，支持restful http请求
+
+​	2 eureka client和eureka server之间进行通信，都是基于jersey框架实现http restful接口请求和调用的
+
+​	3 eureka-client-jersey2，eureka-core-jersey2,这两个工程是eureka为了方便自己，对jersey框架的一个封装，提供更多的功能，方便自己使用
+
+**mockito：**
+
+​	1 mock测试框架，mock就是用的mockito框架
+
+​	2 在eureka框架里面，他每个工程都是有src/test/java的，里面都写了针对自己本工程的单元测试
+
+**jetty：**	
+
+​	1 方便你测试的，测试的时候，是会基于jetty直接将eureka server作为一个web应用给跑起来
+
+​	2 jersey对外暴露了一些restful接口，然后测试类里，就可以基于jersey的客户端，发送http请求，调用eureka server暴露的restful接口，测试比如说：服务注册、心跳、服务实例摘除，等等功能。
+
+```groovy
+apply plugin: 'war'
+
+dependencies {
+    compile project(':eureka-client')
+    compile project(':eureka-core')
+    runtime 'xerces:xercesImpl:2.4.0'
+    compile "com.sun.jersey:jersey-server:$jerseyVersion"
+    compile "com.sun.jersey:jersey-servlet:$jerseyVersion"
+    compile 'org.slf4j:slf4j-log4j12:1.6.1'
+    runtime 'org.codehaus.jettison:jettison:1.2' 
+    providedCompile "javax.servlet:servlet-api:$servletVersion"
+
+    testCompile project(':eureka-test-utils')
+    testCompile "org.mockito:mockito-core:${mockitoVersion}"
+    testCompile "org.eclipse.jetty:jetty-server:$jetty_version"
+    testCompile "org.eclipse.jetty:jetty-webapp:$jetty_version"
+}
+
+task copyLibs(type: Copy) {
+    into 'testlibs/WEB-INF/libs'
+    from configurations.runtime	
+}
+
+//将eureka-resources下面的那些jsp、js、css给搞到这个war包里面去，然后就可以跑起来，提供一个index页面
+war {
+    from (project(':eureka-resources').file('build/resources/main'))
+}
+
+// Integration test loads eureka war, so it must be ready prior to running tests
+test.dependsOn war
+
+```
+
+
+
+### 2.1.2 web.xml解读
+
+web应用最最核心的就是web.xml。
+
+​	最最重要的就是listener，listener是在web应用启动的时候就会执行的，负责对这个web应用进行初始化的事儿，我们如果自己写个web应用，也经常会写一个listener，在里面搞一堆初始化的代码，比如说，启动一些后台线程，加载个配置文件。
+
+```xml
+  <listener>
+    <listener-class>com.netflix.eureka.EurekaBootStrap</listener-class>
+  </listener>
+<!--在eureka-core里，就是负责eureka-server的初始化的-->
+```
+
+有连着4个Filter，任何一个请求都会经过这些filter，这些filter会对每个请求都进行处理，这个4个filter都在eureka-core里面
+
+```xml
+  <filter>
+    <filter-name>statusFilter</filter-name>
+    <filter-class>com.netflix.eureka.StatusFilter</filter-class>
+  </filter>
+<!--StatusFilter：负责状态相关的处理逻辑-->
+  <filter>
+    <filter-name>requestAuthFilter</filter-name>
+    <filter-class>com.netflix.eureka.ServerRequestAuthFilter</filter-class>
+  </filter>
+  <!--ServerRequestAuthFilter：一看就是，对请求进行授权认证的处理的-->
+  <filter>
+    <filter-name>rateLimitingFilter</filter-name>
+    <filter-class>com.netflix.eureka.RateLimitingFilter</filter-class>
+  </filter>
+  <!--RateLimitingFilter：负责限流相关的逻辑的（很有可能成为eureka-server里面的一个技术亮点，看看人家eureka-server作为一个注册中心，是怎么做限流的，先留意算法是什么，留到后面去看）-->
+  <filter>
+    <filter-name>gzipEncodingEnforcingFilter</filter-name>
+    <filter-class>com.netflix.eureka.GzipEncodingEnforcingFilter</filter-class>
+  </filter>
+  <!--GzipEncodingEnforcingFilter：gzip，压缩相关的；encoding，编码相关的-->
+```
+
+jersey框架的一个ServletContainer的一个filter
+
+​	1 类似于每个mvc框架，比如说struts2和spring web mvc，都会搞一个自己的核心filter，或者是核心servlet，配置在web.xml里
+
+​	2 相当于就是将web请求的处理入口交给框架了，框架会根据你的配置，自动帮你干很多事儿，最后调用你的一些处理逻辑。
+
+​	3 jersey也是一样的，这里的这个ServletContainer就是一个核心filter，接收所有的请求，作为请求的入口，处理之后来调用你写的代码逻辑。
+
+```xml
+  <filter>
+    <filter-name>jersey</filter-name>
+    <filter-class>com.sun.jersey.spi.container.servlet.ServletContainer</filter-class>
+    <init-param>
+      <param-name>com.sun.jersey.config.property.WebPageContentRegex</param-name>
+      <param-value>/(flex|images|js|css|jsp)/.*</param-value>
+    </init-param>
+    <init-param>
+      <param-name>com.sun.jersey.config.property.packages</param-name>
+      <param-value>com.sun.jersey;com.netflix</param-value>
+    </init-param>
+
+    <!-- GZIP content encoding/decoding -->
+    <init-param>
+      <param-name>com.sun.jersey.spi.container.ContainerRequestFilters</param-name>
+      <param-value>com.sun.jersey.api.container.filter.GZIPContentEncodingFilter</param-value>
+    </init-param>
+    <init-param>
+      <param-name>com.sun.jersey.spi.container.ContainerResponseFilters</param-name>
+      <param-value>com.sun.jersey.api.container.filter.GZIPContentEncodingFilter</param-value>
+    </init-param>
+  </filter>
+```
+
+filter-mapping
+
+```xml
+  <filter-mapping>
+    <filter-name>statusFilter</filter-name>
+    <url-pattern>/*</url-pattern>
+  </filter-mapping>
+
+  <filter-mapping>
+    <filter-name>requestAuthFilter</filter-name>
+    <url-pattern>/*</url-pattern>
+  </filter-mapping>
+<!--StatusFilter和RequestAuthFilter，一看就是通用的处理逻辑，是对所有的请求都开放的-->
+  <!-- Uncomment this to enable rate limiter filter.
+  <filter-mapping>
+    <filter-name>rateLimitingFilter</filter-name>
+    <url-pattern>/v2/apps</url-pattern>
+    <url-pattern>/v2/apps/*</url-pattern>
+  </filter-mapping>
+  -->
+<!--RateLimitingFilter，默认是不开启的，如果你要打开eureka-server内置的限流功能，你需要自己把RateLimitingFilter的<filter-mapping>的注释打开，让这个filter生效-->
+
+  <filter-mapping>
+    <filter-name>gzipEncodingEnforcingFilter</filter-name>
+    <url-pattern>/v2/apps</url-pattern>
+    <url-pattern>/v2/apps/*</url-pattern>
+  </filter-mapping>
+<!-/v2/apps相关的请求，会走这里，仅仅对部分特殊的请求生效-->
+
+  <filter-mapping>
+    <filter-name>jersey</filter-name>
+    <url-pattern>/*</url-pattern>
+  </filter-mapping>
+  <!--jersey核心filter，是拦截所有的请求的-->
+
+```
+
+welcome-file-list，是配置了status.jsp是欢迎页面，首页，eureka-server的控制台页面，展示注册服务的信息
+
+```xml
+  <welcome-file-list>
+    <welcome-file>jsp/status.jsp</welcome-file>
+  </welcome-file-list>
+```
+
+### 2.1.3 总结
+
+​	如果要启动eureka-server，就打成war包，找一个web容器，比如说tomcat，就可以启动了 ==> 测试类里，是基于jetty代码层面来启动jetty web容器和eureka-server，方便测试发送http restful接口的调用请求
+
+​	1 eureka-server -> build.gradle中的依赖和构建的配置
+
+​	2 eureka-server -> web应用 -> war包 -> tomcat就可以启动
+
+​	3 web.xml -> listener -> 4个filter -> jersy filter -> filter mapping -> welcome file
+
+##  2.2 Eureka Server启动之环境初始化(EurekaBootStrap)
+
+​	web容器（tomcat还是jetty）启动的时候，把eureka-server作为一个web应用给带起来的时候，eureka-server的初始化的逻辑，监听器，EurekaBootStrap。（eureka-core里面）
+
+**EurekaBootStrap部分核心代码：**
+
+```java
+package com.netflix.eureka;
+public class EurekaBootStrap implements ServletContextListener {
+    /**
+     * Initializes Eureka, including syncing up with other Eureka peers and publishing the registry.
+     * 监听器的执行初始化的方法，是contextInitialized()方法，这个方法就是整个eureka-server启动初始化的一个入
+     * 口。
+     */
+    @Override
+    public void contextInitialized(ServletContextEvent event) {
+        try {
+            initEurekaEnvironment();
+            initEurekaServerContext();
+
+            ServletContext sc = event.getServletContext();
+            sc.setAttribute(EurekaServerContext.class.getName(), serverContext);
+        } catch (Throwable e) {
+            logger.error("Cannot bootstrap eureka server :", e);
+            throw new RuntimeException("Cannot bootstrap eureka server :", e);
+        }
+    }
+    
+    /**
+     * Users can override to initialize the environment themselves.
+     * 初始化eureka-server的环境
+     */
+    protected void initEurekaEnvironment() throws Exception {
+        logger.info("Setting the eureka configuration..");
+        //ConfigurationManager.getConfigInstance()方法，
+        // 这个方法，其实就是初始化ConfigurationManager的实例，也就是一个配置管理器的初始化的这么一个过程
+        String dataCenter = ConfigurationManager.getConfigInstance().getString(EUREKA_DATACENTER);
+        if (dataCenter == null) {
+            logger.info("Eureka data center value eureka.datacenter is not set, defaulting to default");
+            ConfigurationManager.getConfigInstance().setProperty(ARCHAIUS_DEPLOYMENT_DATACENTER, DEFAULT);
+        } else {
+            ConfigurationManager.getConfigInstance().setProperty(ARCHAIUS_DEPLOYMENT_DATACENTER, dataCenter);
+        }
+        String environment = ConfigurationManager.getConfigInstance().getString(EUREKA_ENVIRONMENT);
+        if (environment == null) {
+            ConfigurationManager.getConfigInstance().setProperty(ARCHAIUS_DEPLOYMENT_ENVIRONMENT, TEST);
+            logger.info("Eureka environment value eureka.environment is not set, defaulting to test");
+        }
+    }
+}
+```
+
+   ConfigurationManager是什么呢？看字面意思都猜的出来，配置管理器， 管理eureka自己的所有的配置，读取配置文件里的配置到内存里，供后续的eureka-server运行来使用。
+
+**ConfigurationManager 部分核心代码(属于nextflix.config工程不是eureka源码)：**
+
+```java
+package com.netflix.config;
+
+
+public class ConfigurationManager {    
+    
+    static volatile AbstractConfiguration instance = null;
+    
+    /**
+    * double check + volatile 实现线程安全的单例模式
+    */
+	public static AbstractConfiguration getConfigInstance() {
+        if (instance == null) {
+            synchronized (ConfigurationManager.class) {
+                if (instance == null) {
+                    instance = getConfigInstance(Boolean.getBoolean(DynamicPropertyFactory.DISABLE_DEFAULT_CONFIG));
+                }
+            }
+        }
+        return instance;
+    }
+    
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
