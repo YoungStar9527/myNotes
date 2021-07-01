@@ -518,24 +518,26 @@ welcome-file-list，是配置了status.jsp是欢迎页面，首页，eureka-serv
 
 ​	3 web.xml -> listener -> 4个filter -> jersy filter -> filter mapping -> welcome file
 
-##  2.2 Eureka Server启动之环境初始化(EurekaBootStrap)
+##  2.2 Eureka Server启动之环境EurekaBootStrap监听器
 
 ​	web容器（tomcat还是jetty）启动的时候，把eureka-server作为一个web应用给带起来的时候，eureka-server的初始化的逻辑，监听器，EurekaBootStrap。（eureka-core里面）
 
 **EurekaBootStrap部分核心代码：**
 
 ```java
-package com.netflix.eureka;
 public class EurekaBootStrap implements ServletContextListener {
+
     /**
      * Initializes Eureka, including syncing up with other Eureka peers and publishing the registry.
      * 监听器的执行初始化的方法，是contextInitialized()方法，这个方法就是整个eureka-server启动初始化的一个入
      * 口。
      */
-    @Override
+ 	@Override
     public void contextInitialized(ServletContextEvent event) {
         try {
+            //2.2.1 initEurekaEnvironment(初始化eureka环境)
             initEurekaEnvironment();
+            //2.2.2 配置文件加载
             initEurekaServerContext();
 
             ServletContext sc = event.getServletContext();
@@ -545,24 +547,44 @@ public class EurekaBootStrap implements ServletContextListener {
             throw new RuntimeException("Cannot bootstrap eureka server :", e);
         }
     }
+
+}
+```
+
+
+
+### 2.2.1 initEurekaEnvironment(初始化eureka环境 )
+
+#### 2.2.1.1 流程
+
+**EurekaBootStrap部分核心代码：**
+
+```java
+package com.netflix.eureka;
+public class EurekaBootStrap implements ServletContextListener {
     
-    /**
+    /** 
      * Users can override to initialize the environment themselves.
      * 初始化eureka-server的环境
+     * ConfigurationManager.getConfigInstance()方法，
+     * 这个方法，其实就是初始化ConfigurationManager的实例，也就是一个配置管理器的初始化的这么一个过程
      */
     protected void initEurekaEnvironment() throws Exception {
         logger.info("Setting the eureka configuration..");
-        //ConfigurationManager.getConfigInstance()方法，
-        // 这个方法，其实就是初始化ConfigurationManager的实例，也就是一个配置管理器的初始化的这么一个过程
+        
+        //初始化数据中心的配置
         String dataCenter = ConfigurationManager.getConfigInstance().getString(EUREKA_DATACENTER);
         if (dataCenter == null) {
             logger.info("Eureka data center value eureka.datacenter is not set, defaulting to default");
+            //初始化数据中心的配置，如果没有配置的话，就是默认(DEFAULT)
             ConfigurationManager.getConfigInstance().setProperty(ARCHAIUS_DEPLOYMENT_DATACENTER, DEFAULT);
         } else {
+            //初始化数据中心的配置,有的话就将配置设置一下
             ConfigurationManager.getConfigInstance().setProperty(ARCHAIUS_DEPLOYMENT_DATACENTER, dataCenter);
         }
         String environment = ConfigurationManager.getConfigInstance().getString(EUREKA_ENVIRONMENT);
         if (environment == null) {
+            //初始化eurueka运行的环境，如果你没有配置的话，默认就给你设置为test环境
             ConfigurationManager.getConfigInstance().setProperty(ARCHAIUS_DEPLOYMENT_ENVIRONMENT, TEST);
             logger.info("Eureka environment value eureka.environment is not set, defaulting to test");
         }
@@ -572,7 +594,7 @@ public class EurekaBootStrap implements ServletContextListener {
 
    ConfigurationManager是什么呢？看字面意思都猜的出来，配置管理器， 管理eureka自己的所有的配置，读取配置文件里的配置到内存里，供后续的eureka-server运行来使用。
 
-**ConfigurationManager 部分核心代码(属于nextflix.config工程不是eureka源码)：**
+**ConfigurationManager 部分核心代码（ConfigurationManager本身不是属于eureka的源码，是属于netflix config项目的源码）：**
 
 ```java
 package com.netflix.config;
@@ -589,6 +611,7 @@ public class ConfigurationManager {
         if (instance == null) {
             synchronized (ConfigurationManager.class) {
                 if (instance == null) {
+                    //调用重载有参方法
                     instance = getConfigInstance(Boolean.getBoolean(DynamicPropertyFactory.DISABLE_DEFAULT_CONFIG));
                 }
             }
@@ -596,26 +619,295 @@ public class ConfigurationManager {
         return instance;
     }
     
+    /**
+    * getConfigInstance()重载
+    */
+    private static AbstractConfiguration getConfigInstance(boolean defaultConfigDisabled) {
+        if (instance == null && !defaultConfigDisabled) {
+            //createDefaultConfigInstance 获取AbstractConfiguration实例 
+            instance = createDefaultConfigInstance();
+            registerConfigBean();
+        }
+        return instance;        
+    }
+    
+    /**
+    * ConcurrentCompositeConfiguration为AbstractConfiguration的实例，是AbstractConfiguration抽象类的实现
+    */
+    private static AbstractConfiguration createDefaultConfigInstance() {
+        //无参构造调用了clear()方法进行一些配置的初始化
+        ConcurrentCompositeConfiguration config = new ConcurrentCompositeConfiguration();  
+        try {
+            DynamicURLConfiguration defaultURLConfig = new DynamicURLConfiguration();
+            config.addConfiguration(defaultURLConfig, URL_CONFIG_NAME);
+        } catch (Throwable e) {
+            logger.warn("Failed to create default dynamic configuration", e);
+        }
+        if (!Boolean.getBoolean(DISABLE_DEFAULT_SYS_CONFIG)) {
+            SystemConfiguration sysConfig = new SystemConfiguration();
+            config.addConfiguration(sysConfig, SYS_CONFIG_NAME);
+        }
+        if (!Boolean.getBoolean(DISABLE_DEFAULT_ENV_CONFIG)) {
+            EnvironmentConfiguration envConfig = new EnvironmentConfiguration();
+            config.addConfiguration(envConfig, ENV_CONFIG_NAME);
+        }
+        ConcurrentCompositeConfiguration appOverrideConfig = new ConcurrentCompositeConfiguration();
+        config.addConfiguration(appOverrideConfig, APPLICATION_PROPERTIES);
+        config.setContainerConfigurationIndex(config.getIndexOfConfiguration(appOverrideConfig));
+        return config;
+    }
 }
 ```
 
+​	**ConcurrentCompositeConfiguration实例，这个东西，其实就是代表了所谓的配置，包括了eureka需要的所有的配置。在初始化这个实例的时候，调用了坑爹的clear()方法，fireEvent()发布了一个事件（EVENT_CLEAR），fireEvent()这个方法其实是父类的方法，牵扯比较复杂的另外一个项目**
 
+​	**ConcurrentCompositeConfiguration部分核心代码：**
 
+```java
+public class ConcurrentCompositeConfiguration extends ConcurrentMapConfiguration 
+        implements AggregatedConfiguration, ConfigurationListener, Cloneable {
+    
+    /**
+    * 有参构造调用clear()初始化配置
+    */
+    public ConcurrentCompositeConfiguration()
+    {
+        clear();
+    }
+    
+    /**
+    * 不属于eureka源码，无须追踪太多
+    */
+    @Override
+    public final void clear()
+    {	
+        //父类的方法，加入事件到对应监听中(观察者模式)
+        fireEvent(EVENT_CLEAR, null, null, true);
+        configList.clear();
+        namedConfigurations.clear();
+        // recreate the in memory configuration
+        containerConfiguration = new ConcurrentMapConfiguration();
+        containerConfiguration.setThrowExceptionOnMissing(isThrowExceptionOnMissing());
+        containerConfiguration.setListDelimiter(getListDelimiter());
+        containerConfiguration.setDelimiterParsingDisabled(isDelimiterParsingDisabled());
+        containerConfiguration.addConfigurationListener(eventPropagater);
+        configList.add(containerConfiguration);
+        
+        overrideProperties = new ConcurrentMapConfiguration();
+        overrideProperties.setThrowExceptionOnMissing(isThrowExceptionOnMissing());
+        overrideProperties.setListDelimiter(getListDelimiter());
+        overrideProperties.setDelimiterParsingDisabled(isDelimiterParsingDisabled());
+        overrideProperties.addConfigurationListener(eventPropagater);
+        //父类的方法，加入事件到对应监听中(观察者模式)
+        fireEvent(EVENT_CLEAR, null, null, false);
+        containerConfigurationChanged = false;
+        invalidate();
+    }
 
+}
+```
 
+#### 2.2.1.2 总结
 
+（1）创建一个ConcurrentCompositeConfiguration实例，这个东西，其实就是代表了所谓的配置，包括了eureka需要的所有的配置。在初始化这个实例的时候，调用了clear()方法来初始化配置，fireEvent()发布了一个事件（EVENT_CLEAR）（fireEvent()这个方法其实是父类的方法，牵扯比较复杂的另外一个项目（ConfigurationManager本身不是属于eureka的源码，是属于netflix config项目的源码）
 
+（2）就是往上面的那个ConcurrentCompositeConfiguration实例加入了一堆别的config，然后搞完了以后，就直接返回了这个实例，就是作为所谓的那个配置的单例
 
+（3）初始化数据中心的配置，如果没有配置的话，就是DEFAULT（默认配置），有配置则加入ConfigurationManager
 
+（4）初始化eurueka运行的环境，如果你没有配置的话，默认就给你设置为test环境
 
+（5）initEurekaEnvironment的初始化环境的逻辑，就结束了
 
+### 2.2.2 initEurekaServerContext(配置文件加载)
 
+```java
+public class EurekaBootStrap implements ServletContextListener {
+	/**
+     * init hook for server context. Override for custom logic.
+     */
+    protected void initEurekaServerContext() throws Exception {
+        //第一步，加载eureka-server.properties文件中的配置
+        //在springCloud集成中就是对应yml的一些eureka配置
+        EurekaServerConfig eurekaServerConfig = new DefaultEurekaServerConfig();
 
+        // For backward compatibility
+        JsonXStream.getInstance().registerConverter(new V1AwareInstanceInfoConverter(), XStream.PRIORITY_VERY_HIGH);
+        XmlXStream.getInstance().registerConverter(new V1AwareInstanceInfoConverter(), XStream.PRIORITY_VERY_HIGH);
 
+        logger.info("Initializing the eureka client...");
+        logger.info(eurekaServerConfig.getJsonCodecName());
+        ServerCodecs serverCodecs = new DefaultServerCodecs(eurekaServerConfig);
 
+       
+        ApplicationInfoManager applicationInfoManager = null;
+	    //第二步，初始化eureka-server内部的一个eureka-client(用来跟其他的eureka-server节点进行注册和通信的)
+        if (eurekaClient == null) {
+            EurekaInstanceConfig instanceConfig = isCloud(ConfigurationManager.getDeploymentContext())
+                    ? new CloudInstanceConfig()
+                    : new MyDataCenterInstanceConfig();
+            
+            applicationInfoManager = new ApplicationInfoManager(
+                    instanceConfig, new EurekaConfigBasedInstanceInfoProvider(instanceConfig).get());
+            
+            EurekaClientConfig eurekaClientConfig = new DefaultEurekaClientConfig();
+            eurekaClient = new DiscoveryClient(applicationInfoManager, eurekaClientConfig);
+        } else {
+            applicationInfoManager = eurekaClient.getApplicationInfoManager();
+        }
 
+        //第三步，处理注册相关的事情
+        PeerAwareInstanceRegistry registry;
+        if (isAws(applicationInfoManager.getInfo())) {
+            registry = new AwsInstanceRegistry(
+                    eurekaServerConfig,
+                    eurekaClient.getEurekaClientConfig(),
+                    serverCodecs,
+                    eurekaClient
+            );
+            awsBinder = new AwsBinderDelegate(eurekaServerConfig, eurekaClient.getEurekaClientConfig(), registry, applicationInfoManager);
+            awsBinder.start();
+        } else {
+            registry = new PeerAwareInstanceRegistryImpl(
+                    eurekaServerConfig,
+                    eurekaClient.getEurekaClientConfig(),
+                    serverCodecs,
+                    eurekaClient
+            );
+        }
 
+        //第四步，处理peer节点相关的事情
+        PeerEurekaNodes peerEurekaNodes = getPeerEurekaNodes(
+                registry,
+                eurekaServerConfig,
+                eurekaClient.getEurekaClientConfig(),
+                serverCodecs,
+                applicationInfoManager
+        );
 
+        //第五步，完成eureka上下文(context)的构建
+        serverContext = new DefaultEurekaServerContext(
+                eurekaServerConfig,
+                serverCodecs,
+                registry,
+                peerEurekaNodes,
+                applicationInfoManager
+        );
 
+        EurekaServerContextHolder.initialize(serverContext);
 
+        serverContext.initialize();
+        logger.info("Initialized server context");
 
+        // Copy registry from neighboring eureka node
+        //第六步，处理一点善后的事情，从相邻的eureka节点拷贝注册信息
+        int registryCount = registry.syncUp();
+        registry.openForTraffic(applicationInfoManager, registryCount);
+
+        // Register all monitoring statistics.
+        //第七步，处理一点善后的事情，处理所有的监控统计项
+        EurekaMonitors.registerAllStats();
+    }
+}
+```
+
+#### 2.2.2.1 加载eureka-server.properties文件中的配置
+
+##### 2.2.2.1.1 流程
+
+EurekaServerConfig，这是个接口，这里面有一堆getXXX()的方法，包含了eureka server需要使用的所有的配置，都可以通过这个接口来获取
+
+```java
+@Singleton
+public class DefaultEurekaServerConfig implements EurekaServerConfig {
+    
+    private static final DynamicStringProperty EUREKA_PROPS_FILE = DynamicPropertyFactory
+            .getInstance().getStringProperty("eureka.server.props",
+                    "eureka-server");
+    
+    /**
+    * 可以认为DynamicPropertyFactory是从ConfigurationManager那儿来的，因为ConfigurationManager中都包含了加载出来的配置了，所以DynamicPropertyFactory里，也可以获取到所有的配置项
+    */
+    private static final DynamicPropertyFactory configInstance = com.netflix.config.DynamicPropertyFactory
+            .getInstance();
+    
+    /**
+    * 在DefaultEurekaServerConfig的各种获取配置项的方法中，配置项的名字是在各个方法中硬编码的
+    * getEIPBindRebindRetries是n个get方法中的其中之一，写法都一样，都是硬编码获取值，没有则给个默认值
+    */
+    @Override
+    public int getEIPBindRebindRetries() {
+        //configInstance从一个DynamicPropertyFactory里面去获取的
+        return configInstance.getIntProperty(
+                namespace + "eipBindRebindRetries", 3).get();
+
+    }
+    
+    public DefaultEurekaServerConfig() {
+        init();
+    }
+    
+    /**
+    * DefaultEurekaServerConfig.init()方法中，会将eureka-server.properties文件中的配置加载出来，都放到ConfdigurationManager中去
+    */
+    private void init() {
+        String env = ConfigurationManager.getConfigInstance().getString(
+                EUREKA_ENVIRONMENT, TEST);
+        ConfigurationManager.getConfigInstance().setProperty(
+                ARCHAIUS_DEPLOYMENT_ENVIRONMENT, env);
+        //eurekaPropsFile，对应的就是eureka-server(配置文件名)
+        String eurekaPropsFile = EUREKA_PROPS_FILE.get();
+        try {
+            // ConfigurationManager
+            // .loadPropertiesFromResources(eurekaPropsFile);
+            //将加载出来的Properties中的配置项都放到ConfigurationManager中去，由这个ConfigurationManager来管理
+            ConfigurationManager
+                    .loadCascadedPropertiesFromResources(eurekaPropsFile);
+        } catch (IOException e) {
+            logger.warn(
+                    "Cannot find the properties specified : {}. This may be okay if there are other environment "
+                            + "specific properties or the configuration is installed with a different mechanism.",
+                    eurekaPropsFile);
+        }
+    }
+}
+```
+
+​	ConfigurationManager，是个单例，负责管理所有的配置的，ConfigurationManager是属于netfilx config开源项目的，不是属于eureka项目的源码，所以我们大概看一下就可以了，不要去深究了。eureka-server跟.properties给拼接起来了，拼接成一个eureka-server.properties，代表了eureka server的配置文件的名称。
+
+​	比如说eureka-server那个工程里，就有一个src/main/resources/eureka-server.properties文件，只不过里面是空的，全部都用了默认的配置
+
+```java
+public class ConfigurationManager {
+    
+    /**
+    * 将eureka-sesrver.properties中的配置，加载到了Properties对象中去；然后会加载eureka-server-环境.properties中的配置，加载到另外一个Properties中，覆盖之前那个老的Properties中的属性。
+    */
+    public static void loadCascadedPropertiesFromResources(String configName) throws IOException {
+        //将eureka-sesrver.properties中的配置，加载到了Properties对象中去
+        Properties props = loadCascadedProperties(configName);
+        //将加载出来的Properties中的配置项都放到ConfigurationManager中去，由这个ConfigurationManager来管理
+        if (instance instanceof AggregatedConfiguration) {
+            ConcurrentMapConfiguration config = new ConcurrentMapConfiguration();
+            config.loadProperties(props);
+            //addConfiguration方式
+            ((AggregatedConfiguration) instance).addConfiguration(config, configName);
+        } else {
+            //loadProperties方式
+            ConfigurationUtils.loadProperties(props, instance);
+        }
+    }
+}
+```
+
+##### 2.2.2.1.2 总结
+
+（1）创建了一个DefaultEurekaServerConfig对象
+
+（2）创建DefaultEurekaServerConfig对象的时候，在里面会有一个init方法
+
+（3）先是将eureka-server.properties中的配置加载到了一个Properties对象中，然后将Properties对象中的配置放到ConfigurationManager中去，此时ConfigurationManager中去就有了所有的配置了
+
+（4）然后DefaultEurekaServerConfig提供的获取配置项的各个方法，都是通过硬编码的配置项名称，从DynamicPropertyFactory中获取配置项的值，DynamicPropertyFactory是从ConfigurationManager那儿来的，所以也包含了所有配置项的值
+
+（5）在获取配置项的时候，如果没有配置，那么就会有默认的值，全部属性都是有默认值的
