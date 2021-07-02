@@ -740,7 +740,9 @@ public class EurekaBootStrap implements ServletContextListener {
         ServerCodecs serverCodecs = new DefaultServerCodecs(eurekaServerConfig);
 
        
+        //第二步，初始化ApplicationInfoManage
         ApplicationInfoManager applicationInfoManager = null;
+        
 	    //第二步，初始化eureka-server内部的一个eureka-client(用来跟其他的eureka-server节点进行注册和通信的)
         if (eurekaClient == null) {
             EurekaInstanceConfig instanceConfig = isCloud(ConfigurationManager.getDeploymentContext())
@@ -911,3 +913,454 @@ public class ConfigurationManager {
 （4）然后DefaultEurekaServerConfig提供的获取配置项的各个方法，都是通过硬编码的配置项名称，从DynamicPropertyFactory中获取配置项的值，DynamicPropertyFactory是从ConfigurationManager那儿来的，所以也包含了所有配置项的值
 
 （5）在获取配置项的时候，如果没有配置，那么就会有默认的值，全部属性都是有默认值的
+
+#### 2.2.2.2 eureka-client服务实例构造
+
+```java
+public class EurekaBootStrap implements ServletContextListener {
+		//第二步，初始化ApplicationInfoManage
+        ApplicationInfoManager applicationInfoManager = null;
+
+        //第二步，初始化eureka-server内部的一个eureka-client(用来跟其他的eureka-server节点进行注册和通信的)
+        if (eurekaClient == null) {
+            //EurekaInstanceConfig，其实就是将eureka-client.properties文件中的配置加载到ConfigurationManager中去
+            EurekaInstanceConfig instanceConfig = isCloud(ConfigurationManager.getDeploymentContext())
+                    ? new CloudInstanceConfig()
+                    : new MyDataCenterInstanceConfig();
+            
+            //new EurekaConfigBasedInstanceInfoProvider(instanceConfig).get() 返回InstanceInfo实例
+            applicationInfoManager = new ApplicationInfoManager(
+                    instanceConfig, new EurekaConfigBasedInstanceInfoProvider(instanceConfig).get());
+            //也是去读eureka-client.properties里的一些配置，只不过他关注的是跟之前的那个EurekaInstanceConfig是不一样的，代表了服务实例的一些配置项，这里的是关联的这个EurekaClient的一些配置项
+            EurekaClientConfig eurekaClientConfig = new DefaultEurekaClientConfig();
+            eurekaClient = new DiscoveryClient(applicationInfoManager, eurekaClientConfig);
+        } else {
+            applicationInfoManager = eurekaClient.getApplicationInfoManager();
+        }
+}
+```
+
+​	EurekaInstanceConfig，其实跟之前的是类似的，其实就是将eureka-client.properties文件中的配置加载到ConfigurationManager中去，然后基于EurekaInstanceConfig对外暴露的接口来获取这个eureka-client.properties文件中的一些配置项的读取，而且人家提供了所有配置项的默认值
+
+​	可以大致认为EurekaInstanceConfig是服务实例相关的一些配置。eureka server同时也是一个eureka client，因为他可能要向其他的eureka server去进行注册，组成一个eureka server的集群。eureka server把自己也当做是一个eureka client，也就是一个服务实例，所以他这里肯定也是有所谓的Application、Instance等概念的。
+
+```java
+@ImplementedBy(CloudInstanceConfig.class)
+public interface EurekaInstanceConfig {
+    /**
+     * Get the unique Id (within the scope of the appName) of this instance to be registered with eureka.
+     *
+     * @return the (appname scoped) unique id for this instance
+     */
+    String getInstanceId();
+
+    /**
+     * Get the name of the application to be registered with eureka.
+     *
+     * @return string denoting the name.
+     */
+    String getAppname();
+}
+```
+
+​	eureka server自己本身代表的一个服务实例，把自己作为一个服务注册到别的eureka server上去，精华，就在于构造器模式的使用。InstanceInfo.Builder，拿到静态内部类的对象，InstanceInfo.Builder.newBuilder()，这个里面就构造了一个InstanceInfo。然后就是基于这个builder去set各种需要的属性和配置，别的对象，搞完了之后，就完成最终的一个复杂的InstanceInfo服务实例对象的这么一个构造。
+
+```java
+@Singleton
+public class EurekaConfigBasedInstanceInfoProvider implements Provider<InstanceInfo> {
+    private static final Logger LOG = LoggerFactory.getLogger(EurekaConfigBasedInstanceInfoProvider.class);
+
+    private final EurekaInstanceConfig config;
+
+    private InstanceInfo instanceInfo;
+
+    @Inject(optional = true)
+    private VipAddressResolver vipAddressResolver = null;
+
+    @Inject
+    public EurekaConfigBasedInstanceInfoProvider(EurekaInstanceConfig config) {
+        this.config = config;
+    }
+
+    /**
+    * InstanceInfo，你可以认为就是当前这个服务实例的实例本身的信息，直接用了构造器模式，用InstanceInfo.Builder来构造一个复杂的代表一个服务实例的* * 		* InstanceInfo对象。核心的思路是，从之前的那个EurekaInstanceConfig中，读取各种各样的服务实例相关的配置信息，再构造了几个其他的对象，最终完成了	* InstanceInfo的构建
+    */
+    @Override
+    public synchronized InstanceInfo get() {
+        if (instanceInfo == null) {
+            // Build the lease information to be passed to the server based on config
+            LeaseInfo.Builder leaseInfoBuilder = LeaseInfo.Builder.newBuilder()
+                    .setRenewalIntervalInSecs(config.getLeaseRenewalIntervalInSeconds())
+                    .setDurationInSecs(config.getLeaseExpirationDurationInSeconds());
+
+            if (vipAddressResolver == null) {
+                vipAddressResolver = new Archaius1VipAddressResolver();
+            }
+
+            // Builder the instance information to be registered with eureka server
+            //构造器模式/建造者模式(Builder),获取静态内部类
+            InstanceInfo.Builder builder = InstanceInfo.Builder.newBuilder(vipAddressResolver);
+
+            // set the appropriate id for the InstanceInfo, falling back to datacenter Id if applicable, else hostname
+            String instanceId = config.getInstanceId();
+            DataCenterInfo dataCenterInfo = config.getDataCenterInfo();
+            if (instanceId == null || instanceId.isEmpty()) {
+                if (dataCenterInfo instanceof UniqueIdentifier) {
+                    instanceId = ((UniqueIdentifier) dataCenterInfo).getId();
+                } else {
+                    instanceId = config.getHostName(false);
+                }
+            }
+
+            String defaultAddress;
+            if (config instanceof RefreshableInstanceConfig) {
+                // Refresh AWS data center info, and return up to date address
+                defaultAddress = ((RefreshableInstanceConfig) config).resolveDefaultAddress(false);
+            } else {
+                defaultAddress = config.getHostName(false);
+            }
+
+            // fail safe
+            if (defaultAddress == null || defaultAddress.isEmpty()) {
+                defaultAddress = config.getIpAddress();
+            }
+
+            //构造器模式/建造者模式(builder)
+            //通过静态内部类对应方法设置参数
+            builder.setNamespace(config.getNamespace())
+                    .setInstanceId(instanceId)
+                    .setAppName(config.getAppname())
+                    .setAppGroupName(config.getAppGroupName())
+                    .setDataCenterInfo(config.getDataCenterInfo())
+                    .setIPAddr(config.getIpAddress())
+                    .setHostName(defaultAddress)
+                    .setPort(config.getNonSecurePort())
+                    .enablePort(PortType.UNSECURE, config.isNonSecurePortEnabled())
+                    .setSecurePort(config.getSecurePort())
+                    .enablePort(PortType.SECURE, config.getSecurePortEnabled())
+                    .setVIPAddress(config.getVirtualHostName())
+                    .setSecureVIPAddress(config.getSecureVirtualHostName())
+                    .setHomePageUrl(config.getHomePageUrlPath(), config.getHomePageUrl())
+                    .setStatusPageUrl(config.getStatusPageUrlPath(), config.getStatusPageUrl())
+                    .setASGName(config.getASGName())
+                    .setHealthCheckUrls(config.getHealthCheckUrlPath(),
+                            config.getHealthCheckUrl(), config.getSecureHealthCheckUrl());
+
+
+            // Start off with the STARTING state to avoid traffic
+            if (!config.isInstanceEnabledOnit()) {
+                //设置state状态(STARTING)，表示当前服务实例正在启动中
+                InstanceStatus initialStatus = InstanceStatus.STARTING;
+                LOG.info("Setting initial instance status as: " + initialStatus);
+                builder.setStatus(initialStatus);
+            } else {
+                LOG.info("Setting initial instance status as: {}. This may be too early for the instance to advertise "
+                         + "itself as available. You would instead want to control this via a healthcheck handler.",
+                         InstanceStatus.UP);
+            }
+
+            // Add any user-specific metadata information
+            //自定义元数据相关
+            for (Map.Entry<String, String> mapEntry : config.getMetadataMap().entrySet()) {
+                String key = mapEntry.getKey();
+                String value = mapEntry.getValue();
+                builder.add(key, value);
+            }
+			//通过静态内部类获取 构造/建造 完成的实例
+            instanceInfo = builder.build();
+            //leaseInfoBuilder租约相关信息，也是构造器模式创建的实例
+            instanceInfo.setLeaseInfo(leaseInfoBuilder.build());
+        }
+        return instanceInfo;
+    }
+
+}
+
+```
+
+​	直接基于EurekaInstanceConfig和InstnaceInfo，构造了一个ApplicationInfoManager，后面会基于这个ApplicationInfoManager对服务实例进行一些管理。
+
+```java
+@Singleton
+public class ApplicationInfoManager {
+
+    private InstanceInfo instanceInfo;
+    private EurekaInstanceConfig config;
+    
+    public ApplicationInfoManager(EurekaInstanceConfig config, InstanceInfo instanceInfo) {
+        this(config, instanceInfo, null);
+    }
+    
+    @Inject
+    public ApplicationInfoManager(EurekaInstanceConfig config, InstanceInfo instanceInfo, OptionalArgs optionalArgs) {
+        this.config = config;
+        this.instanceInfo = instanceInfo;
+        this.listeners = new ConcurrentHashMap<String, StatusChangeListener>();
+        if (optionalArgs != null) {
+            this.instanceStatusMapper = optionalArgs.getInstanceStatusMapper();
+        } else {
+            this.instanceStatusMapper = NO_OP_MAPPER;
+        }
+
+        // Hack to allow for getInstance() to use the DI'd ApplicationInfoManager
+        instance = this;
+    }
+}
+```
+
+**总结：**
+
+（1）加载eureka-client.properties文件的配置，对外提供EurekaInstanceConfig接口的逻辑，基于接口的配置项读取的思路
+
+（2）基于构造器模式完成的InstanceInfo（服务实例）的构造的一个过程，精华，闪光点
+
+（3）EurekaInstanceConfig（代表了一些配置），搞了InstanceInfo（服务实例），基于这俩玩意儿，搞了一个ApplicationInfoManager，作为服务实例的一个管理器
+
+**构造器/建造者模式(Builder):**
+
+https://blog.csdn.net/zxd1435513775/article/details/83016670?utm_medium=distribute.pc_relevant.none-task-blog-2%7Edefault%7EBlogCommendFromMachineLearnPai2%7Edefault-1.control&depth_1-utm_source=distribute.pc_relevant.none-task-blog-2%7Edefault%7EBlogCommendFromMachineLearnPai2%7Edefault-1.control
+
+​	EurekaClientConfig，这个东西也是个接口，也是对外暴露了一大堆的配置项，看名字就知道了啊，这里包含的是EurekaClient相关的一些配置项。也是去读eureka-client.properties里的一些配置，只不过他关注的是跟之前的那个EurekaInstanceConfig是不一样的，代表了服务实例的一些配置项，这里的是关联的这个EurekaClient的一些配置项。
+
+```java
+/**
+* 接口，定义了一大堆配置的get方法
+*/
+@ImplementedBy(DefaultEurekaClientConfig.class)
+public interface EurekaClientConfig {
+
+    /**
+     * Indicates how often(in seconds) to fetch the registry information from
+     * the eureka server.
+     *
+     * @return the fetch interval in seconds.
+     */
+    int getRegistryFetchIntervalSeconds();
+}
+
+/**
+* 接口实现类，就是获取eureka-client配置项
+*/
+@Singleton
+@ProvidedBy(DefaultEurekaClientConfigProvider.class)
+public class DefaultEurekaClientConfig implements EurekaClientConfig {
+        public DefaultEurekaClientConfig() {
+        this(CommonConstants.DEFAULT_CONFIG_NAMESPACE);
+    }
+
+    public DefaultEurekaClientConfig(String namespace) {
+        this.namespace = namespace.endsWith(".")
+                ? namespace
+                : namespace + ".";
+
+        this.configInstance = Archaius1Utils.initConfig(CommonConstants.CONFIG_FILE_NAME);
+        this.transportConfig = new DefaultEurekaTransportConfig(namespace, configInstance);
+    }
+}
+
+/**
+ * eureka-client常量
+ */
+public final class CommonConstants {
+    public static final String CONFIG_FILE_NAME = "eureka-client";
+    public static final String DEFAULT_CONFIG_NAMESPACE = "eureka";
+
+}
+```
+
+​	基于ApplicationInfoManager（包含了服务实例的信息、配置，作为服务实例管理的一个组件），eureka client相关的配置，一起构建了一个EurekaClient，但是构建的时候，用的是EurekaClient的子类，DiscoveryClient。
+
+```java
+/**
+* EurekaClient的子类，DiscoveryClient
+*/
+@Singleton
+public class DiscoveryClient implements EurekaClient {
+    
+	public DiscoveryClient(ApplicationInfoManager applicationInfoManager, EurekaClientConfig config) {
+        this(applicationInfoManager, config, null);
+    }
+    
+    /**
+     * @deprecated use the version that take {@link com.netflix.discovery.AbstractDiscoveryClientOptionalArgs} instead
+     */
+    @Deprecated
+    public DiscoveryClient(ApplicationInfoManager applicationInfoManager, final EurekaClientConfig config, DiscoveryClientOptionalArgs args) {
+        this(applicationInfoManager, config, (AbstractDiscoveryClientOptionalArgs) args);
+    }
+    
+    public DiscoveryClient(ApplicationInfoManager applicationInfoManager, final EurekaClientConfig config, AbstractDiscoveryClientOptionalArgs args) {
+        this(applicationInfoManager, config, args, new Provider<BackupRegistry>() {
+            private volatile BackupRegistry backupRegistryInstance;
+            @Override
+            public synchronized BackupRegistry get() {
+                if (backupRegistryInstance == null) {
+                    String backupRegistryClassName = config.getBackupRegistryImpl();
+                    if (null != backupRegistryClassName) {
+                        try {
+                            backupRegistryInstance = (BackupRegistry) Class.forName(backupRegistryClassName).newInstance();
+                            logger.info("Enabled backup registry of type " + backupRegistryInstance.getClass());
+                        } catch (InstantiationException e) {
+                            logger.error("Error instantiating BackupRegistry.", e);
+                        } catch (IllegalAccessException e) {
+                            logger.error("Error instantiating BackupRegistry.", e);
+                        } catch (ClassNotFoundException e) {
+                            logger.error("Error instantiating BackupRegistry.", e);
+                        }
+                    }
+
+                    if (backupRegistryInstance == null) {
+                        logger.warn("Using default backup registry implementation which does not do anything.");
+                        backupRegistryInstance = new NotImplementedRegistryImpl();
+                    }
+                }
+
+                return backupRegistryInstance;
+            }
+        });
+    }
+    
+    @Inject
+    DiscoveryClient(ApplicationInfoManager applicationInfoManager, EurekaClientConfig config, AbstractDiscoveryClientOptionalArgs args,
+                    Provider<BackupRegistry> backupRegistryProvider) {
+        if (args != null) {
+            this.healthCheckHandlerProvider = args.healthCheckHandlerProvider;
+            this.healthCheckCallbackProvider = args.healthCheckCallbackProvider;
+            this.eventListeners.addAll(args.getEventListeners());
+            this.preRegistrationHandler = args.preRegistrationHandler;
+        } else {
+            this.healthCheckCallbackProvider = null;
+            this.healthCheckHandlerProvider = null;
+            this.preRegistrationHandler = null;
+        }
+        
+        this.applicationInfoManager = applicationInfoManager;
+        InstanceInfo myInfo = applicationInfoManager.getInfo();
+
+        clientConfig = config;
+        staticClientConfig = clientConfig;
+        transportConfig = config.getTransportConfig();
+        instanceInfo = myInfo;
+        if (myInfo != null) {
+            appPathIdentifier = instanceInfo.getAppName() + "/" + instanceInfo.getId();
+        } else {
+            logger.warn("Setting instanceInfo to a passed in null value");
+        }
+
+        this.backupRegistryProvider = backupRegistryProvider;
+
+        this.urlRandomizer = new EndpointUtils.InstanceInfoBasedUrlRandomizer(instanceInfo);
+        localRegionApps.set(new Applications());
+
+        fetchRegistryGeneration = new AtomicLong(0);
+
+        remoteRegionsToFetch = new AtomicReference<String>(clientConfig.fetchRegistryForRemoteRegions());
+        remoteRegionsRef = new AtomicReference<>(remoteRegionsToFetch.get() == null ? null : remoteRegionsToFetch.get().split(","));
+
+        if (config.shouldFetchRegistry()) {
+            this.registryStalenessMonitor = new ThresholdLevelsMetric(this, METRIC_REGISTRY_PREFIX + "lastUpdateSec_", new long[]{15L, 30L, 60L, 120L, 240L, 480L});
+        } else {
+            this.registryStalenessMonitor = ThresholdLevelsMetric.NO_OP_METRIC;
+        }
+
+        if (config.shouldRegisterWithEureka()) {
+            this.heartbeatStalenessMonitor = new ThresholdLevelsMetric(this, METRIC_REGISTRATION_PREFIX + "lastHeartbeatSec_", new long[]{15L, 30L, 60L, 120L, 240L, 480L});
+        } else {
+            this.heartbeatStalenessMonitor = ThresholdLevelsMetric.NO_OP_METRIC;
+        }
+
+        logger.info("Initializing Eureka in region {}", clientConfig.getRegion());
+
+        if (!config.shouldRegisterWithEureka() && !config.shouldFetchRegistry()) {
+            logger.info("Client configured to neither register nor query for data.");
+            scheduler = null;
+            heartbeatExecutor = null;
+            cacheRefreshExecutor = null;
+            eurekaTransport = null;
+            instanceRegionChecker = new InstanceRegionChecker(new PropertyBasedAzToRegionMapper(config), clientConfig.getRegion());
+
+            // This is a bit of hack to allow for existing code using DiscoveryManager.getInstance()
+            // to work with DI'd DiscoveryClient
+            DiscoveryManager.getInstance().setDiscoveryClient(this);
+            DiscoveryManager.getInstance().setEurekaClientConfig(config);
+
+            initTimestampMs = System.currentTimeMillis();
+            logger.info("Discovery Client initialized at timestamp {} with initial instances count: {}",
+                    initTimestampMs, this.getApplications().size());
+
+            return;  // no need to setup up an network tasks and we are done
+        }
+
+        try {
+            // default size of 2 - 1 each for heartbeat and cacheRefresh
+            scheduler = Executors.newScheduledThreadPool(2,
+                    new ThreadFactoryBuilder()
+                            .setNameFormat("DiscoveryClient-%d")
+                            .setDaemon(true)
+                            .build());
+
+            heartbeatExecutor = new ThreadPoolExecutor(
+                    1, clientConfig.getHeartbeatExecutorThreadPoolSize(), 0, TimeUnit.SECONDS,
+                    new SynchronousQueue<Runnable>(),
+                    new ThreadFactoryBuilder()
+                            .setNameFormat("DiscoveryClient-HeartbeatExecutor-%d")
+                            .setDaemon(true)
+                            .build()
+            );  // use direct handoff
+
+            cacheRefreshExecutor = new ThreadPoolExecutor(
+                    1, clientConfig.getCacheRefreshExecutorThreadPoolSize(), 0, TimeUnit.SECONDS,
+                    new SynchronousQueue<Runnable>(),
+                    new ThreadFactoryBuilder()
+                            .setNameFormat("DiscoveryClient-CacheRefreshExecutor-%d")
+                            .setDaemon(true)
+                            .build()
+            );  // use direct handoff
+
+            eurekaTransport = new EurekaTransport();
+            scheduleServerEndpointTask(eurekaTransport, args);
+
+            AzToRegionMapper azToRegionMapper;
+            if (clientConfig.shouldUseDnsForFetchingServiceUrls()) {
+                azToRegionMapper = new DNSBasedAzToRegionMapper(clientConfig);
+            } else {
+                azToRegionMapper = new PropertyBasedAzToRegionMapper(clientConfig);
+            }
+            if (null != remoteRegionsToFetch.get()) {
+                azToRegionMapper.setRegionsToFetch(remoteRegionsToFetch.get().split(","));
+            }
+            instanceRegionChecker = new InstanceRegionChecker(azToRegionMapper, clientConfig.getRegion());
+        } catch (Throwable e) {
+            throw new RuntimeException("Failed to initialize DiscoveryClient!", e);
+        }
+
+        if (clientConfig.shouldFetchRegistry() && !fetchRegistry(false)) {
+            fetchRegistryFromBackup();
+        }
+
+        // call and execute the pre registration handler before all background tasks (inc registration) is started
+        if (this.preRegistrationHandler != null) {
+            this.preRegistrationHandler.beforeRegistration();
+        }
+        initScheduledTasks();
+
+        try {
+            Monitors.registerObject(this);
+        } catch (Throwable e) {
+            logger.warn("Cannot register timers", e);
+        }
+
+        // This is a bit of hack to allow for existing code using DiscoveryManager.getInstance()
+        // to work with DI'd DiscoveryClient
+        DiscoveryManager.getInstance().setDiscoveryClient(this);
+        DiscoveryManager.getInstance().setEurekaClientConfig(config);
+
+        initTimestampMs = System.currentTimeMillis();
+        logger.info("Discovery Client initialized at timestamp {} with initial instances count: {}",
+                initTimestampMs, this.getApplications().size());
+    }
+}
+```
+
+
+
