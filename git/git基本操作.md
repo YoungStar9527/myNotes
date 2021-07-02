@@ -1074,11 +1074,11 @@ git rebase feature/001
 
 ​	4 **develop**分支经过联调测试完成后，从**develop**分支拉取一个**release**分支进行QA测试
 
-​	4 QA测试结束后，将**release**分合并到**master**进行预发布测试，**master**分支的代码在预发布环境，模拟线上的环境，进行测试和验证。
+​	5 QA测试结束后，将**release**分合并到**master**进行预发布测试，**master**分支的代码在预发布环境，模拟线上的环境，进行测试和验证。
 
-​	5 同时QA和PM，一起进行最后的验收和验证后，直接用**master**分支的代码进行v1.0版本的上线,上线之前需要对该**master**分支打一个tag，便于以后代码的回退(可以在GitLab或者命令等方式对改版本打tag)。
+​	6 同时QA和PM，一起进行最后的验收和验证后，直接用**master**分支的代码进行v1.0版本的上线,上线之前需要对该**master**分支打一个tag，便于以后代码的回退(可以在GitLab或者命令等方式对改版本打tag)。
 
-​	6 上线之后发现有bug，此时需要从**master**分支拉一个**bugfix**分支下来，快速进行bug复现，修复，合并到**master**和**develop**两个分支
+​	7 上线之后发现有bug，此时需要从**master**分支拉一个**bugfix**分支下来，快速进行bug复现，修复，合并到**master**和**develop**两个分支
 
 **PS:每次master代码上线之前，都必须对master打一个标签，v1.0，v1.1。tag，标签，是什么？其实简单来说，就是指向master指向的那个commit的一个指针而已，tag指针是不能移动。说明这个commit就是一个可以稳定的可以上线的某个版本的代码**
 
@@ -1537,7 +1537,7 @@ review通过之后，可以合并到develop分支，做持续集成
 
 在.git目录中，有如下一些内容：
 
-![image-20210622200236335](git基本操作.assets/image-20210622200236335.png)
+![image-20210626190732997](git基本操作.assets/image-20210626190732997.png)
 
 **hooks** 目录中包含了我们的client-side或者是server-side的钩子脚本
 
@@ -1553,7 +1553,9 @@ review通过之后，可以合并到develop分支，做持续集成
 
 **refs **目录中存储了所有的指针（包括了branch，tag，remote，等等，指向了objects目录中的数据），
 
-**HEAD** 指向了当前我们所处的分支指针，indexes文件存储了暂存区中的内容。
+**HEAD** 指向了当前我们所处的分支指针
+
+**indexes** 文件存储了暂存区中的内容。
 
 ##  9.2 提交代码的内幕原理
 
@@ -1583,7 +1585,7 @@ git hash-object -w 123.txt
 
 ​	git会将一个文件的多个不同版本，以完整快照的方式存储在objects数据库中，每个版本都用一个单独的文件来存储，每个版本的文件都有一个不同的hash值
 
-### 9.2.2 git的文件存储机制(轻量级索引机制)
+### 9.2.2 git轻量级索引机制
 
 **1 git将40位hash值的头2位作为目录，其实可以认为是一种轻量级的索引机制**
 
@@ -1638,7 +1640,7 @@ git cat-file -p master^{tree}
 #查看master分支指针指向的那个tree object
 ```
 
-git通常是基于暂存区中的内容来创建一个tree object的，我们首先需要在暂存区中加入一些内容，然后可以试着手动创建一个tree object。可以将仓库中存储的某个commit object的内容放入暂存区中：
+git通常是基于暂存区中的内容来创建一个tree object的，我们首先需要在暂存区中加入一些内容，然后可以试着手动创建一个tree object。
 
 ```shell
 git update-index --add --cacheinfo 100644 83baae61804e65cc73a7201a7252750c76066a30 test.txt
@@ -1652,7 +1654,7 @@ git update-index --add --cacheinfo 100644 83baae61804e65cc73a7201a7252750c76066a
 
 ```shell
 git write-tree
-#将暂存区中的内容创建为一个tree object，tree object也是放入了git仓库，主要是包含了对一个blob obejct的引用
+#将暂存区中的内容创建为一个tree object，tree object也是放入了git仓库，主要是包含了对一个或多个blob obejct的引用
 ```
 
 ![image-20210624194529294](git基本操作.assets/image-20210624194529294.png)
@@ -1785,6 +1787,8 @@ git tag -a v1.1 -m 'test tag'
 #重量级的tag,创建一个带备注的标签
 #此时查看cat .git/refs/tags/v1.2，会发现返回的不是我们指定的那个commit object，是另外一个新创建的tag object的SHA-1 hash
 ```
+
+**PS:tag不是一个独立的分支，tag只是附属于某个分支的tag标签。拉取远程分支的话需要将tag所属的分支拉取关联。对应远程分支的提交历史就有tag了。然后可以再创建一个本地分支来关联这个tag。**
 
 ![image-20210624205338158](git基本操作.assets/image-20210624205338158.png)
 
