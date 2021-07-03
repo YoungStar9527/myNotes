@@ -916,8 +916,16 @@ public class ConfigurationManager {
 
 #### 2.2.2.2 eureka-client服务实例构造
 
+##### 2.2.2.2.1 初始化ApplicationInfoManage相关
+
+###### 2.2.2.2.1.1 流程
+
 ```java
 public class EurekaBootStrap implements ServletContextListener {
+    
+    //initEurekaServerContext第二步
+    protected void initEurekaServerContext() throws Exception
+    
 		//第二步，初始化ApplicationInfoManage
         ApplicationInfoManager applicationInfoManager = null;
 
@@ -933,10 +941,12 @@ public class EurekaBootStrap implements ServletContextListener {
                     instanceConfig, new EurekaConfigBasedInstanceInfoProvider(instanceConfig).get());
             //也是去读eureka-client.properties里的一些配置，只不过他关注的是跟之前的那个EurekaInstanceConfig是不一样的，代表了服务实例的一些配置项，这里的是关联的这个EurekaClient的一些配置项
             EurekaClientConfig eurekaClientConfig = new DefaultEurekaClientConfig();
+            //基于ApplicationInfoManager（包含了服务实例的信息、配置，作为服务实例管理的一个组件），eureka client相关的配置，一起构建了一个EurekaClient，但是构建的时候，用的是EurekaClient的子类，DiscoveryClient。
             eurekaClient = new DiscoveryClient(applicationInfoManager, eurekaClientConfig);
         } else {
             applicationInfoManager = eurekaClient.getApplicationInfoManager();
         }
+    
 }
 ```
 
@@ -1108,13 +1118,7 @@ public class ApplicationInfoManager {
 }
 ```
 
-**总结：**
 
-（1）加载eureka-client.properties文件的配置，对外提供EurekaInstanceConfig接口的逻辑，基于接口的配置项读取的思路
-
-（2）基于构造器模式完成的InstanceInfo（服务实例）的构造的一个过程，精华，闪光点
-
-（3）EurekaInstanceConfig（代表了一些配置），搞了InstanceInfo（服务实例），基于这俩玩意儿，搞了一个ApplicationInfoManager，作为服务实例的一个管理器
 
 **构造器/建造者模式(Builder):**
 
@@ -1168,6 +1172,20 @@ public final class CommonConstants {
 }
 ```
 
+###### 2.2.2.2.1.2 总结
+
+（1）加载eureka-client.properties文件的配置，对外提供EurekaInstanceConfig接口的逻辑，基于接口的配置项读取的思路
+
+（2）基于构造器模式完成的InstanceInfo（服务实例）的构造的一个过程，精华，闪光点
+
+（3）EurekaInstanceConfig（代表了一些配置），搞了InstanceInfo（服务实例），基于这俩玩意儿，搞了一个ApplicationInfoManager，作为服务实例的一个管理器
+
+
+
+##### 2.2.2.2.2 通过DiscoveryClient构造eureka-client
+
+###### 2.2.2.2.2.1 流程
+
 ​	基于ApplicationInfoManager（包含了服务实例的信息、配置，作为服务实例管理的一个组件），eureka client相关的配置，一起构建了一个EurekaClient，但是构建的时候，用的是EurekaClient的子类，DiscoveryClient。
 
 ```java
@@ -1191,6 +1209,7 @@ public class DiscoveryClient implements EurekaClient {
     
     public DiscoveryClient(ApplicationInfoManager applicationInfoManager, final EurekaClientConfig config, AbstractDiscoveryClientOptionalArgs args) {
         this(applicationInfoManager, config, args, new Provider<BackupRegistry>() {
+            //Provider 实现的一个备用注册表的东西
             private volatile BackupRegistry backupRegistryInstance;
             @Override
             public synchronized BackupRegistry get() {
@@ -1223,17 +1242,21 @@ public class DiscoveryClient implements EurekaClient {
     @Inject
     DiscoveryClient(ApplicationInfoManager applicationInfoManager, EurekaClientConfig config, AbstractDiscoveryClientOptionalArgs args,
                     Provider<BackupRegistry> backupRegistryProvider) {
+        //args默认为空
         if (args != null) {
             this.healthCheckHandlerProvider = args.healthCheckHandlerProvider;
             this.healthCheckCallbackProvider = args.healthCheckCallbackProvider;
             this.eventListeners.addAll(args.getEventListeners());
             this.preRegistrationHandler = args.preRegistrationHandler;
         } else {
+            //健康检测相关参数设置为空
             this.healthCheckCallbackProvider = null;
             this.healthCheckHandlerProvider = null;
             this.preRegistrationHandler = null;
         }
         
+        //读取EurekaClientConfig,包括TransportConfig
+        //保存ApplicationInfoManager、InstanceInfo
         this.applicationInfoManager = applicationInfoManager;
         InstanceInfo myInfo = applicationInfoManager.getInfo();
 
@@ -1242,6 +1265,7 @@ public class DiscoveryClient implements EurekaClient {
         transportConfig = config.getTransportConfig();
         instanceInfo = myInfo;
         if (myInfo != null) {
+            //AppName，代表了一个服务名称，但是一个服务可能部署多台机器，每台机器上部署的就是一个服务实例，如：ServiceA/001
             appPathIdentifier = instanceInfo.getAppName() + "/" + instanceInfo.getId();
         } else {
             logger.warn("Setting instanceInfo to a passed in null value");
@@ -1251,18 +1275,20 @@ public class DiscoveryClient implements EurekaClient {
 
         this.urlRandomizer = new EndpointUtils.InstanceInfoBasedUrlRandomizer(instanceInfo);
         localRegionApps.set(new Applications());
-
+		//Atomic开头的一些原子操作类的初始化
         fetchRegistryGeneration = new AtomicLong(0);
 
         remoteRegionsToFetch = new AtomicReference<String>(clientConfig.fetchRegistryForRemoteRegions());
         remoteRegionsRef = new AtomicReference<>(remoteRegionsToFetch.get() == null ? null : remoteRegionsToFetch.get().split(","));
 
+        //是否要注册
         if (config.shouldFetchRegistry()) {
             this.registryStalenessMonitor = new ThresholdLevelsMetric(this, METRIC_REGISTRY_PREFIX + "lastUpdateSec_", new long[]{15L, 30L, 60L, 120L, 240L, 480L});
         } else {
             this.registryStalenessMonitor = ThresholdLevelsMetric.NO_OP_METRIC;
         }
 
+        //是否要抓取注册表
         if (config.shouldRegisterWithEureka()) {
             this.heartbeatStalenessMonitor = new ThresholdLevelsMetric(this, METRIC_REGISTRATION_PREFIX + "lastHeartbeatSec_", new long[]{15L, 30L, 60L, 120L, 240L, 480L});
         } else {
@@ -1270,7 +1296,8 @@ public class DiscoveryClient implements EurekaClient {
         }
 
         logger.info("Initializing Eureka in region {}", clientConfig.getRegion());
-
+        
+		//不用则释放资源
         if (!config.shouldRegisterWithEureka() && !config.shouldFetchRegistry()) {
             logger.info("Client configured to neither register nor query for data.");
             scheduler = null;
@@ -1293,12 +1320,14 @@ public class DiscoveryClient implements EurekaClient {
 
         try {
             // default size of 2 - 1 each for heartbeat and cacheRefresh
+            //支持调度的线程池
             scheduler = Executors.newScheduledThreadPool(2,
                     new ThreadFactoryBuilder()
                             .setNameFormat("DiscoveryClient-%d")
                             .setDaemon(true)
                             .build());
 
+            //支持心跳的线程池
             heartbeatExecutor = new ThreadPoolExecutor(
                     1, clientConfig.getHeartbeatExecutorThreadPoolSize(), 0, TimeUnit.SECONDS,
                     new SynchronousQueue<Runnable>(),
@@ -1308,6 +1337,7 @@ public class DiscoveryClient implements EurekaClient {
                             .build()
             );  // use direct handoff
 
+            //支持缓存刷新的线程池
             cacheRefreshExecutor = new ThreadPoolExecutor(
                     1, clientConfig.getCacheRefreshExecutorThreadPoolSize(), 0, TimeUnit.SECONDS,
                     new SynchronousQueue<Runnable>(),
@@ -1317,7 +1347,9 @@ public class DiscoveryClient implements EurekaClient {
                             .build()
             );  // use direct handoff
 
+            //EurekaTransport，支持底层eureka client跟eureka server进行网络通信的组件
             eurekaTransport = new EurekaTransport();
+            //对网络通信组件进行了一些初始化的操作
             scheduleServerEndpointTask(eurekaTransport, args);
 
             AzToRegionMapper azToRegionMapper;
@@ -1334,7 +1366,9 @@ public class DiscoveryClient implements EurekaClient {
             throw new RuntimeException("Failed to initialize DiscoveryClient!", e);
         }
 
+        //如果要去抓取注册表的话，在这里就抓取注册表了(fetchRegistry)
         if (clientConfig.shouldFetchRegistry() && !fetchRegistry(false)) {
+            //如果fetchRegistry失败了，则fetchRegistryFromBackup从备份中去抓取
             fetchRegistryFromBackup();
         }
 
@@ -1342,6 +1376,8 @@ public class DiscoveryClient implements EurekaClient {
         if (this.preRegistrationHandler != null) {
             this.preRegistrationHandler.beforeRegistration();
         }
+        
+        //初始化调度任务
         initScheduledTasks();
 
         try {
@@ -1360,7 +1396,644 @@ public class DiscoveryClient implements EurekaClient {
                 initTimestampMs, this.getApplications().size());
     }
 }
+
+    /**
+     * Initializes all scheduled tasks.
+     * 初始化调度任务
+     */
+    private void initScheduledTasks() {
+        //如果要抓取注册表的话
+        if (clientConfig.shouldFetchRegistry()) {
+            // registry cache refresh timer
+            int registryFetchIntervalSeconds = clientConfig.getRegistryFetchIntervalSeconds();
+            int expBackOffBound = clientConfig.getCacheRefreshExecutorExponentialBackOffBound();
+            //注册一个定时任务，按照配置的抓取间隔，每隔一定时间(默认是30s)，去执行一个CacheRefreshThread，放入调度线程中
+            scheduler.schedule(
+                    new TimedSupervisorTask(
+                            "cacheRefresh",
+                            scheduler,
+                            cacheRefreshExecutor,
+                            registryFetchIntervalSeconds,
+                            TimeUnit.SECONDS,
+                            expBackOffBound,
+                            new CacheRefreshThread()
+                    ),
+                    registryFetchIntervalSeconds, TimeUnit.SECONDS);
+        }
+
+        //如果要向eureka server进行主注册的话
+        if (clientConfig.shouldRegisterWithEureka()) {
+            int renewalIntervalInSecs = instanceInfo.getLeaseInfo().getRenewalIntervalInSecs();
+            int expBackOffBound = clientConfig.getHeartbeatExecutorExponentialBackOffBound();
+            logger.info("Starting heartbeat executor: " + "renew interval is: " + renewalIntervalInSecs);
+
+            // Heartbeat timer
+            //弄一个定时任务，每隔一定时间发送心跳，执行一个HeartbeatThread，创建了服务实例副本传播器，将自己作为一个定时任务进行调度。
+            scheduler.schedule(
+                    new TimedSupervisorTask(
+                            "heartbeat",
+                            scheduler,
+                            heartbeatExecutor,
+                            renewalIntervalInSecs,
+                            TimeUnit.SECONDS,
+                            expBackOffBound,
+                            new HeartbeatThread()
+                    ),
+                    renewalIntervalInSecs, TimeUnit.SECONDS);
+
+            // InstanceInfo replicator
+            //将自己的服务实例进行复制
+            instanceInfoReplicator = new InstanceInfoReplicator(
+                    this,
+                    instanceInfo,
+                    clientConfig.getInstanceInfoReplicationIntervalSeconds(),
+                    2); // burstSize
+
+            //创建了服务实例状态变更的监听器
+            statusChangeListener = new ApplicationInfoManager.StatusChangeListener() {
+                @Override
+                public String getId() {
+                    return "statusChangeListener";
+                }
+
+                @Override
+                public void notify(StatusChangeEvent statusChangeEvent) {
+                    if (InstanceStatus.DOWN == statusChangeEvent.getStatus() ||
+                            InstanceStatus.DOWN == statusChangeEvent.getPreviousStatus()) {
+                        // log at warn level if DOWN was involved
+                        logger.warn("Saw local status change event {}", statusChangeEvent);
+                    } else {
+                        logger.info("Saw local status change event {}", statusChangeEvent);
+                    }
+                    instanceInfoReplicator.onDemandUpdate();
+                }
+            };
+
+            //如果配置了监听就会注册监听器
+            if (clientConfig.shouldOnDemandUpdateStatusChange()) {
+                //如果服务实例发生状态变更，会通知监听器
+                applicationInfoManager.registerStatusChangeListener(statusChangeListener);
+            }
+
+            instanceInfoReplicator.start(clientConfig.getInitialInstanceInfoReplicationIntervalSeconds());
+        } else {
+            logger.info("Not registering with Eureka server per configuration");
+        }
+    }
+```
+
+**PS:如果是单个eureka server的话，需要将这个fetchRegistry给手动设置为false。如果是集群的话默认即可(默认true)**
+
+###### 2.2.2.2.2.2 总结
+
+（1）读取EurekaClientConfig，包括TransportConfig
+
+（2）保存EurekaInstanceConfig和InstanceInfo
+
+（3）处理了是否要注册以及抓取注册表，如果不要的话，释放一些资源
+
+（4）支持调度的线程池
+
+（5）支持心跳的线程池
+
+（6）支持缓存刷新的线程池
+
+（7）EurekaTransport，支持底层的eureka client跟eureka server进行网络通信的组件，对网络通信组件进行了一些初始化的操作
+
+（8）如果要抓取注册表的话，在这里就会去抓取注册表了，但是如果说你配置了不抓取，那么这里就不抓取了
+
+（9）初始化调度任务：如果要抓取注册表的话，就会注册一个定时任务，按照你设定的那个抓取的间隔，每隔一定时间（默认是30s），去执行一个CacheRefreshThread，给放那个调度线程池里去了；如果要向eureka server进行注册的话，会搞一个定时任务，每隔一定时间发送心跳，执行一个HeartbeatThread；创建了服务实例副本传播器，将自己作为一个定时任务进行调度；创建了服务实例的状态变更的监听器，如果你配置了监听，那么就会注册监听器
+
+#### 2.2.2.3 initEurekaServerContext 后续上下文等步骤
+
+构造了一个东西：PeerAwareInstanceRegistry
+
+```java
+public class EurekaBootStrap implements ServletContextListener {
+    
+    //initEurekaServerContext第三步
+    protected void initEurekaServerContext() throws Exception
+    
+    //第三步，处理注册相关的事情
+        PeerAwareInstanceRegistry registry;
+    	//是否在aws云服务上
+        if (isAws(applicationInfoManager.getInfo())) {
+            registry = new AwsInstanceRegistry(
+                    eurekaServerConfig,
+                    eurekaClient.getEurekaClientConfig(),
+                    serverCodecs,
+                    eurekaClient
+            );
+            awsBinder = new AwsBinderDelegate(eurekaServerConfig, eurekaClient.getEurekaClientConfig(), registry, applicationInfoManager);
+            awsBinder.start();
+        } else {
+            //正常肯定不是aws云服务，所以到else
+            registry = new PeerAwareInstanceRegistryImpl(
+                    eurekaServerConfig,
+                    eurekaClient.getEurekaClientConfig(),
+                    serverCodecs,
+                    eurekaClient);
+        }
+
+
+            
+```
+
+​	PeerAware，可以识别eureka server集群的：peer，多个同样的东西组成的一个集群，peers集群，peer就是集群中的一个实例
+
+​	InstanceRegistry：实例注册，服务实例注册，注册表，这个里面放了所有的注册到这个eureka server上来的服务实例，就是一个服务实例的注册表
+
+​	PeerAwareInstanceRegistry：可以感知eureka server集群的服务实例注册表，eureka client（作为服务实例）过来注册的注册表，而且这个注册表是可以感知到eureka server集群的。假如有一个eureka server集群的话，这里包含了其他的eureka server中的服务实例注册表的信息的。
+
+```java
+/*
+ *     1 这个eureka启动的时候，会尝试从其他的eureka server上过去抓取注册表的信息，如果抓取失败了，
+ *     那么就不会让其他的服务实例来自己这里进行服务发现，获取自己的注册表的信息
+ 
+ *     2 如果说当前eureka server获取心跳的比例低于一定的比例的话，在一定时间内。eureka server就会自动认为自己出了网络故障，
+ *     不会将未发送心跳的服务实例摘除，而是让自己进入一个自我保护机制，就是自己不再摘除任何的服务实例(比如20个实例，就有10个未发送心跳)
+ */
+@Singleton
+public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry implements PeerAwareInstanceRegistry {
+	@Inject
+    public PeerAwareInstanceRegistryImpl(
+            EurekaServerConfig serverConfig,
+            EurekaClientConfig clientConfig,
+            ServerCodecs serverCodecs,
+            EurekaClient eurekaClient
+    ) {
+        //调用父类的构造
+        super(serverConfig, clientConfig, serverCodecs);
+        this.eurekaClient = eurekaClient;
+        this.numberOfReplicationsLastMin = new MeasuredRate(1000 * 60 * 1);
+        // We first check if the instance is STARTING or DOWN, then we check explicit overrides,
+        // then we check the status of a potentially existing lease.
+        this.instanceStatusOverrideRule = new FirstMatchWinsCompositeRule(new DownOrStartingRule(),
+                new OverrideExistsRule(overriddenInstanceStatusMap), new LeaseExistsRule());
+    }
+}
+
 ```
 
 
+
+PeerEurekaNodes
+
+​	PeerEurekaNodes，代表了eureka server集群，peers大概来说多个相同的实例组成的一个集群，peer就是peers集群中的一个实例，PeerEurekaNodes，大概来说，是代表的是eureka server集群
+
+```java
+public class EurekaBootStrap implements ServletContextListener 
+    
+    //initEurekaServerContext
+    protected void initEurekaServerContext() throws Exception
+            //第四步，处理peer节点相关的事情
+        PeerEurekaNodes peerEurekaNodes = getPeerEurekaNodes(
+                registry,
+                eurekaServerConfig,
+                eurekaClient.getEurekaClientConfig(),
+                serverCodecs,
+                applicationInfoManager
+        );
+
+
+```
+
+​	将上面构造好的所有的东西，都一起来构造一个EurekaServerContext，代表了当前这个eureka server的一个服务器上下文，包含了服务器需要的所有的东西。将这个东西放在了一个holder中，以后谁如果要使用这个EurekaServerContext，直接从这个holder中获取就可以了。
+
+​	这个也是一个比较常见的用法，就是将初始化好的一些东西，放在一个holder中，然后后面的话呢，整个系统运行期间，谁都可以来获取，在任何地方任何时间，谁都可以获取这个上下文，从里面获取自己需要的一些组件。
+
+```java
+//initEurekaServerContext
+public class EurekaBootStrap implements ServletContextListener 
+    
+protected void initEurekaServerContext() throws Exception
+
+    //第五步，完成eureka上下文(context)的构建
+    serverContext = new DefaultEurekaServerContext(
+            eurekaServerConfig,
+            serverCodecs,
+            registry,
+            peerEurekaNodes,
+            applicationInfoManager
+    );
+	//放在了一个holder中，以后谁如果要使用这个EurekaServerContext，直接从这个holder中获取就可以了
+    EurekaServerContextHolder.initialize(serverContext);
+```
+
+EurekaServerContext.initialize()
+
+```java
+//initEurekaServerContext
+public class EurekaBootStrap implements ServletContextListener 
+
+protected void initEurekaServerContext() throws Exception
+
+
+        serverContext.initialize();
+        logger.info("Initialized server context");
+
+```
+
+peerEurekaNodes.start();
+
+​	这里呢，就是将eureka server集群给启动起来，这里干的事情，我们猜测一下，就是更新一下eureka server集群的信息，让当前的eureka server感知到所有的其他的eureka server。然后搞一个定时调度任务，就一个后台线程，每隔一定的时间，更新eureka server集群的信息。
+
+registry.init(peerEurekaNodes);
+
+​	基于eureka server集群的信息，来初始化注册表，是将eureka server集群中所有的eureka server的注册表的信息，都抓取过来，放到自己本地的注册表里去，多事跟eureka server集群之间的注册表信息互换有关联的
+
+```java
+@Singleton
+public class DefaultEurekaServerContext implements EurekaServerContext {
+   
+   @PostConstruct
+    @Override
+    public void initialize() throws Exception {
+        logger.info("Initializing ...");
+        peerEurekaNodes.start();
+        registry.init(peerEurekaNodes);
+        logger.info("Initialized");
+    }
+```
+
+registry.syncUp();
+
+从相邻的一个eureka server节点拷贝注册表的信息，如果拷贝失败，就找下一个
+
+EurekaMonitors.registerAllStats();
+
+跟eureka自身的监控机制相关联的
+
+```java
+public class EurekaBootStrap implements ServletContextListener 
+    
+    //initEurekaServerContext
+    protected void initEurekaServerContext() throws Exception
+    
+        // Copy registry from neighboring eureka node
+        //第六步，处理一点善后的事情，从相邻的eureka节点拷贝注册信息
+        int registryCount = registry.syncUp();
+        registry.openForTraffic(applicationInfoManager, registryCount);
+
+        // Register all monitoring statistics.
+        //第七步，处理一点善后的事情，处理所有的监控统计项
+        EurekaMonitors.registerAllStats();
+
+```
+
+**PS:读源码，千万不要有强迫症， 很多时候，刚开始看源码的时候，要允许自己对很多细节都不太清楚，但是能大体把握住大的流程就ok了**
+
+## 2.3 eureka server启动流程图
+
+https://www.processon.com/view/link/60e043021e0853598890517e
+
+# 3 Eureka client启动
+
+## 3.1 流程
+
+​	eureka-examples，有一个类，ExampleEurekaClient，就是一个自带的例子，如果是一个eureka服务，一定会有一个eureka client，服务实例启动的时候，一定会启动eureka client，eureka client去向eureka server去服务注册
+
+ExampleEurekaClient，相当于是一个你自己写的普通的服务
+
+```java
+public class ExampleEurekaClient {
+
+    private static ApplicationInfoManager applicationInfoManager;
+    private static EurekaClient eurekaClient;
+
+    private static synchronized ApplicationInfoManager initializeApplicationInfoManager(EurekaInstanceConfig instanceConfig) {
+        if (applicationInfoManager == null) {
+            InstanceInfo instanceInfo = new EurekaConfigBasedInstanceInfoProvider(instanceConfig).get();
+            applicationInfoManager = new ApplicationInfoManager(instanceConfig, instanceInfo);
+        }
+
+        return applicationInfoManager;
+    }
+
+    private static synchronized EurekaClient initializeEurekaClient(ApplicationInfoManager applicationInfoManager, EurekaClientConfig clientConfig) {
+        if (eurekaClient == null) {
+            eurekaClient = new DiscoveryClient(applicationInfoManager, clientConfig);
+        }
+
+        return eurekaClient;
+    }
+
+
+    public void sendRequestToServiceUsingEureka(EurekaClient eurekaClient) {
+        // initialize the client
+        // this is the vip address for the example service to talk to as defined in conf/sample-eureka-service.properties
+        String vipAddress = "sampleservice.mydomain.net";
+
+        InstanceInfo nextServerInfo = null;
+        try {
+            nextServerInfo = eurekaClient.getNextServerFromEureka(vipAddress, false);
+        } catch (Exception e) {
+            System.err.println("Cannot get an instance of example service to talk to from eureka");
+            System.exit(-1);
+        }
+
+        System.out.println("Found an instance of example service to talk to from eureka: "
+                + nextServerInfo.getVIPAddress() + ":" + nextServerInfo.getPort());
+
+        System.out.println("healthCheckUrl: " + nextServerInfo.getHealthCheckUrl());
+        System.out.println("override: " + nextServerInfo.getOverriddenStatus());
+
+        Socket s = new Socket();
+        int serverPort = nextServerInfo.getPort();
+        try {
+            s.connect(new InetSocketAddress(nextServerInfo.getHostName(), serverPort));
+        } catch (IOException e) {
+            System.err.println("Could not connect to the server :"
+                    + nextServerInfo.getHostName() + " at port " + serverPort);
+        } catch (Exception e) {
+            System.err.println("Could not connect to the server :"
+                    + nextServerInfo.getHostName() + " at port " + serverPort + "due to Exception " + e);
+        }
+        try {
+            String request = "FOO " + new Date();
+            System.out.println("Connected to server. Sending a sample request: " + request);
+
+            PrintStream out = new PrintStream(s.getOutputStream());
+            out.println(request);
+
+            System.out.println("Waiting for server response..");
+            BufferedReader rd = new BufferedReader(new InputStreamReader(s.getInputStream()));
+            String str = rd.readLine();
+            if (str != null) {
+                System.out.println("Received response from server: " + str);
+                System.out.println("Exiting the client. Demo over..");
+            }
+            rd.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * This will be read by server internal discovery client. We need to salience it.
+     */
+    private static void injectEurekaConfiguration() throws UnknownHostException {
+        String myHostName = InetAddress.getLocalHost().getHostName();
+        String myServiceUrl = "http://" + myHostName + ":8080/v2/";
+
+        System.setProperty("eureka.region", "default");
+        System.setProperty("eureka.name", "eureka");
+        System.setProperty("eureka.vipAddress", "eureka.mydomain.net");
+        System.setProperty("eureka.port", "8080");
+        System.setProperty("eureka.preferSameZone", "false");
+        System.setProperty("eureka.shouldUseDns", "false");
+        //默认是false，这里改成true
+        System.setProperty("eureka.shouldFetchRegistry", "true");
+        System.setProperty("eureka.serviceUrl.defaultZone", myServiceUrl);
+        System.setProperty("eureka.serviceUrl.default.defaultZone", myServiceUrl);
+        System.setProperty("eureka.awsAccessId", "fake_aws_access_id");
+        System.setProperty("eureka.awsSecretKey", "fake_aws_secret_key");
+        System.setProperty("eureka.numberRegistrySyncRetries", "0");
+    }
+
+    public static void main(String[] args) throws UnknownHostException {
+        //新增启动前配置
+        //读取eureka-client.properties配置文件，形成一个服务实例的配置，基于接口对外提供服务实例的配置项的读取
+        injectEurekaConfiguration();
+
+        ExampleEurekaClient sampleClient = new ExampleEurekaClient();
+
+        // create the client
+        //基于服务实例的配置，构造了一个服务实例（InstanceInfo）
+        //基于服务实例的配置和服务实例，构造了一个服务实例管理器（ApplicationInfoManager）
+        ApplicationInfoManager applicationInfoManager = initializeApplicationInfoManager(new MyDataCenterInstanceConfig());
+        //new DefaultEurekaClientConfig() 读取eureka-client.properites配置文件，形成一个eureka client的配置，接口接口对外提供eureka client的配置项的读取
+        //initializeEurekaClient  基于eureka client配置，和服务实例管理器，来构造了一个EurekaClient（DiscoveryClient），保存了一些配置，处理服务的注册和注册表的抓取，启动了几个线程池，启动了网络通信组件，启动了一些调度任务，注册了监控项
+        EurekaClient client = initializeEurekaClient(applicationInfoManager, new DefaultEurekaClientConfig());
+
+        // use the client
+        sampleClient.sendRequestToServiceUsingEureka(client);
+
+
+        // shutdown the client
+        eurekaClient.shutdown();
+    }
+
+}
+```
+
+## 3.2 总结
+
+（1）读取eureka-client.properties配置文件，形成一个服务实例的配置，基于接口对外提供服务实例的配置项的读取
+
+（2）基于服务实例的配置，构造了一个服务实例（InstanceInfo）
+
+（3）基于服务实例的配置和服务实例，构造了一个服务实例管理器（ApplicationInfoManager）
+
+（4）读取eureka-client.properites配置文件，形成一个eureka client的配置，接口接口对外提供eureka client的配置项的读取
+
+（5）基于eureka client配置，和服务实例管理器，来构造了一个EurekaClient（DiscoveryClient），保存了一些配置，处理服务的注册和注册表的抓取，启动了几个线程池，启动了网络通信组件，启动了一些调度任务，注册了监控项
+
+**PS:ExampleEurekaClient所有调用的源码，都在2 Eureka Server启动源码有详细过程**
+
+## 3.3 流程图
+
+https://www.processon.com/view/link/60e05398f346fb04d2d7c48c
+
+# 4 从眼花缭乱的代码中找到Eureka client如何进行注册的
+
+## 4.1 流程
+
+**PS:本笔记上下文 方法中，上下括号不完整的代码都是该方法的部分代码**
+
+```java
+
+@Singleton
+public class DiscoveryClient implements EurekaClient {
+@Inject
+    DiscoveryClient(ApplicationInfoManager applicationInfoManager, EurekaClientConfig config, AbstractDiscoveryClientOptionalArgs args,
+                    Provider<BackupRegistry> backupRegistryProvider)
+        //石杉建议(我个人 等 指代中华石杉)
+        //我个人期望看到的代码时，在这个eureka client初始化的过程中
+        //就在这里，先将自己注册到注册中心去，或者是先在这里抓取注册表，都可以
+        if (clientConfig.shouldFetchRegistry() && !fetchRegistry(false)) {
+            fetchRegistryFromBackup();
+        }
+
+        //起码说，这个代码应该在这里发起一个服务的注册
+
+        // call and execute the pre registration handler before all background tasks (inc registration) is started
+        if (this.preRegistrationHandler != null) {
+            this.preRegistrationHandler.beforeRegistration();
+        }
+    	//注册代码在这里面
+        initScheduledTasks();            
+                    
+ 
+    //////////////////////////////////////////////////////////////////////////
+    //初始化调度任务
+    private void initScheduledTasks()
+         // InstanceInfo replicator
+        	//就在这个InstanceInfoReplicator组件里面，服务实例信息复制组件，就是这么一个复制组件，来负责服务的注册
+            instanceInfoReplicator = new InstanceInfoReplicator(
+                    this,
+                    instanceInfo,
+                    clientConfig.getInstanceInfoReplicationIntervalSeconds(),
+                    2); // burstSize
+    ........
+        //服务注册在这里面
+        //clientConfig.getInitialInstanceInfoReplicationIntervalSeconds()默认40秒,也就是说start中的调度线程
+        //会在40s后进行服务注册请求
+        instanceInfoReplicator.start(clientConfig.getInitialInstanceInfoReplicationIntervalSeconds());
+
+        
+}
+```
+
+服务注册的地方，就在这个InstanceInfoReplicator组件里面，服务实例信息复制组件，就是这么一个复制组件，来负责服务的注册。
+
+**PS:。我（石杉）觉得这么设计很不好。明明是一个注册的概念，结果他搞了一个复制的概念，replicate绝对不是用在这种地方的。**
+
+**用在比如说，你有一个数据，你现在要复制几个副本，放到其他的机器上去，一般对这种行为，我们称之为replicate。把服务实例的信息replicate到一个eureka server上去，是非常不合适的。**
+
+```java
+class InstanceInfoReplicator implements Runnable {
+
+   public void start(int initialDelayMs) {
+        if (started.compareAndSet(false, true)) {
+            //还将isDirty设置为了ture
+            //instanceInfo的isDirtyWithTime设置为当前时间戳
+            instanceInfo.setIsDirty();  // for initial register
+            //将this加入调度，自然就调用run方法
+            Future next = scheduler.schedule(this, initialDelayMs, TimeUnit.SECONDS);
+            scheduledPeriodicRef.set(next);
+        }
+    }
+    
+    /*
+    *先是找EurekaClient.refreshInstanceInfo()这个方法，里面其实是调用ApplicationInfoManager的一些方法刷新了一下服务实例的配置，看看配置有没有改变，如果改变了，就刷新一下；用健康检查器，检查了一下状态，将状态设置到了ApplicationInfoManager中去，更新服务实例的状态
+    **/
+    public void run() {
+        try {
+            //刷新了一下服务实例的信息
+            discoveryClient.refreshInstanceInfo();
+
+            Long dirtyTimestamp = instanceInfo.isDirtyWithTime();
+            //instanceInfo.isDirtyWithTime()在之前已经设置了值为当前时间戳
+            //所以一定会进入if里面，进行服务注册
+            if (dirtyTimestamp != null) {
+                //调用DiscoveryClient的register进行服务注册
+                discoveryClient.register();
+                instanceInfo.unsetIsDirty(dirtyTimestamp);
+            }
+        } catch (Throwable t) {
+            logger.warn("There was a problem with the instance info replicator", t);
+        } finally {
+            Future next = scheduler.schedule(this, replicationIntervalSeconds, TimeUnit.SECONDS);
+            scheduledPeriodicRef.set(next);
+        }
+    }
+
+```
+
+​	服务注册的时候，是基于EurekaClient的reigster()方法去注册的，调用的是底层的TransportClient的RegistrationClient，执行了register()方法，将InstanceInfo服务实例的信息，通过http请求，调用eureka server对外暴露的一个restful接口，将InstanceInfo给发送了过去。这里找的是EurekaTransport，在构造的时候，调用了scheduleServerEndpointTask()方法，这个方法里就初始化了专门用于注册的RegistrationClient
+
+```java
+@Singleton
+public class DiscoveryClient implements EurekaClient {
+
+     /**
+     * Register with the eureka service by making the appropriate REST call.
+     */
+    boolean register() throws Throwable {
+        logger.info(PREFIX + appPathIdentifier + ": registering service...");
+        EurekaHttpResponse<Void> httpResponse;
+        try {
+            //这里就是EurekaTransportt，在构造的时候，调用了scheduleServerEndpointTask()方法，
+            //这个方法里就初始化了专门用于注册的RegistrationClient
+            httpResponse = eurekaTransport.registrationClient.register(instanceInfo);
+        } catch (Exception e) {
+            logger.warn("{} - registration failed {}", PREFIX + appPathIdentifier, e.getMessage(), e);
+            throw e;
+        }
+        if (logger.isInfoEnabled()) {
+            logger.info("{} - registration status: {}", PREFIX + appPathIdentifier, httpResponse.getStatusCode());
+        }
+        return httpResponse.getStatusCode() == 204;
+    }
+    
+    /////////////////////////////////////////////////
+     @Inject
+    DiscoveryClient(ApplicationInfoManager applicationInfoManager, EurekaClientConfig config, AbstractDiscoveryClientOptionalArgs args,
+                    Provider<BackupRegistry> backupRegistryProvider)
+        .........
+        eurekaTransport = new EurekaTransport();
+            scheduleServerEndpointTask(eurekaTransport, args);
+    
+    private void scheduleServerEndpointTask(EurekaTransport eurekaTransport,
+                                            AbstractDiscoveryClientOptionalArgs args) 
+      ........
+      
+                newRegistrationClientFactory = EurekaHttpClients.registrationClientFactory(
+                        eurekaTransport.bootstrapResolver,
+                        eurekaTransport.transportClientFactory,
+                        transportConfig
+                );
+         ........
+     public final class EurekaHttpClients 
+         public static EurekaHttpClientFactory queryClientFactory
+         .......
+     return canonicalClientFactory(EurekaClientNames.QUERY, transportConfig, queryResolver, transportClientFactory);
+.............
+    static EurekaHttpClientFactory canonicalClientFactory
+    ....................
+    //SessionedEurekaHttpClient这个就是这里就是EurekaTransport构造registrationClient中对应的client
+    //但是里面也没有对应的注册方法，对应的注册方法在父类，父类register又是调用一个execute，又是其他地方，绕出去了
+    return new SessionedEurekaHttpClient........
+}
+```
+
+​	eureka大量的基于jersey框架，在eureka server上提供restful接口，在eureka client如果要发送请求到eureka server的话，一定是基于jersey框架，去发送的http restful接口调用的请求
+
+​	真正执行注册请求的，就是eureka-client-jersey2工程里的AbstractJersey2EurekaHttpClient，请求http://localhost:8080/v2/apps/ServiceA，将服务实例的信息发送过去
+
+```java
+/**
+ * @author Tomasz Bak
+ */
+public abstract class AbstractJersey2EurekaHttpClient implements EurekaHttpClient {
+    @Override
+    public EurekaHttpResponse<Void> register(InstanceInfo info) {
+        String urlPath = "apps/" + info.getAppName();
+        Response response = null;
+        try {
+            //发送请求，如: http://localhost:8080/v2/apps/ServiceA
+            //serviceUrl http://localhost:8080/v2 自己配的 defaultZone
+            //urlPath ServiceA 自己配的
+            Builder resourceBuilder = jerseyClient.target(serviceUrl).path(urlPath).request();
+            addExtraProperties(resourceBuilder);
+            addExtraHeaders(resourceBuilder);
+            //发送的是post的请求，把InstancInfo对象(服务实例对象)打成了json发送过去
+            //包含了自己的主机、ip、端口号
+            //人家eureka server 就知道这个ServiveA这个服务，有一个服务实例，比如是在192.168.31.109、host-01、8761
+            response = resourceBuilder
+                    .accept(MediaType.APPLICATION_JSON)
+                    .acceptEncoding("gzip")
+                    .post(Entity.json(info));
+            return anEurekaHttpResponse(response.getStatus()).headers(headersOf(response)).build();
+        } finally {
+            if (logger.isDebugEnabled()) {
+                logger.debug("Jersey2 HTTP POST {}/{} with instance {}; statusCode={}", serviceUrl, urlPath, info.getId(),
+                        response == null ? "N/A" : response.getStatus());
+            }
+            if (response != null) {
+                response.close();
+            }
+        }
+    }
+}
+```
+
+## 4.2 总结
+
+eureka client的核心机制：
+
+（1）eureka client的服务注册，是在 DiscoveryClient构造的initScheduledTasks(初始化调度任务) InstanceInfoReplicator(服务实例进行复制)的调度任务中的
+
+（2）实际发送服务注册请求的是AbstractJersey2EurekaHttpClient，调用了一个restful接口
 
