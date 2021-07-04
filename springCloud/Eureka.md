@@ -2037,3 +2037,237 @@ eureka client的核心机制：
 
 （2）实际发送服务注册请求的是AbstractJersey2EurekaHttpClient，调用了一个restful接口
 
+# 5 eureka server是如何完成服务注册的
+
+​	在这个eureka core的resources包下面，有一堆的resources，这些resource相当于是spring web mvc的controller，用来接收这个http请求的。resources相当于是jersey里面的controller吧。
+
+​	所有的请求都会发送到eureka server的web应用，最后都会走jersey的servlet，jersey的servlet会根据请求的路径，将请求转发给eureka core里面的resource（相当于是转发给某个controller）。
+
+![image-20210704115820248](Eureka.assets/image-20210704115820248.png)
+
+​	**ApplicationsResource，里面是接收这个请求的**。http://localhost:8080/v2/apps/ServiceA，这么一个地址。ServiceA可以认为是一个app name，也可以是app id，标志了一个服务，就是服务名称。用ApplicationResource来处理，看看对这个url发起的是什么请求，GET？POST？PUT？DELETE？post请求，带着InstanceInfo实例打成的一个json过来的。
+
+​	**ApplicationResource的addInstance()方法，是接收post请求的**，看方法名就知道是服务实例的注册的。接收的是一个InstanceInfo，代表了一个服务实例。服务可能会部署在多台机器上，每台机器上部署的就是一个服务实例。
+
+```java
+@Produces({"application/xml", "application/json"})
+public class ApplicationResource {
+    
+     private final PeerAwareInstanceRegistry registry;
+    
+    @POST
+    @Consumes({"application/json", "application/xml"})
+    public Response addInstance(InstanceInfo info,
+                                @HeaderParam(PeerEurekaNode.HEADER_REPLICATION) String isReplication) {
+        logger.debug("Registering instance {} (replication={})", info.getId(), isReplication);
+        // validate that the instanceinfo contains all the necessary required fields
+        //check相关的代码逻辑，防御式编程，保持代码的健壮性
+        //但是一般建议，将这种重要接口的请求参数的校验逻辑，都放在单独方法中，解耦
+        if (isBlank(info.getId())) {
+            return Response.status(400).entity("Missing instanceId").build();
+        } else if (isBlank(info.getHostName())) {
+            return Response.status(400).entity("Missing hostname").build();
+        } else if (isBlank(info.getIPAddr())) {
+            return Response.status(400).entity("Missing ip address").build();
+        } else if (isBlank(info.getAppName())) {
+            return Response.status(400).entity("Missing appName").build();
+        } else if (!appName.equals(info.getAppName())) {
+            return Response.status(400).entity("Mismatched appName, expecting " + appName + " but was " + info.getAppName()).build();
+        } else if (info.getDataCenterInfo() == null) {
+            return Response.status(400).entity("Missing dataCenterInfo").build();
+        } else if (info.getDataCenterInfo().getName() == null) {
+            return Response.status(400).entity("Missing dataCenterInfo Name").build();
+        }
+
+        // handle cases where clients may be registering with bad DataCenterInfo with missing data
+        DataCenterInfo dataCenterInfo = info.getDataCenterInfo();
+        if (dataCenterInfo instanceof UniqueIdentifier) {
+            String dataCenterInfoId = ((UniqueIdentifier) dataCenterInfo).getId();
+            if (isBlank(dataCenterInfoId)) {
+                boolean experimental = "true".equalsIgnoreCase(serverConfig.getExperimental("registration.validation.dataCenterInfoId"));
+                //石杉建议
+                //DataCenter dataCenter = DataCenterFactory.get();->根据eureka.server.env=default还是aws来返回
+                //实现类可能是DefaultDataCenter,也可能是AWSDataCenter
+                //直接就是运行一个接口的方法，面向接口编程:dataCenter.refreshData();
+                if (experimental) {
+                    String entity = "DataCenterInfo of type " + dataCenterInfo.getClass() + " must contain a valid id";
+                    return Response.status(400).entity(entity).build();
+                } else if (dataCenterInfo instanceof AmazonInfo) {
+                    AmazonInfo amazonInfo = (AmazonInfo) dataCenterInfo;
+                    String effectiveId = amazonInfo.get(AmazonInfo.MetaDataKey.instanceId);
+                    if (effectiveId == null) {
+                        amazonInfo.getMetadata().put(AmazonInfo.MetaDataKey.instanceId.getName(), info.getId());
+                    }
+                } else {
+                    logger.warn("Registering DataCenterInfo of type {} without an appropriate id", dataCenterInfo.getClass());
+                }
+            }
+        }
+		//PeerAwareInstanceRegistry中进行注册逻辑
+        registry.register(info, "true".equals(isReplication));
+        return Response.status(204).build();  // 204 to be backwards compatible
+    }
+}
+```
+
+**所谓的InstanceInfo，服务实例，里面最主要的就是包含2块数据：**
+
+（1）主机名、ip地址、端口号、url地址
+
+（2）lease（租约）的信息：保持心跳的间隔时间，最近心跳的时间，服务注册的时间，服务启动的时间
+
+```java
+//PeerAwareInstanceRegistry：注册表，包含所有的服务实例注册的信息
+@Singleton
+public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry implements PeerAwareInstanceRegistry {
+    /*
+    * PeerAwareInstanceRegistry.register()方法，将服务实例往注册表去进行注册，实际上会调用父类AbstractInstanceRegistry的register()方法中去了
+    */
+    @Override
+    public void register(final InstanceInfo info, final boolean isReplication) {
+        int leaseDuration = Lease.DEFAULT_DURATION_IN_SECS;
+        if (info.getLeaseInfo() != null && info.getLeaseInfo().getDurationInSecs() > 0) {
+            leaseDuration = info.getLeaseInfo().getDurationInSecs();
+        }
+        //注册逻辑由父类注册方法负责
+        super.register(info, leaseDuration, isReplication);
+        replicateToPeers(Action.Register, info.getAppName(), info.getId(), info, null, isReplication);
+    }
+}
+
+public abstract class AbstractInstanceRegistry implements InstanceRegistry {
+    	//ConcurrentHashMap这个就是所谓的注册表，核心的数据结构
+    	//类似这种内存注册表的一种实现形式，就是最简单的就是用ConcurentHashMap保证多线程并发安全就可以了，然后将每个服务的每个服务实例的信息，都保存在这个map里面
+        private final ConcurrentHashMap<String, Map<String, Lease<InstanceInfo>>> registry
+            = new ConcurrentHashMap<String, Map<String, Lease<InstanceInfo>>>();
+    	//读写锁的一个应用，ReentranctReadWriteLock，注册的时候，上的是读锁。多个服务实例，可以同时来注册。灵活的运用读写锁，可以控制多线程的并发，有些操作是可以并发执行的，有些操作是互斥的。
+        private final ReentrantReadWriteLock readWriteLock = new ReentrantReadWriteLock();
+    	private final Lock read = readWriteLock.readLock();
+    	private final Lock write = readWriteLock.writeLock();
+    
+        public void register(InstanceInfo registrant, int leaseDuration, boolean isReplication) {
+        try {
+            read.lock();
+            //appName，APPLICATION0，服务名称，ServiceA，或者是别的什么名称
+            Map<String, Lease<InstanceInfo>> gMap = registry.get(registrant.getAppName());
+            REGISTER.increment(isReplication);
+            //如果说是某个服务第一次来注册，很明显，通过AppName是获取不到Map的，是个空
+            //此时就会创建一个新的Map，给放到大的registry map中去
+            //其实这个registry map，就是一个注册表,里面包含了每个服务实例的注册信息
+            if (gMap == null) {
+                final ConcurrentHashMap<String, Lease<InstanceInfo>> gNewMap = new ConcurrentHashMap<String, Lease<InstanceInfo>>();
+                gMap = registry.putIfAbsent(registrant.getAppName(), gNewMap);
+                if (gMap == null) {
+                    gMap = gNewMap;
+                }
+            }
+            //通过InstanceId,从gMap中获取服务实例对应的租约
+            //假设这个服务实例，第一次来注册，那么这里获取到的lease一定是Null
+            //因为这个服务实例之前没有来注册过
+            //instanceId，例：i-0000001，服务实例id，一个服务名称会对应多个服务实例，每个服务实例的服务名称当然是一样的咯，但是服务实例id是不一样的
+            Lease<InstanceInfo> existingLease = gMap.get(registrant.getId());
+            // Retain the last dirty timestamp without overwriting it, if there is already a lease
+            if (existingLease != null && (existingLease.getHolder() != null)) {
+                Long existingLastDirtyTimestamp = existingLease.getHolder().getLastDirtyTimestamp();
+                Long registrationLastDirtyTimestamp = registrant.getLastDirtyTimestamp();
+                logger.debug("Existing lease found (existing={}, provided={}", existingLastDirtyTimestamp, registrationLastDirtyTimestamp);
+
+                // this is a > instead of a >= because if the timestamps are equal, we still take the remote transmitted
+                // InstanceInfo instead of the server local copy.
+                if (existingLastDirtyTimestamp > registrationLastDirtyTimestamp) {
+                    logger.warn("There is an existing lease and the existing lease's dirty timestamp {} is greater" +
+                            " than the one that is being registered {}", existingLastDirtyTimestamp, registrationLastDirtyTimestamp);
+                    logger.warn("Using the existing instanceInfo instead of the new instanceInfo as the registrant");
+                    registrant = existingLease.getHolder();
+                }
+            } else {
+                // The lease does not exist and hence it is a new registration
+                synchronized (lock) {
+                    if (this.expectedNumberOfRenewsPerMin > 0) {
+                        // Since the client wants to cancel it, reduce the threshold
+                        // (1
+                        // for 30 seconds, 2 for a minute)
+                        this.expectedNumberOfRenewsPerMin = this.expectedNumberOfRenewsPerMin + 2;
+                        this.numberOfRenewsPerMinThreshold =
+                                (int) (this.expectedNumberOfRenewsPerMin * serverConfig.getRenewalPercentThreshold());
+                    }
+                }
+                logger.debug("No previous lease information found; it is new registration");
+            }
+            //在这里，会将这个InstanceInfo封装为一个lease对象
+            Lease<InstanceInfo> lease = new Lease<InstanceInfo>(registrant, leaseDuration);
+            if (existingLease != null) {
+                lease.setServiceUpTimestamp(existingLease.getServiceUpTimestamp());
+            }
+            //直接将封装了服务实例信息的Lease对象，放到了gMap中去,key就是服务实例的id
+            gMap.put(registrant.getId(), lease);
+            //最近注册的队列，保存注册服务的队列
+            synchronized (recentRegisteredQueue) {
+                recentRegisteredQueue.add(new Pair<Long, String>(
+                        System.currentTimeMillis(),
+                        registrant.getAppName() + "(" + registrant.getId() + ")"));
+            }
+            //服务实例的状态
+            // This is where the initial state transfer of overridden status happens
+            if (!InstanceStatus.UNKNOWN.equals(registrant.getOverriddenStatus())) {
+                logger.debug("Found overridden status {} for instance {}. Checking to see if needs to be add to the "
+                                + "overrides", registrant.getOverriddenStatus(), registrant.getId());
+                if (!overriddenInstanceStatusMap.containsKey(registrant.getId())) {
+                    logger.info("Not found overridden id {} and hence adding it", registrant.getId());
+                    overriddenInstanceStatusMap.put(registrant.getId(), registrant.getOverriddenStatus());
+                }
+            }
+            InstanceStatus overriddenStatusFromMap = overriddenInstanceStatusMap.get(registrant.getId());
+            if (overriddenStatusFromMap != null) {
+                logger.info("Storing overridden status {} from map", overriddenStatusFromMap);
+                registrant.setOverriddenStatus(overriddenStatusFromMap);
+            }
+
+            // Set the status based on the overridden status rules
+            InstanceStatus overriddenInstanceStatus = getOverriddenInstanceStatus(registrant, existingLease, isReplication);
+            registrant.setStatusWithoutDirty(overriddenInstanceStatus);
+
+            // If the lease is registered with UP status, set lease service up timestamp
+            if (InstanceStatus.UP.equals(registrant.getStatus())) {
+                lease.serviceUp();
+            }
+            registrant.setActionType(ActionType.ADDED);
+            recentlyChangedQueue.add(new RecentlyChangedItem(lease));
+            registrant.setLastUpdatedTimestamp();
+            invalidateCache(registrant.getAppName(), registrant.getVIPAddress(), registrant.getSecureVipAddress());
+            logger.info("Registered instance {}/{} with status {} (replication={})",
+                    registrant.getAppName(), registrant.getId(), registrant.getStatus(), isReplication);
+        } finally {
+            read.unlock();
+        }
+    }
+}
+```
+
+​	一个类似这种内存注册表的一种实现形式，就是最简单的就是用ConcurentHashMap保证多线程并发安全就可以了，然后将每个服务的每个服务实例的信息，都保存在这个map里面
+
+```json
+ConcurrentHashMap<String, Map<String, Lease<InstanceInfo>>>
+Lease(组约)
+这个就是所谓的注册表，核心的数据结构
+Lease泛型InstanceInfo，其中holder属性就是泛型成员变量，保存了InstanceInfo，其他属性为一些租约信息
+{
+“ServiceA”: {
+“001”: Lease<InstanceInfo>,
+“002”: Lease<InstanceInfo>,
+“003”: Lease<InstanceInfo>
+},
+“ServiceB”: {
+“001”: Lease<InstanceInfo>
+}
+}
+```
+
+
+
+
+
+
+
+
+
