@@ -2039,6 +2039,8 @@ eureka client的核心机制：
 
 # 5 eureka server是如何完成服务注册的
 
+## 5.1 流程
+
 ​	在这个eureka core的resources包下面，有一堆的resources，这些resource相当于是spring web mvc的controller，用来接收这个http请求的。resources相当于是jersey里面的controller吧。
 
 ​	所有的请求都会发送到eureka server的web应用，最后都会走jersey的servlet，jersey的servlet会根据请求的路径，将请求转发给eureka core里面的resource（相当于是转发给某个controller）。
@@ -2263,11 +2265,21 @@ Lease泛型InstanceInfo，其中holder属性就是泛型成员变量，保存了
 }
 ```
 
+## 5.2 流程图
 
+一旦完成了服务注册之后，咱们平时访问的eureka控制台，其实就是个jsp，status.jsp
 
+在jsp代码中，拿到了EurekaServerContext，所以之前为什么要将这个东东放到一个Holder里面去，就是随时都要从这个里面去获取一些数据
 
+然后会从EurekaServerContext，获取到注册表，PeerAwareInstanceRegistry，注册表，从里面获取所有的服务信息，从底层的map数据结构中，获取所有的服务注册的信息，遍历，封装到一个叫Application的东西里去，一个Application就代表了一个服务，里面包含很多个服务实例。
 
+然后就是将每个服务实例的信息，处理一下，形成一个服务的完整的这么一份信息，比如说有几个服务实例，每个服务实例的url地址是什么。
 
+ ![image-20210704150705546](Eureka.assets/image-20210704150705546.png)
+
+流程图：
+
+https://www.processon.com/view/link/60e15e231efad40c1bf4a51c
 
 
 
