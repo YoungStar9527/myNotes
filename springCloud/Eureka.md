@@ -2281,5 +2281,319 @@ Lease泛型InstanceInfo，其中holder属性就是泛型成员变量，保存了
 
 https://www.processon.com/view/link/60e15e231efad40c1bf4a51c
 
+# 6 eureka注册表
 
+## 6.1 eureka client第一次启动时全量抓取注册表
+
+​	全量抓取注册表，eureka client第一次启动的时候，必须从eureka server端一次性抓取全量的注册表的信息过来，在本地进行缓存，后面的话呢，每隔30秒从eureka server抓取增量的注册表信息，跟本地缓存进行合并
+
+```java
+@Singleton
+public class DiscoveryClient implements EurekaClient {
+ 
+        @Inject
+    DiscoveryClient(ApplicationInfoManager applicationInfoManager, EurekaClientConfig config, AbstractDiscoveryClientOptionalArgs args,
+                    Provider<BackupRegistry> backupRegistryProvider) 
+        ......................
+        //如果要去抓取注册表的话，在这里就抓取注册表了(fetchRegistry)
+        //如果你配置了应该要抓取注册表的信息，那么就会在启动的时候来一次全量的注册表的抓取
+        if (clientConfig.shouldFetchRegistry() && !fetchRegistry(false)) {
+            fetchRegistryFromBackup();
+        }
+    ...................
+        
+    private boolean fetchRegistry(boolean forceFullRegistryFetch) {
+        Stopwatch tracer = FETCH_REGISTRY_TIMER.start();
+
+        try {
+            // If the delta is disabled or if it is the first time, get all
+            //）先获取本地的Applications缓存
+            Applications applications = getApplications();
+
+            if (clientConfig.shouldDisableDelta()
+                    || (!Strings.isNullOrEmpty(clientConfig.getRegistryRefreshSingleVipAddress()))
+                    || forceFullRegistryFetch
+                    || (applications == null)
+                    || (applications.getRegisteredApplications().size() == 0)
+                    || (applications.getVersion() == -1)) //Client application does not have latest library supporting delta
+            {
+                logger.info("Disable delta property : {}", clientConfig.shouldDisableDelta());
+                logger.info("Single vip registry refresh property : {}", clientConfig.getRegistryRefreshSingleVipAddress());
+                logger.info("Force full registry fetch : {}", forceFullRegistryFetch);
+                logger.info("Application is null : {}", (applications == null));
+                logger.info("Registered Applications size is zero : {}",
+                        (applications.getRegisteredApplications().size() == 0));
+                logger.info("Application version is -1: {}", (applications.getVersion() == -1));
+                //第一次就是全量抓取注册表
+                getAndStoreFullRegistry();
+            } else {
+                getAndUpdateDelta(applications);
+            }
+            applications.setAppsHashCode(applications.getReconcileHashCode());
+            logTotalInstances();
+        } catch (Throwable e) {
+            logger.error(PREFIX + appPathIdentifier + " - was unable to refresh its cache! status = " + e.getMessage(), e);
+            return false;
+        } finally {
+            if (tracer != null) {
+                tracer.stop();
+            }
+        }
+
+        // Notify about cache refresh before updating the instance remote status
+        onCacheRefreshed();
+
+        // Update remote status based on refreshed data held in the cache
+        updateInstanceRemoteStatus();
+
+        // registry was fetched successfully, so return true
+        return true;
+    }
+    
+  /*
+  *
+  * 全量抓取注册表
+  */
+  private void getAndStoreFullRegistry() throws Throwable {
+        long currentUpdateGeneration = fetchRegistryGeneration.get();
+
+        logger.info("Getting all instance registry info from the eureka server");
+
+        Applications apps = null;
+      //调用jersey client，发送http请求（http://localhost:8080/v2/apps），GET请求，调用eureka server的getApplications restful接口，获取全量注册表，缓存在自己的本地
+      //eurekaTransport.queryClient.getApplications 为 AbstractJersey2EurekaHttpClient 中对应的方法
+        EurekaHttpResponse<Applications> httpResponse = clientConfig.getRegistryRefreshSingleVipAddress() == null
+                ? eurekaTransport.queryClient.getApplications(remoteRegionsRef.get())
+                : eurekaTransport.queryClient.getVip(clientConfig.getRegistryRefreshSingleVipAddress(), remoteRegionsRef.get());
+        if (httpResponse.getStatusCode() == Status.OK.getStatusCode()) {
+            apps = httpResponse.getEntity();
+        }
+        logger.info("The response status is {}", httpResponse.getStatusCode());
+
+        if (apps == null) {
+            logger.error("The application is null for some reason. Not storing this information");
+        } else if (fetchRegistryGeneration.compareAndSet(currentUpdateGeneration, currentUpdateGeneration + 1)) {
+            localRegionApps.set(this.filterAndShuffle(apps));
+            logger.debug("Got full registry with apps hashcode {}", apps.getAppsHashCode());
+        } else {
+            logger.warn("Not updating applications as another thread is updating it already");
+        }
+    }
+        
+}
+```
+
+**总结：**
+
+（1）EurekaClient初始化的时候，就会自动全量抓取注册表
+
+（2）先获取本地的Applications缓存，Applications是什么东西？就是所有的服务，Applicaiton是一个服务，Applications是所有的服务，Application中包含了他自己的所有的InstanceInfo，就是一个服务包含了自己的所有的服务实例
+
+（3）调用jersey client，发送http请求（http://localhost:8080/v2/apps），GET请求，调用eureka server的getApplications restful接口，获取全量注册表，缓存在自己的本地
+
+ 
+
+## 6.2 eureka server的注册表多级缓存机制源码剖析
+
+​	eureka client初始化的时候，就会自动发送个请求到eureka server拉一次清抓取全量的注册表，eureka client发送的请求是：http://localhost:8080/v2/apps/，get请求 
+
+​	ApplicationsResource的getContainers()方法，获取全量注册表的方法
+
+```java
+@Path("/{version}/apps")
+@Produces({"application/xml", "application/json"})
+public class ApplicationsResource {
+    
+    //ResponseCache接口的ResponseCacheImpl实现类
+    private final ResponseCache responseCache;
+    
+    @GET
+    public Response getContainers(@PathParam("version") String version,
+                                  @HeaderParam(HEADER_ACCEPT) String acceptHeader,
+                                  @HeaderParam(HEADER_ACCEPT_ENCODING) String acceptEncoding,
+                                  @HeaderParam(EurekaAccept.HTTP_X_EUREKA_ACCEPT) String eurekaAccept,
+                                  @Context UriInfo uriInfo,
+                                  @Nullable @QueryParam("regions") String regionsStr) {
+
+        boolean isRemoteRegionRequested = null != regionsStr && !regionsStr.isEmpty();
+        String[] regions = null;
+        if (!isRemoteRegionRequested) {
+            EurekaMonitors.GET_ALL.increment();
+        } else {
+            regions = regionsStr.toLowerCase().split(",");
+            Arrays.sort(regions); // So we don't have different caches for same regions queried in different order.
+            EurekaMonitors.GET_ALL_WITH_REMOTE_REGIONS.increment();
+        }
+
+        // Check if the server allows the access to the registry. The server can
+        // restrict access if it is not
+        // ready to serve traffic depending on various reasons.
+        if (!registry.shouldAllowAccess(isRemoteRegionRequested)) {
+            return Response.status(Status.FORBIDDEN).build();
+        }
+        CurrentRequestVersion.set(Version.toEnum(version));
+        KeyType keyType = Key.KeyType.JSON;
+        String returnMediaType = MediaType.APPLICATION_JSON;
+        if (acceptHeader == null || !acceptHeader.contains(HEADER_JSON_VALUE)) {
+            keyType = Key.KeyType.XML;
+            returnMediaType = MediaType.APPLICATION_XML;
+        }
+
+        Key cacheKey = new Key(Key.EntityType.Application,
+                ResponseCacheImpl.ALL_APPS,
+                keyType, CurrentRequestVersion.get(), EurekaAccept.fromString(eurekaAccept), regions
+        );
+
+        Response response;
+        if (acceptEncoding != null && acceptEncoding.contains(HEADER_GZIP_VALUE)) {
+            response = Response.ok(responseCache.getGZIP(cacheKey))
+                    .header(HEADER_CONTENT_ENCODING, HEADER_GZIP_VALUE)
+                    .header(HEADER_CONTENT_TYPE, returnMediaType)
+                    .build();
+        } else {
+            //eureka server端，支持你来读取注册表的时候，搞了一套短小精干的多级缓存机制
+            //responseCache.get(cacheKey)
+            //最后呢，就是将从多级缓存机制中读取出来的全量的Applications作为响应来返回
+            response = Response.ok(responseCache.get(cacheKey))
+                    .build();
+        }
+        return response;
+    }
+}
+```
+
+​	eureka server端，支持你来读取注册表的时候，搞了一套短小精干的多级缓存机制
+
+​	也就是说，你eureka client发送请求过来读取全量注册表的时候，其实会从多级缓存里去读取注册表的数据，所以这里的cacheKey，就是全量注册表的缓存key
+
+​	RespnseCache，就是eureka server端的缓存机制
+
+​	多级缓存机制，用了两个map，来做了两级缓存，只读缓存map，读写缓存map，先从只读缓存里去读，如果没有的话，会从读写缓存里去读，如果还是没有呢？如果这个读写缓存，没有缓存的话，会从eureka server的注册表中去读取
+
+​	从注册表中获取所有的Applications，ServerCodecs，json序列化的组件，将Applications对象序列化为了一个json字符串，将注册表中读取出来的Applications，放入读写缓存，接着放入只读缓存中去
+
+​	最后呢，就是将从多级缓存机制中读取出来的全量的Applications作为响应来返回
+
+```java
+public class ResponseCacheImpl implements ResponseCache {
+
+    //只读缓存map
+   private final ConcurrentMap<Key, Value> readOnlyCacheMap = new ConcurrentHashMap<Key, Value>();
+
+    //读写缓存map
+    private final LoadingCache<Key, Value> readWriteCacheMap;
+    
+    public String get(final Key key) {
+        return get(key, shouldUseReadOnlyResponseCache);
+    }
+
+    /*
+    * get获取缓存中的数据
+    */
+    @VisibleForTesting
+    String get(final Key key, boolean useReadOnlyCache) {
+        Value payload = getValue(key, useReadOnlyCache);
+        if (payload == null || payload.getPayload().equals(EMPTY_PAYLOAD)) {
+            return null;
+        } else {
+            return payload.getPayload();
+        }
+    }
+    
+    /*
+    * getValue获取读写缓存数据
+    */
+    @VisibleForTesting
+    Value getValue(final Key key, boolean useReadOnlyCache) {
+        Value payload = null;
+        try {
+            if (useReadOnlyCache) {
+                //先从只读缓存里去读
+                final Value currentPayload = readOnlyCacheMap.get(key);
+                if (currentPayload != null) {
+                    payload = currentPayload;
+                } else {
+                    //如果没有的话，会从读写缓存里去读
+                    //如果还是没有呢 参考 ResponseCacheImpl 中 readWriteCacheMap的实现
+                    //将注册表中读取出来的Applications，放入读写缓存，接着放入只读缓存中去
+                    payload = readWriteCacheMap.get(key);
+                    //再存入读缓存
+                    readOnlyCacheMap.put(key, payload);
+                }
+            } else {
+                payload = readWriteCacheMap.get(key);
+            }
+        } catch (Throwable t) {
+            logger.error("Cannot get value for key :" + key, t);
+        }
+        return payload;
+    }
+    
+   ResponseCacheImpl(EurekaServerConfig serverConfig, ServerCodecs serverCodecs, AbstractInstanceRegistry registry) 
+        ..............
+       //如果这个读写缓存，没有缓存的话，会从eureka server的注册表中去读取
+       //将注册表中读取出来的Applications，放入读写缓存
+        this.readWriteCacheMap =
+                CacheBuilder.newBuilder().initialCapacity(1000)
+                        .expireAfterWrite(serverConfig.getResponseCacheAutoExpirationInSeconds(), TimeUnit.SECONDS)
+                        .removalListener(new RemovalListener<Key, Value>() {
+                            @Override
+                            public void onRemoval(RemovalNotification<Key, Value> notification) {
+                                Key removedKey = notification.getKey();
+                                if (removedKey.hasRegions()) {
+                                    Key cloneWithNoRegions = removedKey.cloneWithoutRegions();
+                                    regionSpecificKeys.remove(cloneWithNoRegions, removedKey);
+                                }
+                            }
+                        })
+                        .build(new CacheLoader<Key, Value>() {
+                            @Override
+                            public Value load(Key key) throws Exception {
+                                if (key.hasRegions()) {
+                                    Key cloneWithNoRegions = key.cloneWithoutRegions();
+                                    regionSpecificKeys.put(cloneWithNoRegions, key);
+                                }
+                                //从注册表中获取所有的Applications
+                                Value value = generatePayload(key);
+                                return value;
+                            }
+                        });
+......................................
+       private Value generatePayload(Key key)
+    ......................................
+    		switch (key.getEntityType()) {
+                    //从注册表中获取所有的Applications
+     			case Application:
+                    boolean isRemoteRegionRequested = key.hasRegions();
+
+                    if (ALL_APPS.equals(key.getName())) {
+                        if (isRemoteRegionRequested) {
+                            tracer = serializeAllAppsWithRemoteRegionTimer.start();
+                            //ServerCodecs，json序列化的组件，将Applications对象序列化为了一个json字符串
+                            payload = getPayLoad(key, registry.getApplicationsFromMultipleRegions(key.getRegions()));
+                        } else {
+                            tracer = serializeAllAppsTimer.start();
+                            payload = getPayLoad(key, registry.getApplications());
+                        }
+                    }
+    ......................................
+     //ServerCodecs，json序列化的组件，将Applications对象序列化为了一个json字符串
+    private String getPayLoad(Key key, Applications apps) {
+        EncoderWrapper encoderWrapper = serverCodecs.getEncoder(key.getType(), key.getEurekaAccept());
+        String result;
+        try {
+            result = encoderWrapper.encode(apps);
+        } catch (Exception e) {
+            logger.error("Failed to encode the payload for all apps", e);
+            return "";
+        }
+        if(logger.isDebugEnabled()) {
+            logger.debug("New application cache entry {} with apps hashcode {}", key.toStringCompact(), apps.getAppsHashCode());
+        }
+        return result;
+    }
+}
+```
+
+流程图：https://www.processon.com/view/link/60e3045d1e08535988941b8f
 
