@@ -2393,7 +2393,7 @@ public class DiscoveryClient implements EurekaClient {
 
  
 
-## 6.2 eureka server的注册表多级缓存机制源码剖析
+## 6.2 eureka server的注册表多级缓存机制源码剖析(只读缓存+读写缓存)
 
 ​	eureka client初始化的时候，就会自动发送个请求到eureka server拉一次清抓取全量的注册表，eureka client发送的请求是：http://localhost:8080/v2/apps/，get请求 
 
@@ -2593,6 +2593,181 @@ public class ResponseCacheImpl implements ResponseCache {
         return result;
     }
 }
+```
+
+流程图：https://www.processon.com/view/link/60e3045d1e08535988941b8f
+
+## 6.3 eureka server的注册表多级缓存过期机制：主动过期+定时过期+被动过期
+
+（1）主动过期
+
+readWriteCacheMap，读写缓存
+
+有新的服务实例发生注册、下线、故障的时候，就会去刷新readWriteCacheMap
+
+比如说现在有一个服务A，ServiceA，有一个新的服务实例，Instance010来注册了，注册完了之后，其实必须是得刷新这个缓存的，然后就会调用ResponseCache.invalidate()，将之前缓存好的ALL_APPS这个key对应的缓存，给他过期掉
+
+将readWriteCacheMap中的ALL_APPS缓存key，对应的缓存给过期掉
+
+
+
+```java
+//eureke server 接受服务注册，新增实例的接口
+@Produces({"application/xml", "application/json"})
+public class ApplicationResource {
+    
+	private final PeerAwareInstanceRegistry registry;
+    
+    @POST
+    @Consumes({"application/json", "application/xml"})
+    public Response addInstance(InstanceInfo info,
+                                @HeaderParam(PeerEurekaNode.HEADER_REPLICATION) String isReplication) 
+        .........................
+        //服务注册
+        registry.register(info, "true".equals(isReplication));
+        ......................
+}
+```
+
+服务注册,过期缓存
+
+```java
+@Singleton
+public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry implements PeerAwareInstanceRegistry {
+    @Override
+    public void register(final InstanceInfo info, final boolean isReplication)
+        ...................
+        //调用父类注册方法
+        super.register(info, leaseDuration, isReplication);
+ ...............
+}
+
+//父类
+public abstract class AbstractInstanceRegistry implements InstanceRegistry {
+    
+     protected volatile ResponseCache responseCache;
+    
+    //父类对应注册方法
+     public void register(InstanceInfo registrant, int leaseDuration, boolean isReplication)
+       ........................
+         //注册完了之后，其实必须是得刷新这个缓存的
+       invalidateCache(registrant.getAppName(), registrant.getVIPAddress(), registrant.getSecureVipAddress());
+..............................
+    
+   private void invalidateCache(String appName, @Nullable String vipAddress, @Nullable String secureVipAddress) {
+        // invalidate cache
+    	//然后就会调用ResponseCache.invalidate()，将之前缓存好的ALL_APPS这个key对应的缓存，给他过期掉
+        responseCache.invalidate(appName, vipAddress, secureVipAddress);
+    }
+}
+//缓存操作类
+public class ResponseCacheImpl implements ResponseCache {
+   @Override
+    public void invalidate(String appName, @Nullable String vipAddress, @Nullable String secureVipAddress) {
+        for (Key.KeyType type : Key.KeyType.values()) {
+            for (Version v : Version.values()) {
+                //将readWriteCacheMap中的ALL_APPS缓存key，对应的缓存给过期掉
+                invalidate(
+                        new Key(Key.EntityType.Application, appName, type, v, EurekaAccept.full),
+                        new Key(Key.EntityType.Application, appName, type, v, EurekaAccept.compact),
+                        new Key(Key.EntityType.Application, ALL_APPS, type, v, EurekaAccept.full),
+                        new Key(Key.EntityType.Application, ALL_APPS, type, v, EurekaAccept.compact),
+                        new Key(Key.EntityType.Application, ALL_APPS_DELTA, type, v, EurekaAccept.full),
+                        new Key(Key.EntityType.Application, ALL_APPS_DELTA, type, v, EurekaAccept.compact)
+                );
+                if (null != vipAddress) {
+                    invalidate(new Key(Key.EntityType.VIP, vipAddress, type, v, EurekaAccept.full));
+                }
+                if (null != secureVipAddress) {
+                    invalidate(new Key(Key.EntityType.SVIP, secureVipAddress, type, v, EurekaAccept.full));
+                }
+            }
+        }
+    }
+}
+```
+
+（2）定时过期
+
+​	readWriteCacheMap在构建的时候，指定了一个自动过期的时间，默认值就是180秒，所以你往readWriteCacheMap中放入一个数据过后，自动会等180秒过后，就将这个数据给他过期了
+
+（3）被动过期
+
+​	readOnlyCacheMap怎么过期呢？
+
+​	默认是每隔30秒，执行一个定时调度的线程任务，TimerTask，有一个逻辑，会每隔30秒，对readOnlyCacheMap和readWriteCacheMap中的数据进行一个比对，如果两块数据是不一致的，那么就将readWriteCacheMap中的数据放到readOnlyCacheMap中来。
+
+​	比如说readWriteCacheMap中，ALL_APPS这个key对应的缓存没了，那么最多30秒过后，就会同步到readOnelyCacheMap中去
+
+```java
+ public class ResponseCacheImpl implements ResponseCache {
+	 ResponseCacheImpl(EurekaServerConfig serverConfig, ServerCodecs serverCodecs, AbstractInstanceRegistry registry) 
+         .....................
+ 		this.readWriteCacheMap =
+                CacheBuilder.newBuilder().initialCapacity(1000)
+         			//readWriteCacheMap在构建的时候，指定了一个自动过期的时间，默认值就是180秒，所以你往readWriteCacheMap中放入一个数据过后，自动会等180秒过后，就将这个数据给他过期了
+         //serverConfig.getResponseCacheAutoExpirationInSeconds()默认180
+                        .expireAfterWrite(serverConfig.getResponseCacheAutoExpirationInSeconds(), TimeUnit.SECONDS)
+                        .removalListener(new RemovalListener<Key, Value>() {
+                            @Override
+                            public void onRemoval(RemovalNotification<Key, Value> notification) {
+                                Key removedKey = notification.getKey();
+                                if (removedKey.hasRegions()) {
+                                    Key cloneWithNoRegions = removedKey.cloneWithoutRegions();
+                                    regionSpecificKeys.remove(cloneWithNoRegions, removedKey);
+                                }
+                            }
+                        })
+                        .build(new CacheLoader<Key, Value>() {
+                            @Override
+                            public Value load(Key key) throws Exception {
+                                if (key.hasRegions()) {
+                                    Key cloneWithNoRegions = key.cloneWithoutRegions();
+                                    regionSpecificKeys.put(cloneWithNoRegions, key);
+                                }
+                                Value value = generatePayload(key);
+                                return value;
+                            }
+                        });
+     if (shouldUseReadOnlyResponseCache) {
+         //readOnelyCacheMap被动过期调度
+         //默认是每隔30秒，执行一个定时调度的线程任务
+            timer.schedule(getCacheUpdateTask(),
+                    new Date(((System.currentTimeMillis() / responseCacheUpdateIntervalMs) * responseCacheUpdateIntervalMs)
+                            + responseCacheUpdateIntervalMs),
+                    responseCacheUpdateIntervalMs);
+        }
+     .................................
+         
+   //readOnelyCacheMap被动方法       
+  //比如说readWriteCacheMap中，ALL_APPS这个key对应的缓存没了，那么最多30秒过后，就会同步到readOnelyCacheMap中去
+  private TimerTask getCacheUpdateTask() {
+        return new TimerTask() {
+            @Override
+            public void run() {
+                logger.debug("Updating the client cache from response cache");
+                for (Key key : readOnlyCacheMap.keySet()) {
+                    if (logger.isDebugEnabled()) {
+                        Object[] args = {key.getEntityType(), key.getName(), key.getVersion(), key.getType()};
+                        logger.debug("Updating the client cache from response cache for key : {} {} {} {}", args);
+                    }
+                    try {
+                        CurrentRequestVersion.set(key.getVersion());
+                        //对readOnlyCacheMap和readWriteCacheMap中的数据进行一个比对
+                        Value cacheValue = readWriteCacheMap.get(key);
+                        Value currentCacheValue = readOnlyCacheMap.get(key);
+                        //如果两块数据是不一致的，那么就将readWriteCacheMap中的数据放到readOnlyCacheMap中来
+                        if (cacheValue != currentCacheValue) {
+                            readOnlyCacheMap.put(key, cacheValue);
+                        }
+                    } catch (Throwable th) {
+                        logger.error("Error while updating the client cache from response cache", th);
+                    }
+                }
+            }
+        };
+    }
+ }
 ```
 
 流程图：https://www.processon.com/view/link/60e3045d1e08535988941b8f
