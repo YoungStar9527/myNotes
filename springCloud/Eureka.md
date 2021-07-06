@@ -2875,6 +2875,7 @@ public class DiscoveryClient implements EurekaClient {
                     //抓取到的delta的注册表，就会跟本地的注册表进行合并，完成服务实例的增删改
                     updateDelta(delta);
                     //对更新完合并完以后的注册表，会计算一个hash值；delta，带了一个eureka server端的全量注册表的hash值
+                    //delta.getAppsHashCode()就是eureka server端返回的hash值
                     reconcileHashCode = getReconcileHashCode(applications);
                 } finally {
                     //解锁
@@ -2885,6 +2886,7 @@ public class DiscoveryClient implements EurekaClient {
             }
             // There is a diff in number of instances for some reason
     		//此时会将eureka client端的合并完(增量的和本地的合并)的注册表的hash值，跟eureka server端的全量注册表的hash值进行一个比对
+    		//delta.getAppsHashCode()就是eureka server端返回的hash值,reconcileHashCode为本地生成的
             if (!reconcileHashCode.equals(delta.getAppsHashCode()) || clientConfig.shouldLogDeltaDiff()) {
                 //如果说不一样的话，说明本地注册表跟server端不一样了，此时就会重新从eureka server拉取全量的注册表到本地来更新到缓存里去
                 reconcileAndLogDifference(delta, reconcileHashCode);  // this makes a remoteCall
@@ -3139,17 +3141,17 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
 
 （3）这块会走EurekaHttpClient的getDelta()方法和接口，http://localhost:8080/v2/apps/delta，get请求
 
-（4）说实话，我(石杉)在这里都看的出来，写eureka client和eureka server的哥儿们，估计就不是一个人，这家伙，编码的风格，不太像，包括对方法的命名，eureka core的ApplicationsResource的getContainerDiffretional。
+​	**PS:说实话，我(石杉)在这里都看的出来，写eureka client和eureka server的哥儿们，估计就不是一个人，这家伙，编码的风格，不太像，包括对方法的命名，eureka core的ApplicationsResource的getContainerDiffretional(eureka server要厉害)**
 
-（5）在eureka server端，会走多级缓存的机制，缓存的Key，ALL_APPS_DELTA，唯一的区别在哪儿呢？就是在那个readWriteCacheMap的从注册表获取数据那里是不一样的，registry.getApplicationDeltasFromMultipleRegions()获取增量的注册表，就是从上一次拉取注册表之后，有变化的注册表
+（4）在eureka server端，会走多级缓存的机制，缓存的Key，ALL_APPS_DELTA，唯一的区别在哪儿呢？就是在那个readWriteCacheMap的从注册表获取数据那里是不一样的，registry.getApplicationDeltasFromMultipleRegions()获取增量的注册表，就是从上一次拉取注册表之后，有变化的注册表
 
-（6）recentlyChangedQueue，代表的含义是，最近有变化的服务实例，比如说，新注册、下线的，或者是别的什么什么，在Registry构造的时候，有一个定时调度的任务，默认是30秒一次，看一下，服务实例的变更记录，是否在队列里停留了超过180s（3分钟），如果超过了3分钟，就会从队列里将这个服务实例变更记录给移除掉。也就是说，这个queue，就保留最近3分钟的服务实例变更记录。delta，增量。
+（5）recentlyChangedQueue，代表的含义是，最近有变化的服务实例，比如说，新注册、下线的，或者是别的什么什么，在Registry构造的时候，有一个定时调度的任务，默认是30秒一次，看一下，服务实例的变更记录，是否在队列里停留了超过180s（3分钟），如果超过了3分钟，就会从队列里将这个服务实例变更记录给移除掉。也就是说，这个queue，就保留最近3分钟的服务实例变更记录。delta，增量。
 
-（7）eureka client每次30秒，去抓取注册表的时候，就会返回最近3分钟内发生过变化的服务实例
+（6）eureka client每次30秒，去抓取注册表的时候，就会返回最近3分钟内发生过变化的服务实例
 
-（8）抓取到的delta的注册表，就会跟本地的注册表进行合并，完成服务实例的增删改
+（7）抓取到的delta的注册表，就会跟本地的注册表进行合并，完成服务实例的增删改
 
-（9）**对更新完合并完以后的注册表，会计算一个hash值；delta，带了一个eureka server端的全量注册表的hash值；此时会将eureka client端的合并完的注册表的hash值，跟eureka server端的全量注册表的hash值进行一个比对；如果说不一样的话，说明本地注册表跟server端不一样了，此时就会重新从eureka server拉取全量的注册表到本地来更新到缓存里去**
+（8）**对更新完合并完以后的注册表，会计算一个hash值；delta，带了一个eureka server端的全量注册表的hash值；此时会将eureka client端的合并完的注册表的hash值，跟eureka server端的全量注册表的hash值进行一个比对；如果说不一样的话，说明本地注册表跟server端不一样了，此时就会重新从eureka server拉取全量的注册表到本地来更新到缓存里去**
 
 **eureka server这块，学到两个闪光点：**
 
