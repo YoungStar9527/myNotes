@@ -2029,6 +2029,8 @@ public abstract class AbstractJersey2EurekaHttpClient implements EurekaHttpClien
 }
 ```
 
+**PS:在AbstractJersey2EurekaHttpClient 中Builder resourceBuilder,resourceBuilder最后拼接的一个方法get/post来查看是对应什么类型的请求**
+
 ## 4.2 总结
 
 eureka client的核心机制：
@@ -2440,6 +2442,7 @@ public class ApplicationsResource {
         }
 
         Key cacheKey = new Key(Key.EntityType.Application,
+                //ALL_APPS为全量抓取的key               
                 ResponseCacheImpl.ALL_APPS,
                 keyType, CurrentRequestVersion.get(), EurekaAccept.fromString(eurekaAccept), regions
         );
@@ -2771,4 +2774,390 @@ public class ResponseCacheImpl implements ResponseCache {
 ```
 
 流程图：https://www.processon.com/view/link/60e3045d1e08535988941b8f
+
+## 6.4 eureka client每隔30秒增量抓取注册表的源码剖析（一致性hash比对机制）
+
+### 6.4.1 流程
+
+​	eureka client启动的时候，会去抓取一次全量的注册表，整个这套机制，我们都已经在源码看的比较清晰了，启动的时候，同时会启动一个定时调度的线程，每隔30秒，会发送一次请求到eureka server，抓取增量的注册表
+
+​	什么叫做增量的注册表呢？就是说跟上一次抓取的注册表相比，有变化的部分，给抓取过来就可以了，不需要每次都抓取全量的注册表
+
+ 
+
+```java
+@Singleton
+public class DiscoveryClient implements EurekaClient {
+
+    @Inject
+    DiscoveryClient(ApplicationInfoManager applicationInfoManager, EurekaClientConfig config, AbstractDiscoveryClientOptionalArgs args,
+                    Provider<BackupRegistry> backupRegistryProvider) 
+        ......................
+        //启动的时候，同时会启动定时调度的线程
+        initScheduledTasks();
+        ...............
+   private void initScheduledTasks()
+       if (clientConfig.shouldFetchRegistry()) {
+            // registry cache refresh timer
+           //getRegistryFetchIntervalSeconds默认30s
+            int registryFetchIntervalSeconds = clientConfig.getRegistryFetchIntervalSeconds();
+            int expBackOffBound = clientConfig.getCacheRefreshExecutorExponentialBackOffBound();
+           //启动的时候，同时会启动一个定时调度的线程，每隔30秒，会发送一次请求到eureka server，抓取增量的注册表
+            scheduler.schedule(
+                    new TimedSupervisorTask(
+                            "cacheRefresh",
+                            scheduler,
+                            cacheRefreshExecutor,
+                            registryFetchIntervalSeconds,
+                            TimeUnit.SECONDS,
+                            expBackOffBound,
+                            new CacheRefreshThread()
+                    ),
+                    registryFetchIntervalSeconds, TimeUnit.SECONDS);
+        }
+            .........................
+      //为DiscoveryClient的内部类      
+      class CacheRefreshThread implements Runnable {
+        public void run() {
+            //刷新注册表
+            refreshRegistry();
+        }
+    }
+    
+    //刷新注册表
+    @VisibleForTesting
+    void refreshRegistry()
+        ...........................
+         boolean remoteRegionsModified = false;
+        ...........................
+        boolean success = fetchRegistry(remoteRegionsModified);
+        ...........................
+    
+    //抓取注册表
+    private boolean fetchRegistry(boolean forceFullRegistryFetch)
+    .........................
+            //这里的if中的条件都是false,非第一次的情况
+            //因为本地已经有了缓存的Applications
+            if (clientConfig.shouldDisableDelta()
+                    || (!Strings.isNullOrEmpty(clientConfig.getRegistryRefreshSingleVipAddress()))
+                    || forceFullRegistryFetch //这里是false
+                    || (applications == null)
+                    || (applications.getRegisteredApplications().size() == 0)
+                    || (applications.getVersion() == -1)) //Client application does not have latest library supporting delta
+            {
+               ............................................
+            } else {
+                //因为本地已经有了缓存的Applications，所以再次抓取注册表的时候，走的是增量抓取的策略
+                getAndUpdateDelta(applications);
+            }
+    .......................
+    private void getAndUpdateDelta(Applications applications) throws Throwable
+        ...........................
+        //这块会走EurekaHttpClient的getDelta()方法和接口，http://localhost:8080/v2/apps/delta，get请求
+        //类似这种eureka client请求，都是在AbstractJersey2EurekaHttpClient中找对应的方法
+        EurekaHttpResponse<Applications> httpResponse = eurekaTransport.queryClient.getDelta(remoteRegionsRef.get());
+     	if (httpResponse.getStatusCode() == Status.OK.getStatusCode()) {
+            delta = httpResponse.getEntity();
+        }
+        if (delta == null) {
+            logger.warn("The server does not allow the delta revision to be applied because it is not safe. "
+                    + "Hence got the full registry.");
+		   //如果是null的话就会拿去全量的注册表
+            getAndStoreFullRegistry();
+        }} else if (fetchRegistryGeneration.compareAndSet(currentUpdateGeneration, currentUpdateGeneration + 1)) {
+    		//拿到了增量注册表
+            logger.debug("Got delta update with apps hashcode {}", delta.getAppsHashCode());
+            String reconcileHashCode = "";
+    		//尝试加锁，获取到锁才进行更新增量注册表
+            if (fetchRegistryUpdateLock.tryLock()) {
+                try {
+                    //更新增量注册表
+                    //抓取到的delta的注册表，就会跟本地的注册表进行合并，完成服务实例的增删改
+                    updateDelta(delta);
+                    //对更新完合并完以后的注册表，会计算一个hash值；delta，带了一个eureka server端的全量注册表的hash值
+                    reconcileHashCode = getReconcileHashCode(applications);
+                } finally {
+                    //解锁
+                    fetchRegistryUpdateLock.unlock();
+                }
+            } else {
+                logger.warn("Cannot acquire update lock, aborting getAndUpdateDelta");
+            }
+            // There is a diff in number of instances for some reason
+    		//此时会将eureka client端的合并完(增量的和本地的合并)的注册表的hash值，跟eureka server端的全量注册表的hash值进行一个比对
+            if (!reconcileHashCode.equals(delta.getAppsHashCode()) || clientConfig.shouldLogDeltaDiff()) {
+                //如果说不一样的话，说明本地注册表跟server端不一样了，此时就会重新从eureka server拉取全量的注册表到本地来更新到缓存里去
+                reconcileAndLogDifference(delta, reconcileHashCode);  // this makes a remoteCall
+            }
+        }
+  ...........................
+      
+   //抓取到的delta的注册表，就会跟本地的注册表进行合并，完成服务实例的增删改         
+    private void updateDelta(Applications delta) {
+        int deltaCount = 0;
+        for (Application app : delta.getRegisteredApplications()) {
+            for (InstanceInfo instance : app.getInstances()) {
+                //获取本地注册表
+                Applications applications = getApplications();
+                String instanceRegion = instanceRegionChecker.getInstanceRegion(instance);
+                if (!instanceRegionChecker.isLocalRegion(instanceRegion)) {
+                    Applications remoteApps = remoteRegionVsApps.get(instanceRegion);
+                    if (null == remoteApps) {
+                        remoteApps = new Applications();
+                        remoteRegionVsApps.put(instanceRegion, remoteApps);
+                    }
+                    applications = remoteApps;
+                }
+
+                ++deltaCount;
+                //增
+                if (ActionType.ADDED.equals(instance.getActionType())) {
+                    Application existingApp = applications.getRegisteredApplications(instance.getAppName());
+                    if (existingApp == null) {
+                        applications.addApplication(app);
+                    }
+                    logger.debug("Added instance {} to the existing apps in region {}", instance.getId(), instanceRegion);
+                    applications.getRegisteredApplications(instance.getAppName()).addInstance(instance);
+                //改    
+                } else if (ActionType.MODIFIED.equals(instance.getActionType())) {
+                    Application existingApp = applications.getRegisteredApplications(instance.getAppName());
+                    if (existingApp == null) {
+                        applications.addApplication(app);
+                    }
+                    logger.debug("Modified instance {} to the existing apps ", instance.getId());
+
+                    applications.getRegisteredApplications(instance.getAppName()).addInstance(instance);
+				//删
+                } else if (ActionType.DELETED.equals(instance.getActionType())) {
+                    Application existingApp = applications.getRegisteredApplications(instance.getAppName());
+                    if (existingApp == null) {
+                        applications.addApplication(app);
+                    }
+                    logger.debug("Deleted instance {} to the existing apps ", instance.getId());
+                    applications.getRegisteredApplications(instance.getAppName()).removeInstance(instance);
+                }
+            }
+        }
+        logger.debug("The total number of instances fetched by the delta processor : {}", deltaCount);
+
+        getApplications().setVersion(delta.getVersion());
+        getApplications().shuffleInstances(clientConfig.shouldFilterOnlyUpInstances());
+		//会跟本地的注册表进行合并
+        for (Applications applications : remoteRegionVsApps.values()) {
+            applications.setVersion(delta.getVersion());
+            applications.shuffleInstances(clientConfig.shouldFilterOnlyUpInstances());
+        }
+    }      
+}
+```
+
+**PS:eureka client相关config默认配置见 DefaultEurekaClientConfig类**
+
+**PS:AbstractJersey2EurekaHttpClient对应的apps相关方法都是在ApplicationsResource中的，对应eureka相关接口也都是在eureka-core的com.netflix.eureka.resources目录中(包括ApplicationsResource)**
+
+
+
+```java
+public abstract class AbstractJersey2EurekaHttpClient implements EurekaHttpClient {
+	@Override
+    public EurekaHttpResponse<Applications> getDelta(String... regions) {
+        return getApplicationsInternal("apps/delta", regions);
+    }
+ }
+
+@Path("/{version}/apps")
+@Produces({"application/xml", "application/json"})
+public class ApplicationsResource {
+	@Path("delta")
+    @GET
+    public Response getContainerDifferential(
+            @PathParam("version") String version,
+            @HeaderParam(HEADER_ACCEPT) String acceptHeader,
+            @HeaderParam(HEADER_ACCEPT_ENCODING) String acceptEncoding,
+            @HeaderParam(EurekaAccept.HTTP_X_EUREKA_ACCEPT) String eurekaAccept,
+            @Context UriInfo uriInfo, @Nullable @QueryParam("regions") String regionsStr) 
+        .....................
+        Key cacheKey = new Key(Key.EntityType.Application,
+               //ALL_APPS_DELTA为增量抓取的key                
+                ResponseCacheImpl.ALL_APPS_DELTA,
+                keyType, CurrentRequestVersion.get(), EurekaAccept.fromString(eurekaAccept), regions
+        );
+        .....................
+        //和全量抓取调用方法是一样的，获取多级缓存中注册表的数据
+        //区别就是ALL_APPS为全量抓取的key，ALL_APPS_DELTA为增量抓取的key，key不同
+         return Response.ok(responseCache.get(cacheKey))
+                    .build();
+}
+
+
+            
+```
+
+​	在eureka server端，会走多级缓存的机制，缓存的Key，ALL_APPS_DELTA，唯一的区别在哪儿呢？就是在那个readWriteCacheMap的从注册表获取数据那里是不一样的，registry.getApplicationDeltasFromMultipleRegions()获取增量的注册表，就是从上一次拉取注册表之后，有变化的注册表
+
+```java
+public class ResponseCacheImpl implements ResponseCache {
+	ResponseCacheImpl(EurekaServerConfig serverConfig, ServerCodecs serverCodecs, AbstractInstanceRegistry registry) 
+	......................
+     //就是在那个readWriteCacheMap的从注册表获取数据那里是不一样的
+	 this.readWriteCacheMap =
+                CacheBuilder.newBuilder().initialCapacity(1000)
+                        .expireAfterWrite(serverConfig.getResponseCacheAutoExpirationInSeconds(), TimeUnit.SECONDS)
+                        .removalListener(new RemovalListener<Key, Value>() {
+                            @Override
+                            public void onRemoval(RemovalNotification<Key, Value> notification) {
+                                Key removedKey = notification.getKey();
+                                if (removedKey.hasRegions()) {
+                                    Key cloneWithNoRegions = removedKey.cloneWithoutRegions();
+                                    regionSpecificKeys.remove(cloneWithNoRegions, removedKey);
+                                }
+                            }
+                        })
+                        .build(new CacheLoader<Key, Value>() {
+                            @Override
+                            public Value load(Key key) throws Exception {
+                                if (key.hasRegions()) {
+                                    Key cloneWithNoRegions = key.cloneWithoutRegions();
+                                    regionSpecificKeys.put(cloneWithNoRegions, key);
+                                }
+                                //generatePayload获取数据的区别
+                                Value value = generatePayload(key);
+                                return value;
+                            }
+                        });
+	......................
+	 //generatePayload获取数据的区别
+	private Value generatePayload(Key key) 
+	...........................
+        if (ALL_APPS.equals(key.getName())) {
+            if (isRemoteRegionRequested) {
+                tracer = serializeAllAppsWithRemoteRegionTimer.start();
+                payload = getPayLoad(key, registry.getApplicationsFromMultipleRegions(key.getRegions()));
+            } else {
+                tracer = serializeAllAppsTimer.start();
+                payload = getPayLoad(key, registry.getApplications());
+            }
+        } else if (ALL_APPS_DELTA.equals(key.getName())) {
+            if (isRemoteRegionRequested) {
+                tracer = serializeDeltaAppsWithRemoteRegionTimer.start();
+                versionDeltaWithRegions.incrementAndGet();
+                versionDeltaWithRegionsLegacy.incrementAndGet();
+                payload = getPayLoad(key,
+                                     registry.getApplicationDeltasFromMultipleRegions(key.getRegions()));
+            } else {
+                tracer = serializeDeltaAppsTimer.start();
+                versionDelta.incrementAndGet();
+                versionDeltaLegacy.incrementAndGet();
+                //registry.getApplicationDeltasFromMultipleRegions()获取增量的注册表，就是从上一次拉取注册表之后，有变化的注册表
+                payload = getPayLoad(key, registry.getApplicationDeltas());
+            }
+        }
+	..........................
+}
+```
+
+eureka client每次30秒，去抓取注册表的时候，就会返回最近3分钟内发生过变化的服务实例
+
+```java
+public abstract class AbstractInstanceRegistry implements InstanceRegistry {
+	//recentlyChangedQueue，代表的含义是，最近有变化的服务实例，比如说，新注册、下线的，或者是别的什么什么
+    private ConcurrentLinkedQueue<RecentlyChangedItem> recentlyChangedQueue = new ConcurrentLinkedQueue<RecentlyChangedItem>();
+    
+    //在Registry构造的时候，有一个定时调度的任务，默认是30秒一次
+    protected AbstractInstanceRegistry(EurekaServerConfig serverConfig, EurekaClientConfig clientConfig, ServerCodecs serverCodecs) {
+        this.serverConfig = serverConfig;
+        this.clientConfig = clientConfig;
+        this.serverCodecs = serverCodecs;
+        this.recentCanceledQueue = new CircularQueue<Pair<Long, String>>(1000);
+        this.recentRegisteredQueue = new CircularQueue<Pair<Long, String>>(1000);
+
+        this.renewsLastMin = new MeasuredRate(1000 * 60 * 1);
+
+        //在Registry构造的时候，有一个定时调度的任务，默认是30秒一次
+        //getDeltaRetentionTask
+        this.deltaRetentionTimer.schedule(getDeltaRetentionTask(),
+                serverConfig.getDeltaRetentionTimerIntervalInMs(),
+                serverConfig.getDeltaRetentionTimerIntervalInMs());
+    }
+    
+    // //registry.getApplicationDeltasFromMultipleRegions()获取增量的注册表，就是从上一次拉取注册表之后，有变化的注册表
+	public Applications getApplicationDeltasFromMultipleRegions(String[] remoteRegions)    
+    ..................................
+         write.lock();
+    		//recentlyChangedQueue，代表的含义是，最近有变化的服务实例，比如说，新注册、下线的，或者是别的什么什么
+    		//最近3分钟内有变化的服务实例的注册表，增量注册表
+            Iterator<RecentlyChangedItem> iter = this.recentlyChangedQueue.iterator();
+            logger.debug("The number of elements in the delta queue is :" + this.recentlyChangedQueue.size());
+            while (iter.hasNext()) {
+                Lease<InstanceInfo> lease = iter.next().getLeaseInfo();
+                InstanceInfo instanceInfo = lease.getHolder();
+                Object[] args = {instanceInfo.getId(),
+                        instanceInfo.getStatus().name(),
+                        instanceInfo.getActionType().name()};
+                logger.debug("The instance id %s is found with status %s and actiontype %s", args);
+                Application app = applicationInstancesMap.get(instanceInfo.getAppName());
+                if (app == null) {
+                    app = new Application(instanceInfo.getAppName());
+                    applicationInstancesMap.put(instanceInfo.getAppName(), app);
+                    apps.addApplication(app);
+                }
+                app.addInstance(decorateInstanceInfo(lease));
+            }
+    ...................................
+        
+   //在Registry构造的时候，有一个定时调度的任务，默认是30秒一次     
+   private TimerTask getDeltaRetentionTask() {
+        return new TimerTask() {
+
+            @Override
+            public void run() {
+                Iterator<RecentlyChangedItem> it = recentlyChangedQueue.iterator();
+                while (it.hasNext()) {
+                    //看一下，服务实例的变更记录，是否在队列里停留了超过180s（3分钟），如果超过了3分钟，就会从队列里将这个服务实例变更记录给移除掉。也就是说，这个queue，就保留最近3分钟的服务实例变更记录。delta，增量
+                    if (it.next().getLastUpdateTime() <
+                            System.currentTimeMillis() - serverConfig.getRetentionTimeInMSInDeltaQueue()) {
+                        it.remove();
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+        };
+    }    
+        
+}
+```
+
+**PS:eureka server相关config配置见DefaultEurekaServerConfig类**
+
+### 6.4.2 总结
+
+（1）定时任务，每隔30秒来一次
+
+（2）因为本地已经有了缓存的Applications，所以再次抓取注册表的时候，走的是增量抓取的策略
+
+（3）这块会走EurekaHttpClient的getDelta()方法和接口，http://localhost:8080/v2/apps/delta，get请求
+
+（4）说实话，我(石杉)在这里都看的出来，写eureka client和eureka server的哥儿们，估计就不是一个人，这家伙，编码的风格，不太像，包括对方法的命名，eureka core的ApplicationsResource的getContainerDiffretional。
+
+（5）在eureka server端，会走多级缓存的机制，缓存的Key，ALL_APPS_DELTA，唯一的区别在哪儿呢？就是在那个readWriteCacheMap的从注册表获取数据那里是不一样的，registry.getApplicationDeltasFromMultipleRegions()获取增量的注册表，就是从上一次拉取注册表之后，有变化的注册表
+
+（6）recentlyChangedQueue，代表的含义是，最近有变化的服务实例，比如说，新注册、下线的，或者是别的什么什么，在Registry构造的时候，有一个定时调度的任务，默认是30秒一次，看一下，服务实例的变更记录，是否在队列里停留了超过180s（3分钟），如果超过了3分钟，就会从队列里将这个服务实例变更记录给移除掉。也就是说，这个queue，就保留最近3分钟的服务实例变更记录。delta，增量。
+
+（7）eureka client每次30秒，去抓取注册表的时候，就会返回最近3分钟内发生过变化的服务实例
+
+（8）抓取到的delta的注册表，就会跟本地的注册表进行合并，完成服务实例的增删改
+
+（9）**对更新完合并完以后的注册表，会计算一个hash值；delta，带了一个eureka server端的全量注册表的hash值；此时会将eureka client端的合并完的注册表的hash值，跟eureka server端的全量注册表的hash值进行一个比对；如果说不一样的话，说明本地注册表跟server端不一样了，此时就会重新从eureka server拉取全量的注册表到本地来更新到缓存里去**
+
+**eureka server这块，学到两个闪光点：**
+
+（1）增量数据的设计思路：如果你要保存一份增量的最新变更数据，可以基于LinkedQuueue，将最新变更的数据放入这个queue中，然后后台来一个定时任务，每隔一定时间，将在队列中存放超过一定时间的数据拿掉，保持这个队列中就是最近几分钟内的变更的增量数据
+
+（2）数据同步的hash值比对机制：如果你要在两个地方，一个分布式系统里，进行数据的同步，可以采用Hash值的思想，从一个地方的数据计算一个hash值，到另外一个地方，计算一个hash值，保证两个hash值是一样的，确保这个数据传输过程中，没有出什么问题
+
+###  6.4.3 流程图
+
+流程图https://www.processon.com/view/link/60e468be0791294d9b4e9256
 
