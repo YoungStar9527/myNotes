@@ -3163,3 +3163,373 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
 
 流程图https://www.processon.com/view/link/60e468be0791294d9b4e9256
 
+# 7 服务实例
+
+## 7.1 服务实例与注册中心之间的心跳机制（服务续约）
+
+### 7.1.1 流程
+
+​	eureka server启动，eureka client启动，服务注册，注册中心控制台，服务发现
+
+​	心跳，eureka client每隔一定的时间，会给eureka server发送心跳，保持心跳，让eureka server知道自己还活着
+
+​	lease renewal，续约，心跳
+
+```java
+@Singleton
+public class DiscoveryClient implements EurekaClient {
+    @Inject
+    DiscoveryClient(ApplicationInfoManager applicationInfoManager, EurekaClientConfig config, AbstractDiscoveryClientOptionalArgs args,
+                    Provider<BackupRegistry> backupRegistryProvider)
+    .................................
+    initScheduledTasks();
+    .................................
+    private void initScheduledTasks()
+    .................................
+        scheduler.schedule(
+        	new TimedSupervisorTask(
+            "heartbeat",
+            scheduler,
+            heartbeatExecutor,
+            renewalIntervalInSecs,
+            TimeUnit.SECONDS,
+            expBackOffBound,
+            new HeartbeatThread()
+        ),
+        //在这里可以看到，默认是每隔30秒去发送一次心跳，每隔30秒执行一次HeartbeatTHread线程的逻辑，发送心跳(renewalIntervalInSecs对应配置默认30s)
+        renewalIntervalInSecs, TimeUnit.SECONDS);        
+    .................................
+    //HeartbeatThread为DiscoveryClient的内部类    
+    private class HeartbeatThread implements Runnable {
+
+        public void run() {
+            if (renew()) {
+                lastSuccessfulHeartbeatTimestamp = System.currentTimeMillis();
+            }
+        }
+    }
+    
+    boolean renew()
+.................
+        //这边的话就是去发送这个心跳，走的是EurekaHttpClient的sendHeartbeat()方法，http://localhost:8080/v2/apps/ServiceA/i-000000-1，走的是put请求
+		httpResponse = eurekaTransport.registrationClient.sendHeartBeat(instanceInfo.getAppName(), instanceInfo.getId(), instanceInfo, null);
+    .................
+        
+}
+
+//对应EurekaHttpClient的sendHeartbeat()
+public abstract class AbstractJersey2EurekaHttpClient implements EurekaHttpClient {
+        @Override
+    public EurekaHttpResponse<InstanceInfo> sendHeartBeat(String appName, String id, InstanceInfo info, InstanceStatus overriddenStatus)
+........................
+        //走的是put请求
+        response = requestBuilder.put(Entity.entity("{}", MediaType.APPLICATION_JSON_TYPE)); 
+    ........................
+
+}
+```
+
+通过注册表的renew()方法，进去完成服务续约，实际进入AbstractInstanceRegistry的renew()方法
+
+```java
+@Produces({"application/xml", "application/json"})
+public class InstanceResource {
+        @PUT
+    public Response renewLease(
+            @HeaderParam(PeerEurekaNode.HEADER_REPLICATION) String isReplication,
+            @QueryParam("overriddenstatus") String overriddenStatus,
+            @QueryParam("status") String status,
+            @QueryParam("lastDirtyTimestamp") String lastDirtyTimestamp) 
+....................
+        boolean isSuccess = registry.renew(app.getName(), id, isFromReplicaNode);
+....................
+}
+
+```
+
+​	从注册表的map中，根据服务名和实例id，获取一个Lease<InstanceInfo>，对服务续约的代码进行了调整，让代码可读性更好，更加的优雅。实际的服务续约的逻辑，其实就是在Lease对象中，更新一下lastUpdateTimestamp这个时间戳，每次续约，就更新一下这个时间戳就ok了。
+
+```java
+@Singleton
+public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry implements PeerAwareInstanceRegistry {
+    public boolean renew(final String appName, final String id, final boolean isReplication) {
+        if (super.renew(appName, id, isReplication)) {
+            replicateToPeers(Action.Heartbeat, appName, id, null, null, isReplication);
+            return true;
+        }
+        return false;
+    }
+}
+
+//源代码写的水平较差，renew及checkInstanceStatus为改造后的优雅代码，大概改造就是减少else及抽取状态判断逻辑为单独一个方法
+    public boolean renew(String appName, String id, boolean isReplication) {
+        RENEW.increment(isReplication);
+        Map<String, Lease<InstanceInfo>> gMap = registry.get(appName);
+        Lease<InstanceInfo> leaseToRenew = null;
+        //从注册表的map中，根据服务名和实例id，获取一个Lease<InstanceInfo>
+        if (gMap != null) {
+            leaseToRenew = gMap.get(id);
+        }
+        if (leaseToRenew == null) {
+            RENEW_NOT_FOUND.increment(isReplication);
+            logger.warn("DS: Registry: lease doesn't exist, registering resource: {} - {}", appName, id);
+            return false;
+        }
+        InstanceInfo instanceInfo = leaseToRenew.getHolder();
+        if (instanceInfo == null) {
+            logger.warn("...................", appName, id);
+            return true;
+        }
+        if(!checkInstanceStatus(instanceInfo,leaseToRenew,isReplication)){
+            return false;
+        }
+        renewsLastMin.increment();
+        //其实就是在Lease对象中，更新一下lastUpdateTimestamp这个时间戳，每次续约，就更新一下这个时间戳就ok了
+        leaseToRenew.renew();
+        return true;
+    }
+    private boolean checkInstanceStatus(InstanceInfo instanceInfo,Lease<InstanceInfo> leaseToRenew, boolean isReplication){
+        
+        // touchASGCache(instanceInfo.getASGName());
+        InstanceStatus overriddenInstanceStatus = this.getOverriddenInstanceStatus(
+                instanceInfo, leaseToRenew, isReplication);
+        if (overriddenInstanceStatus == InstanceStatus.UNKNOWN) {
+            logger.info("Instance status UNKNOWN possibly due to deleted override for instance {}"
+                    + "; re-register required", instanceInfo.getId());
+            RENEW_NOT_FOUND.increment(isReplication);
+            return false;
+        }
+        if (!instanceInfo.getStatus().equals(overriddenInstanceStatus)) {
+            Object[] args = {
+                    instanceInfo.getStatus().name(),
+                    instanceInfo.getOverriddenStatus().name(),
+                    instanceInfo.getId()
+            };
+            logger.info(
+                    "The instance status {} is different from overridden instance status {} for instance {}. "
+                            + "Hence setting the status to overridden status", args);
+            instanceInfo.setStatusWithoutDirty(overriddenInstanceStatus);
+        }
+        return true;
+    }
+}
+
+public class Lease<T> {
+    
+    private volatile long lastUpdateTimestamp;
+    
+    //服务续约(心跳)90s,
+    public void renew() {
+        //duration默认90s
+        lastUpdateTimestamp = System.currentTimeMillis() + duration;
+    }
+}
+```
+
+### 7.1.2 总结
+
+（1）DiscoveryClient初始化的时候，会去调度一堆定时任务，其中有一个就是HeartbeatThread，心跳线程
+
+（2）在这里可以看到，默认是每隔30秒去发送一次心跳，每隔30秒执行一次HeartbeatTHread线程的逻辑，发送心跳
+
+（3）这边的话就是去发送这个心跳，走的是EurekaHttpClient的sendHeartbeat()方法，http://localhost:8080/v2/apps/ServiceA/i-000000-1，走的是put请求
+
+（4）负责接服务实例的心跳相关的这些操作的，是ApplicationsResource，服务相关的controller。jersey的mvc框架，国内很少有用jersey，spring web mvc大家都看得懂。找到ApplicationResource，再次找到InstanceResource，通过PUT请求，可以找到renewLease方法。
+
+（5）通过注册表的renew()方法，进去完成服务续约，实际进入AbstractInstanceRegistry的renew()方法
+
+（6）从注册表的map中，根据服务名和实例id，获取一个Lease<InstanceInfo>，对服务续约的代码进行了调整，让代码可读性更好，更加的优雅。实际的服务续约的逻辑，其实就是在Lease对象中，更新一下lastUpdateTimestamp这个时间戳，每次续约，就更新一下这个时间戳就ok了。
+
+**PS:分布式系统里面，心跳机制，是很重要的，可以让一个中枢控制的服务，监控所有其他的工作服务是否还活着，这个所以是一个心跳机制，就是每次更新心跳，就更新最近的一次时间戳就可以了**
+
+## 7.2 停止服务实例时的服务下线以及实例摘除机制源码剖析
+
+### 7.2.1 流程
+
+​	本来现在就是一个注册中心，还有很多个服务，在线上跑着，各个服务都会时不时来一个心跳，一切都很好，但是现在的话是这样子的。如果某个服务现在要停机，或者是重启，首先就会关闭，此时会发生什么样的事情呢？
+
+​	eureka client关闭的话，服务停止，需要你自己去调用EurekaClient的shutdown()，将服务实例停止，所以说呢，我们重点就是从EurekaClient的shutdown()方法开始入手来看。
+
+​	比如说你如果eureka client也是跟着一个web容器来启动的，ContextListener，里面有一个contextDestroyed()，在这个方法里，你就调用eureka client的shutdown()方法就可以了。
+
+```java
+@Singleton
+public class DiscoveryClient implements EurekaClient {
+
+    //DiscoveryClient中的shutdown()方法，需要你自己调用这个方法
+    @PreDestroy
+    @Override
+    public synchronized void shutdown() {
+        if (isShutdown.compareAndSet(false, true)) {
+            logger.info("Shutting down DiscoveryClient ...");
+
+            //去除监听
+            if (statusChangeListener != null && applicationInfoManager != null) {
+                applicationInfoManager.unregisterStatusChangeListener(statusChangeListener.getId());
+            }
+
+            //就是将线程池都给shutdown掉了，释放资源，停止运行的线程
+            cancelScheduledTasks();
+
+            // If APPINFO was registered
+            if (applicationInfoManager != null && clientConfig.shouldRegisterWithEureka()) {
+                //将服务实例的状态设置为 DOWN
+                applicationInfoManager.setInstanceStatus(InstanceStatus.DOWN);
+                //调用unregister()方法取消注册
+                unregister();
+            }
+
+            //关闭网络通信组件
+            if (eurekaTransport != null) {
+                eurekaTransport.shutdown();
+            }
+
+            //将监听器都给关了
+            heartbeatStalenessMonitor.shutdown();
+            registryStalenessMonitor.shutdown();
+
+            logger.info("Completed shut down of DiscoveryClient");
+        }
+    }
+    
+    //iscoveryClient中的unregister()方法中，取消注册，调用EurekaHttpClient的cancel()方法，http://localhost:8080/v2/apps/ServiceA/i-00000-1，delete请求
+    void unregister() 
+..............................
+                EurekaHttpResponse<Void> httpResponse = eurekaTransport.registrationClient.cancel(instanceInfo.getAppName(), instanceInfo.getId());
+..............................
+    
+}
+
+public abstract class AbstractJersey2EurekaHttpClient implements EurekaHttpClient {
+    public EurekaHttpResponse<Void> cancel(String appName, String id)
+        //delete请求
+        response = resourceBuilder.delete();
+}
+```
+
+会在eureka core中的InstanceResource中调用注册表的cancelLease()方法
+
+```java
+@Produces({"application/xml", "application/json"})
+public class InstanceResource {
+    @DELETE
+    public Response cancelLease(
+            @HeaderParam(PeerEurekaNode.HEADER_REPLICATION) String isReplication)
+    boolean isSuccess = registry.cancel(app.getName(), id,
+                "true".equals(isReplication));        
+..............................      
+}
+```
+
+调用父类的canel()方法，interlCancel()方法
+
+```java
+@Singleton
+public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry implements PeerAwareInstanceRegistry {
+    @Override
+    public boolean cancel(final String appName, final String id,
+                          final boolean isReplication) {
+        //调用父类的canel()方法，interlCancel()方法
+        if (super.cancel(appName, id, isReplication)) {
+            replicateToPeers(Action.Cancel, appName, id, null, null, isReplication);
+            synchronized (lock) {
+                if (this.expectedNumberOfRenewsPerMin > 0) {
+                    // Since the client wants to cancel it, reduce the threshold (1 for 30 seconds, 2 for a minute)
+                    this.expectedNumberOfRenewsPerMin = this.expectedNumberOfRenewsPerMin - 2;
+                    this.numberOfRenewsPerMinThreshold =
+                            (int) (this.expectedNumberOfRenewsPerMin * serverConfig.getRenewalPercentThreshold());
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+}
+
+public abstract class AbstractInstanceRegistry implements InstanceRegistry {
+    
+    @Override
+    public boolean cancel(String appName, String id, boolean isReplication) {
+        return internalCancel(appName, id, isReplication);
+    }
+    
+    
+    protected boolean internalCancel(String appName, String id, boolean isReplication) {
+        try {
+            read.lock();
+            CANCEL.increment(isReplication);
+            //从自己内存的map数据结构的注册表中将这个服务实例移除
+            Map<String, Lease<InstanceInfo>> gMap = registry.get(appName);
+            Lease<InstanceInfo> leaseToCancel = null;
+            if (gMap != null) {
+                leaseToCancel = gMap.remove(id);
+            }
+            //将服务实例加入最近下线的一个queue中(用于统计或调试)
+            synchronized (recentCanceledQueue) {
+                recentCanceledQueue.add(new Pair<Long, String>(System.currentTimeMillis(), appName + "(" + id + ")"));
+            }
+            InstanceStatus instanceStatus = overriddenInstanceStatusMap.remove(id);
+            if (instanceStatus != null) {
+                logger.debug("Removed instance id {} from the overridden map which has value {}", id, instanceStatus.name());
+            }
+            if (leaseToCancel == null) {
+                CANCEL_NOT_FOUND.increment(isReplication);
+                logger.warn("DS: Registry: cancel failed because Lease is not registered for: {}/{}", appName, id);
+                return false;
+            } else {
+                //调用Lease的cancel()方法
+                leaseToCancel.cancel();
+                InstanceInfo instanceInfo = leaseToCancel.getHolder();
+                String vip = null;
+                String svip = null;
+                if (instanceInfo != null) {
+                    //将服务实例信息扔到最近改变的队列中去了
+                    instanceInfo.setActionType(ActionType.DELETED);
+            		//将服务实例放入最近变化的队列中去，让所有的eureka client下一次拉取增量注册表的时候，可以拉取到这个服务实例下线的这么一个变化
+                    recentlyChangedQueue.add(new RecentlyChangedItem(leaseToCancel));
+                    //设置了服务的lastUpdateTimestamp，最近一次变更的时间戳
+                    instanceInfo.setLastUpdatedTimestamp();
+                    vip = instanceInfo.getVIPAddress();
+                    svip = instanceInfo.getSecureVipAddress();
+                    //服务的注册、下线、故障摘除，都会代表这个服务实例变化了，都会将自己放入最近改变的队列中去
+                    //这个最近改变的队列，只会保留最近3分钟的服务实例
+                    //所以说eureka client拉取增量注册表的时候，其实就是拉取最近3分钟有变化的服务实例的注册表
+                }
+                //过期注册表缓存
+                //服务实例变更过了，必须将之前的缓存都清理掉，从readWriteCacheMap中清理掉
+                invalidateCache(appName, vip, svip);
+                logger.info("Cancelled instance {}/{} (replication={})", appName, id, isReplication);
+                return true;
+            }
+        } finally {
+            read.unlock();
+        }
+    }
+}
+```
+
+### 7.2.2 总结
+
+（1）DiscoveryClient中的shutdown()方法，需要你自己调用这个方法
+
+（2）DiscoveryClient中的unregister()方法中，取消注册，调用EurekaHttpClient的cancel()方法，http://localhost:8080/v2/apps/ServiceA/i-00000-1，delete请求
+
+（3）会在eureka core中的InstanceResource中，调用注册表的cancelLease()方法，调用父类的canel()方法，interlCancel()方法
+
+（4）将服务实例从eureka server的map结构的注册表中移除掉
+
+（5）最最核心的是调用了Lease的cancel()方法，里面保存了一个evictionTimestamp，就是服务实例被清理掉，服务实例下线的时间戳
+
+（6）将服务实例放入最近变化的队列(**recentlyChangedQueue**)中去，让所有的eureka client下一次拉取增量注册表的时候，可以拉取到这个服务实例下线的这么一个变化
+
+（7）服务实例变更过了，必须将之前的缓存都清理掉，从readWriteCacheMap中清理掉
+
+（8）然后我(石杉)之前给大家讲过，定时过期的一个过程，就是有一个定时的任务，每隔30秒，将readWriteCacheMap和readOnlyCacheMap进行一个同步
+
+（9）下次所有的eureka client来拉取增量注册表的时候，都会发现readOnlyCacheMap里没有，会找readWriteCacheMap也会发现没有，然后就会从注册表里抓取增量注册表，此时就会将上面那个recentlyChangedQueue中的记录返回
+
+**服务实例下线机制**
+
+（1）在注册中心，将服务实例从注册表中移除，下线的服务放入recentlyChangedQueue中去
+
+（2）每个服务都会定时拉取增量注册表，此时可以从recentlyChangedQueue中感知到下线的服务实例，然后就可以在自己本地缓存中删除那个下线的服务实例562292680
