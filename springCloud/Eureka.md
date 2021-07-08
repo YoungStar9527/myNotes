@@ -3261,7 +3261,10 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
     }
 }
 
-//源代码写的水平较差，renew及checkInstanceStatus为改造后的优雅代码，大概改造就是减少else及抽取状态判断逻辑为单独一个方法
+
+public abstract class AbstractInstanceRegistry implements InstanceRegistry {
+    
+    //源代码写的水平较差，renew及checkInstanceStatus为改造后的优雅代码，大概改造就是减少else及抽取状态判断逻辑为单独一个方法
     public boolean renew(String appName, String id, boolean isReplication) {
         RENEW.increment(isReplication);
         Map<String, Lease<InstanceInfo>> gMap = registry.get(appName);
@@ -3532,4 +3535,228 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
 
 （1）在注册中心，将服务实例从注册表中移除，下线的服务放入recentlyChangedQueue中去
 
-（2）每个服务都会定时拉取增量注册表，此时可以从recentlyChangedQueue中感知到下线的服务实例，然后就可以在自己本地缓存中删除那个下线的服务实例562292680
+（2）每个服务都会定时拉取增量注册表，此时可以从recentlyChangedQueue中感知到下线的服务实例，然后就可以在自己本地缓存中删除那个下线的服务实例
+
+### 7.2.3 流程图
+
+https://www.processon.com/view/link/60e5c1b1e0b34d548fc11fb7
+
+## 7.3 服务实例的自动故障感知以及服务实例自动摘除机制源码剖析(自动下线)
+
+### 7.3.1 流程
+
+​	如果eureka client要停机，你呢要在代码里自己调用DiscoveryClient的shutdown()方法，就会发送请求到eureka server去下线一个服务实例。很多时候，可能不是说你把某个服务给停机了，而是说服务自己宕机了，就不会调用shutdown()方法，也不会去发送请求下线服务实例。
+
+​	**eureka自己，有一个所谓到自动故障感知机制，以及服务实例摘除的机制**
+
+​	**eureka靠的是心跳，来感知，可能某个服务已经挂掉了，就不会再发送心跳了，如果在一段时间内没有接收到某个服务的心跳，那么就将这个服务实例给摘除，认为这个服务实例已经宕机了**
+
+```java
+public class EurekaBootStrap implements ServletContextListener {
+
+    protected void initEurekaServerContext() throws Exception 
+        ...................
+        PeerAwareInstanceRegistry registry;
+        .......................
+		//自动检查服务实例是否故障宕机的入口
+        registry.openForTraffic(applicationInfoManager, registryCount);
+        .......................
+}
+```
+
+​	你要自己找到这个入口，你该在哪里找呢？你思考一下，如果要启动一个定时检查服务实例有没有宕机的后台线程任务，**eureka server启动初始化的**时候，会去启动那么一个后台线程。
+
+​	**EurekaBootStrap里面找**，检查服务实例有没有宕机的这个东西，最可能跟谁是相关的呢？肯定是注册表啊。。。。服务实例信息都在注册表里，registry。所以就在registry相关的地方来寻找一下
+
+​	PeerAwareInstanceRegistry.openForTraffic()方法里，最后隐藏了一行调用，postInit()。每隔60s会运行一次定时调度的后台线程任务，EvictionTask。
+
+```java
+@Singleton
+public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry implements PeerAwareInstanceRegistry {
+
+    @Override
+    public void openForTraffic(ApplicationInfoManager applicationInfoManager, int count)
+        ...................
+        //服务自动下线逻辑在父类postInit()方法中
+        super.postInit();
+}
+public abstract class AbstractInstanceRegistry implements InstanceRegistry {
+    
+    protected void postInit()
+		.......................
+        //每隔60s(默认)会运行一次定时调度的后台线程任务，EvictionTask
+        evictionTaskRef.set(new EvictionTask());
+        evictionTimer.schedule(evictionTaskRef.get(),
+                serverConfig.getEvictionIntervalTimerInMs(),
+                serverConfig.getEvictionIntervalTimerInMs());
+    
+    //为AbstractInstanceRegistry的内部类
+      class EvictionTask extends TimerTask {
+          @Override
+        public void run() 
+		.......................
+          //获取补偿时间
+          long compensationTimeMs = getCompensationTimeMs();
+          logger.info("Running the evict task with compensationTime {}ms", compensationTimeMs);
+          //自动服务下线的核心方法
+          evict(compensationTimeMs);
+		.......................
+            
+		//获取补偿时间
+        long getCompensationTimeMs() {
+            //先获取当前时间
+            long currNanos = getCurrentTimeNano();
+            //上一次这个EvictionTask被执行的时间，第一次获取是0，将当前时间设置到AtomicLong(lastExecutionNanosRef)中去
+            //然后第二次获取就是上一次的执行时间，上一次调用这个方法的当前时间了
+            long lastNanos = lastExecutionNanosRef.getAndSet(currNanos);
+            if (lastNanos == 0l) {
+                return 0l;
+            }
+            //当前时间-上一次的时间
+            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(currNanos - lastNanos);
+            //用elapsedMs(两次调用的时间间隔)减去60秒（对应配置默认60秒），如果小于0就是0,大于0就直接返回
+            //大于0返回的值就是 两次调用的时间间隔 和 默认配置 的差值(比预期的时间晚了x秒)
+            long compensationTime = elapsedMs - serverConfig.getEvictionIntervalTimerInMs();
+            return compensationTime <= 0l ? 0l : compensationTime;
+        }
+          
+      }
+}
+```
+
+自动服务下线的核心方法
+
+```java
+public abstract class AbstractInstanceRegistry implements InstanceRegistry {
+    
+    //自动服务下线的核心方法
+    //additionalLeaseMs补偿时间
+    public void evict(long additionalLeaseMs) {
+        logger.debug("Running the evict task");
+
+        //是否允许主动删除掉故障的服务实例 ->跟自我保护的机制相关
+        if (!isLeaseExpirationEnabled()) {
+            logger.debug("DS: lease expiration is currently disabled.");
+            return;
+        }
+
+        // We collect first all expired items, to evict them in random order. For large eviction sets,
+        // if we do not that, we might wipe out whole apps before self preservation kicks in. By randomizing it,
+        // the impact should be evenly distributed across all applications.
+        List<Lease<InstanceInfo>> expiredLeases = new ArrayList<>();
+
+        for (Entry<String, Map<String, Lease<InstanceInfo>>> groupEntry : registry.entrySet()) {
+            Map<String, Lease<InstanceInfo>> leaseMap = groupEntry.getValue();
+            if (leaseMap != null) {
+                for (Entry<String, Lease<InstanceInfo>> leaseEntry : leaseMap.entrySet()) {
+                    Lease<InstanceInfo> lease = leaseEntry.getValue();
+                    //对每个服务实例的租约判断一下，如果一个服务实例上一次的心跳时间到现在位置
+                    //超过了90*2=180s(两个duration)，才会认为这个服务实例过期了,故障了
+                    //lease.isExpired 判断服务是否下线的核心方法
+                    if (lease.isExpired(additionalLeaseMs) && lease.getHolder() != null) {
+                        expiredLeases.add(lease);
+                    }
+                }
+            }
+        }
+
+        // To compensate for GC pauses or drifting local time, we need to use current registry size as a base for
+        // triggering self-preservation. Without that we would wipe out full registry.
+        //不能一次性摘除过多的服务实例
+        //假设 现在一共是20个服务实例，现在有6个服务实例不可用了，一次性可以摘除的服务实例没有这么多的，有个比例
+        //假设 registrySize=20
+        //假设 20*0.85=17（比例）
+        int registrySize = (int) getLocalRegistrySize();
+        //假设 evictionLimit = 20-17=3
+        //假设 最多只能摘除3个服务实例
+
+        //下一次就是17个了，17*0.85 ~14,17-14=3，下一次就能把3个服务给摘除了
+        //剩下14个服务实例就对了，因为是有6个服务实例挂了
+        int registrySizeThreshold = (int) (registrySize * serverConfig.getRenewalPercentThreshold());
+        int evictionLimit = registrySize - registrySizeThreshold;
+
+        int toEvict = Math.min(expiredLeases.size(), evictionLimit);
+        if (toEvict > 0) {
+            logger.info("Evicting {} items (expired={}, evictionLimit={})", toEvict, expiredLeases.size(), evictionLimit);
+
+            Random random = new Random(System.currentTimeMillis());
+            //假设 你要摘除的服务实例一共有6个，但是最多只能摘除3个服务实例
+            //下面的代码，会在6个服务实例中，随机选择3个服务实例，来摘除掉
+            for (int i = 0; i < toEvict; i++) {
+                // Pick a random item (Knuth shuffle algorithm)
+                int next = i + random.nextInt(expiredLeases.size() - i);
+                Collections.swap(expiredLeases, i, next);
+                //随机挑选出来的一个
+                Lease<InstanceInfo> lease = expiredLeases.get(i);
+
+                String appName = lease.getHolder().getAppName();
+                String id = lease.getHolder().getId();
+                EXPIRED.increment();
+                logger.warn("DS: Registry: expired lease for {}/{}", appName, id);
+                //对这个随机挑选出来的服务实例，就调用internalCancel方法 摘除
+                internalCancel(appName, id, false);
+            }
+        }
+    }
+}
+```
+
+ 判断服务是否下线的核心方法
+
+**PS:需要等待两个duration(默认90s)，都没有心跳，才会认为这个服务实例挂掉了，才会下线**
+
+```java
+public class Lease<T> {
+
+    //在renew()服务续约/心跳方法中对，lastUpdateTimestamp已经是 当前时间+duration了，在这边判断的时候再+duration一次这个时间
+    //相当于是加了2次duration，是个bug,会导致如果服务没有发送心跳宕机了，会导致服务下线比预期的时间多一个duration(默认90s)，才会自动下线
+    //这个bug eureka并不打算修复
+    public boolean isExpired(long additionalLeaseMs) {
+        //当前时间是否大于, 上一次心跳的时间+duration(默认90s)+additionalLeaseMs(compensationTime补偿时间(两次间隔-配置))
+        //additionalLeaseMs(compensationTime补偿时间(两次间隔-配置))正常来说是0
+        return (evictionTimestamp > 0 || System.currentTimeMillis() > (lastUpdateTimestamp + duration + additionalLeaseMs));
+        //需要等待两个duration(默认90s)，都没有心跳，才会认为这个服务实例挂掉了，才会下线
+        //才会认为你这个服务实例宕机了，下线了
+        //如果你没有看过源码，你可能就会犯错了，去面试，有人问你，多长时间没有心跳，就会认为服务实例挂了，90s
+        //源码层面是有Bug的,90*2=180s，才会服务实例下线
+
+        //其他服务感知到还有
+        //失效多级缓存,30s才能同步，服务30s才会重新抓取增量注册表
+        //一个服务实例挂掉以后，可能要过几分钟，四五分钟，才能让其他服务感知到
+    }
+    
+}
+```
+
+
+
+### 7.3.2 总结
+
+（1）获取一个补偿时间，是为了避免说EvictionTask两次调度的时间超过了设置的60s，***\*补偿时间的机制\****，大家可以学习一下这个东西的使用
+
+19:55:00 3分钟 19:58:00 -> 过期
+
+EvictionTask本身调度的就慢了，比上一次该调度的时间晚了92s
+
+19:55:00过后，3分钟内没有心跳，在他延迟的这92s之内，也没心跳，19:59:32，都没心跳发送过，才能认为是失效
+
+（2）遍历注册表中所有的服务实例，然后调用Lease的isExpired()方法，来判断当前这个服务实例的租约是否过期了，是否失效了，服务实例故障了，如果是故障的服务实例，加入一个列表。如果上次的心跳到现在间隔了90s * 2 = 180s，3分钟，才会认为是故障了。闪光点，突出你的牛的地方，***\*eureka bug\****。
+
+（3）不会一次性将所有故障的服务实例都摘除，每次最多讲注册表中15%的服务实例给摘除掉，所以一次没摘除所有的故障实例，下次EvictionTask再次执行的时候，会再次摘除，**分批摘取机制**
+
+（4）在摘除的时候，是从故障实例中随机挑选本次可以摘除的数量的服务实例，来摘除，**随机摘取机制**
+
+（5）摘除服务实例的时候，其实就是调用下线的方法，internelCancel()方法，注册表、recentChangeQueue、invalidate缓存
+
+### 7.3.2 流程图
+
+https://www.processon.com/view/link/60e6f6e7e401fd314350eeb5
+
+
+
+
+
+
+
+
+
