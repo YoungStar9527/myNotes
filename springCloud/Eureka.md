@@ -301,7 +301,13 @@ eureka:
 
 #### <font color="red">**EMERGENCY! EUREKA MAY BE INCORRECTLY CLAIMING INSTANCES ARE UP WHEN THEY'RE NOT. RENEWALS ARE LESSER THAN THRESHOLD AND HENCE THE INSTANCES ARE NOT BEING EXPIRED JUST TO BE SAFE.**</font>
 
-​	这就是eureka进入了自我保护模式，如果客户端的心跳失败了超过一定的比例，或者说在一定时间内（15分钟）接收到的服务续约低于85%，那么就会认为是自己网络故障了，导致人家client无法发送心跳。这个时候eureka注册中心会先给保护起来，不会立即把失效的服务实例摘除，在测试的时候一般都会关闭这个自我保护模式：
+​	这就是eureka进入了自我保护模式，如果客户端的心跳失败了超过一定的比例，
+
+**或者说在一定时间内（15分钟）接收到的服务续约低于85%，那么就会认为是自己网络故障了，(错啦，不是15分钟)**
+
+导致人家client无法发送心跳。这个时候eureka注册中心会先给保护起来，不会立即把失效的服务实例摘除，在测试的时候一般都会关闭这个自我保护模式：
+
+**PS:期望心跳数*0.85 < 上一分钟心跳数，就会进入保护模式。15分钟是更新期望心跳数的定时任务，所以会认为是15分钟才会进入保护模式。实际上自动摘除停止实例的任务60s执行一次，且心跳数较少就会导致直接进入保护模式，不会将服务实例摘除下线了。**
 
 ```
 eureka.server.enable-self-preservation: false
@@ -3163,7 +3169,7 @@ public abstract class AbstractInstanceRegistry implements InstanceRegistry {
 
 流程图https://www.processon.com/view/link/60e468be0791294d9b4e9256
 
-# 7 服务实例
+# 7 服务实例相关机制
 
 ## 7.1 服务实例与注册中心之间的心跳机制（服务续约）
 
@@ -3751,6 +3757,249 @@ EvictionTask本身调度的就慢了，比上一次该调度的时间晚了92s
 ### 7.3.2 流程图
 
 https://www.processon.com/view/link/60e6f6e7e401fd314350eeb5
+
+
+
+## 7.4 eureka server网络故障时的的自我保护机制源码剖析
+
+​	ureka server启动、eureka client启动、服务注册、注册表拉取、心跳（服务续约）、服务下线、服务故障 --> eureka自我保护机制
+
+​	假如说，20个服务实例，结果在1分钟之内，只有8个服务实例保持了心跳 --> eureka server是应该将剩余的12个没有心跳的服务实例都摘除吗？
+
+​	这个时候很可能说的是，eureka server自己网络故障了，那些服务没问题的。只不过eureka server自己的机器所在的网络故障了，导致那些服务的心跳发送不过来。就导致eureka server本地一直没有更新心跳。
+
+​	自己进入一个自我保护的机制，从此之后就不会再摘除任何服务实例了
+
+​	**注册表的evict()方法，EvictionTask，定时调度的任务，60s来一次，会判断一下服务实例是否故障了，如果故障了，一直没有心跳，就会将服务实例给摘除(自动摘除实例的核心方法)。**
+
+```java
+public abstract class AbstractInstanceRegistry implements InstanceRegistry {
+
+    public void evict(long additionalLeaseMs) 
+    	logger.debug("Running the evict task");
+        //是否允许主动删除掉故障的服务实例 ->跟自我保护的机制相关
+        if (!isLeaseExpirationEnabled()) {
+            logger.debug("DS: lease expiration is currently disabled.");
+            return;
+        }
+    ......................................
+}
+
+//evict()方法内部，先会判断上一分钟的心跳次数，是否小于我期望的一分钟的心跳次数，如果小于，那么压根儿就不让清理任何服务实例
+@Singleton
+public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry implements PeerAwareInstanceRegistry {
+        @Override
+    public boolean isLeaseExpirationEnabled() {
+        //默认是true,如果你改为false，关闭自我保护机制的话，对这个方法永远会返回true
+        //也就是说随时都可以清理故障的服务实例
+        if (!isSelfPreservationModeEnabled()) {
+            // The self preservation mode is disabled, hence allowing the instances to expire.
+            return true;
+        }
+        //numberOfRenewsPerMinThreshold -->期望一分钟要有多少次心跳发送过来，比如期望所有服务实例一分钟发送100次心跳
+        //getNumOfRenewsInLastMin() -->上一分钟所有服务实例一共发送过来多少次心跳
+        //如果上一分钟发送的服务心跳大于期望心跳数则返回true
+        //如果上一分钟发送的服务心跳小于期望心跳数则返回false
+        return numberOfRenewsPerMinThreshold > 0 && getNumOfRenewsInLastMin() > numberOfRenewsPerMinThreshold;
+    }
+}
+```
+
+**numberOfRenewsPerMinThreshold:期望的一分钟的心跳次数是怎么算出来的?**
+
+**expectedNumberOfRenewsPerMin：服务实例乘以2的数量**
+
+​	**分别在eureka server初始化，服务注册，服务下线，以及注册表初始化创建的定时任务，这4个地方会去更新期望心跳数。但是服务故障自动下线的时候没有对期望心跳次数更新的操作**
+
+1 eureka server启动的时候，就会初始化一次这个值
+
+```java
+public class EurekaBootStrap implements ServletContextListener {
+
+    protected void initEurekaServerContext() throws Exception 
+ .........................
+         //自动检查服务实例是否故障宕机的入口
+        registry.openForTraffic(applicationInfoManager, registryCount);
+......................
+}
+
+@Singleton
+public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry implements PeerAwareInstanceRegistry {
+        @Override
+    public void openForTraffic(ApplicationInfoManager applicationInfoManager, int count) 
+        // Renewals happen every 30 seconds and for a minute it should be a factor of 2.
+        //如果有20个服务实例，乘以2，期望一分钟40个心跳
+        this.expectedNumberOfRenewsPerMin = count * 2;
+        //count * 2 * 0.85
+        //serverConfig.getRenewalPercentThreshold()默认0.85
+        this.numberOfRenewsPerMinThreshold =
+                (int) (this.expectedNumberOfRenewsPerMin * serverConfig.getRenewalPercentThreshold());
+    	...................................
+}
+```
+
+2 服务注册，服务下线去更新期望的一分钟的心跳次数（numberOfRenewsPerMinThreshold）
+
+```java
+public abstract class AbstractInstanceRegistry implements InstanceRegistry {
+    
+    //注册一个服务实例就将期望心跳数加2
+    public void register(InstanceInfo registrant, int leaseDuration, boolean isReplication) 
+    ...........................
+    	synchronized (lock) {
+                    if (this.expectedNumberOfRenewsPerMin > 0) {
+                        // Since the client wants to cancel it, reduce the threshold
+                        // (1
+                        // for 30 seconds, 2 for a minute)
+                        this.expectedNumberOfRenewsPerMin = this.expectedNumberOfRenewsPerMin + 2;
+                        this.numberOfRenewsPerMinThreshold =
+                                (int) (this.expectedNumberOfRenewsPerMin * serverConfig.getRenewalPercentThreshold());
+                    }
+                }
+    ...........................
+        
+}
+
+@Singleton
+public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry implements PeerAwareInstanceRegistry {
+    
+    //正常服务下线就将服务实例减2
+    @Override
+    public boolean cancel(final String appName, final String id,
+                          final boolean isReplication) {
+        if (super.cancel(appName, id, isReplication)) {
+            replicateToPeers(Action.Cancel, appName, id, null, null, isReplication);
+            synchronized (lock) {
+                if (this.expectedNumberOfRenewsPerMin > 0) {
+                    // Since the client wants to cancel it, reduce the threshold (1 for 30 seconds, 2 for a minute)
+                    this.expectedNumberOfRenewsPerMin = this.expectedNumberOfRenewsPerMin - 2;
+                    this.numberOfRenewsPerMinThreshold =
+                            (int) (this.expectedNumberOfRenewsPerMin * serverConfig.getRenewalPercentThreshold());
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+}
+
+```
+
+3 注册表初始化时创建15分钟执行一次的更新期望数值的定时任务
+
+```java
+@Singleton
+public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry implements PeerAwareInstanceRegistry {
+    @Override
+    public void init(PeerEurekaNodes peerEurekaNodes) throws Exception 
+        .............................
+        scheduleRenewalThresholdUpdateTask();
+        .............................
+    
+   //serverConfig.getRenewalThresholdUpdateIntervalMs()该配置时间默认是15分钟
+    private void scheduleRenewalThresholdUpdateTask() {
+        timer.schedule(new TimerTask() {
+                           @Override
+                           public void run() {
+                               updateRenewalThreshold();
+                           }
+                       }, serverConfig.getRenewalThresholdUpdateIntervalMs(),
+                serverConfig.getRenewalThresholdUpdateIntervalMs());
+    }
+    
+    //拉取其他地方的服务实例数量去更新期望心跳数
+    private void updateRenewalThreshold() {
+        try {
+            //将自己作为eureka client，从其他的eureka server拉取注册表
+            //合并到自己本地区
+            //将从别的eureka server拉取到的服务实例数量作为count
+            Applications apps = eurekaClient.getApplications();
+            int count = 0;
+            for (Application app : apps.getRegisteredApplications()) {
+                for (InstanceInfo instance : app.getInstances()) {
+                    if (this.isRegisterable(instance)) {
+                        ++count;
+                    }
+                }
+            }
+            synchronized (lock) {
+                // Update threshold only if the threshold is greater than the
+                // current expected threshold of if the self preservation is disabled.
+                //需要满足其他eureka server拉取到的服务实例数量 * 2 大于 当前期望心跳数*0.85才去更新
+                if ((count * 2) > (serverConfig.getRenewalPercentThreshold() * numberOfRenewsPerMinThreshold)
+                        || (!this.isSelfPreservationModeEnabled())) {
+                    this.expectedNumberOfRenewsPerMin = count * 2;
+                    this.numberOfRenewsPerMinThreshold = (int) ((count * 2) * serverConfig.getRenewalPercentThreshold());
+                }
+            }
+            logger.info("Current renewal threshold is : {}", numberOfRenewsPerMinThreshold);
+        } catch (Throwable e) {
+            logger.error("Cannot update renewal threshold", e);
+        }
+    }
+}
+```
+
+**实际的上一分钟的心跳次数是怎么算出来的?**
+
+​	每次一个心跳过来，一定会更新这个MeasturedRate。来计算每一分钟的心跳的实际的次数。
+
+​	**MeasuredRate，技术亮点：如何计算每一分钟内的一个内存中的计数的呢？计算每一分钟内的心跳的次数？**
+
+```java
+public abstract class AbstractInstanceRegistry implements InstanceRegistry {
+    
+    private final MeasuredRate renewsLastMin;
+    
+    public boolean renew(String appName, String id, boolean isReplication) 
+    .............................
+        //每次心跳的时候，都会把这个东西加1
+        //记录每一分钟实际的心跳次数
+        renewsLastMin.increment();
+    .............................
+}
+
+public class MeasuredRate {
+    public synchronized void start() {
+        if (!isActive) {
+            timer.schedule(new TimerTask() {
+
+                @Override
+                public void run() {
+                    try {
+                        // Zero out the current bucket.
+                        //每分钟这块调度一次
+                        //将当前的这个次数(比如88次)，设置到lastBucket中去
+                        //然后将currentBucket设置为0
+
+                        //currentBucket是用来更新当前这一分钟的心跳次数的
+                        //lastBucket是保留了上一分钟的心跳次数
+                        //timer调度任务，一分钟调度一次,就将上一分钟的心跳次数设置到lastBucket中去
+                        //将currentBucket的次数清零，重新开始计算当前分钟的心跳次数
+
+                        lastBucket.set(currentBucket.getAndSet(0));
+                    } catch (Throwable e) {
+                        logger.error("Cannot reset the Measured Rate", e);
+                    }
+                }
+            }, sampleInterval, sampleInterval);
+
+            isActive = true;
+        }
+    }
+    
+    public void increment() {
+        //心跳加1
+        currentBucket.incrementAndGet();
+    }
+}
+```
+
+总结：
+
+​	**自我保护机制的触发:如果上一分钟实际的心跳次数，比我们期望的一分钟的心跳次数要小，触发自我保护机制，不允许摘除任何服务实例，此时认为自己的eureka server出现网络故障，大量的服务实例无法发送心跳过来**
+
+
 
 
 
