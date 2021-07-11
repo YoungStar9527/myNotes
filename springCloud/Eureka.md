@@ -336,6 +336,10 @@ eureka server怎么启动的？
 
 ​	**eureka core**，扮演了核心的注册中心的角色，接收别人的服务注册请求，提供服务发现的功能，保持心跳（续约请求），摘除故障服务实例。**eureka server依赖eureka core的，基于eureka core的功能对外暴露接口**，提供注册中心的功能
 
+### 1.11 常用配置项
+
+https://www.cnblogs.com/zyon/p/11023750.html
+
 # 2 Eureka Server启动源码
 
 ## 2.1 Eureka Server的web工程结构分析以及web.xml解读
@@ -1287,14 +1291,12 @@ public class DiscoveryClient implements EurekaClient {
         remoteRegionsToFetch = new AtomicReference<String>(clientConfig.fetchRegistryForRemoteRegions());
         remoteRegionsRef = new AtomicReference<>(remoteRegionsToFetch.get() == null ? null : remoteRegionsToFetch.get().split(","));
 
-        //是否要注册
         if (config.shouldFetchRegistry()) {
             this.registryStalenessMonitor = new ThresholdLevelsMetric(this, METRIC_REGISTRY_PREFIX + "lastUpdateSec_", new long[]{15L, 30L, 60L, 120L, 240L, 480L});
         } else {
             this.registryStalenessMonitor = ThresholdLevelsMetric.NO_OP_METRIC;
         }
 
-        //是否要抓取注册表
         if (config.shouldRegisterWithEureka()) {
             this.heartbeatStalenessMonitor = new ThresholdLevelsMetric(this, METRIC_REGISTRATION_PREFIX + "lastHeartbeatSec_", new long[]{15L, 30L, 60L, 120L, 240L, 480L});
         } else {
@@ -1427,7 +1429,7 @@ public class DiscoveryClient implements EurekaClient {
                     registryFetchIntervalSeconds, TimeUnit.SECONDS);
         }
 
-        //如果要向eureka server进行主注册的话
+        //如果要向eureka server进行注册的话
         if (clientConfig.shouldRegisterWithEureka()) {
             int renewalIntervalInSecs = instanceInfo.getLeaseInfo().getRenewalIntervalInSecs();
             int expBackOffBound = clientConfig.getHeartbeatExecutorExponentialBackOffBound();
@@ -3762,6 +3764,8 @@ https://www.processon.com/view/link/60e6f6e7e401fd314350eeb5
 
 ## 7.4 eureka server网络故障时的的自我保护机制源码剖析
 
+### 7.4.1 流程
+
 ​	ureka server启动、eureka client启动、服务注册、注册表拉取、心跳（服务续约）、服务下线、服务故障 --> eureka自我保护机制
 
 ​	假如说，20个服务实例，结果在1分钟之内，只有8个服务实例保持了心跳 --> eureka server是应该将剩余的12个没有心跳的服务实例都摘除吗？
@@ -3995,17 +3999,1153 @@ public class MeasuredRate {
 }
 ```
 
-总结：
+**扩展：**
+
+eureka server控制台显示红色字体就是通过该方法判断，如果 实际心跳数<预期心跳数就会进入自我保护机制
+
+```java
+@Singleton
+public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry implements PeerAwareInstanceRegistry {
+    @Override
+    public int isBelowRenewThresold() {
+        //numberOfRenewsPerMinThreshold就是实例数量 * 2 * 0.85
+        if ((getNumOfRenewsInLastMin() <= numberOfRenewsPerMinThreshold)
+                &&
+                ((this.startupTime > 0) && (System.currentTimeMillis() > this.startupTime + (serverConfig.getWaitTimeInMsWhenSyncEmpty())))) {
+            //返回1就会在页面上显示红色字体，说明进入了自我保护机制
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+}
+```
+
+
+
+### 7.4.2 总结
 
 ​	**自我保护机制的触发:如果上一分钟实际的心跳次数，比我们期望的一分钟的心跳次数要小，触发自我保护机制，不允许摘除任何服务实例，此时认为自己的eureka server出现网络故障，大量的服务实例无法发送心跳过来**
 
+​	1 注册表的evict()方法，EvictionTask，定时调度的任务，**60s来一次，会判断一下服务实例是否故障了，如果故障了，一直没有心跳，就会将服务实例给摘除(自动摘除实例的核心方法)。**
+
+​	2 evict()方法内部，先会判断上一分钟的心跳次数，**是否小于我期望的一分钟的心跳次数，如果小于，那么压根儿就不让清理任何服务实例**
+
+​	3 **numberOfRenewsPerMinThreshold:期望的一分钟的心跳次数是怎么算出来的?**分别在eureka server初始化，服务注册，服务下线，以及注册表初始化创建的定时任务，这4个地方会去更新期望心跳数。但是服务故障自动下线的时候没有对期望心跳次数更新的操作
+
+​	4 **实际的上一分钟的心跳次数是怎么算出来的?**
+每次一个心跳过来，一定会更新这个MeasturedRate。来计算每一分钟的心跳的实际的次数。
+
+### 7.4.3 流程图
+
+https://www.processon.com/view/link/60e91766f346fb6bcd2515ea
+
+# 8 集群相关机制
+
+## 8.1 eureka server集群机制源码剖析：注册表同步以及高可用
+
+### 8.1.1 流程
+
+（1）eureka core的BootStrap里面，有一块代码，是PeerEurekaNodes的代码，其实是在处理eureka server集群信息的初始化，会执行PeerEurekaNodes.start()方法
+
+解析配置文件中的其他eureka server的url地址，基于url地址构造一个一个的PeerEurekaNode，一个PeerEurekaNode就代表了一个eureka server。启动一个后台的线程，默认是每隔10分钟，会运行一个任务，就是基于配置文件中的url来刷新eureka server列表。
+
+```java
+public class EurekaBootStrap implements ServletContextListener {
+    protected void initEurekaServerContext() throws Exception 
+.......................
+        //eureka core的BootStrap里面，有一块代码，是PeerEurekaNodes的代码
+        serverContext.initialize();
+.......................
+}
+
+@Singleton
+public class DefaultEurekaServerContext implements EurekaServerContext {
+    @PostConstruct
+    @Override
+    public void initialize() throws Exception {
+        logger.info("Initializing ...");
+        //其实是在处理eureka server集群信息的初始化，会执行PeerEurekaNodes.start()方法
+        peerEurekaNodes.start();
+        registry.init(peerEurekaNodes);
+       
+}
+    
+//启动一个后台的线程，默认是每隔10分钟，会运行一个任务，就是基于配置文件中的url来刷新eureka server列表。    
+public class PeerEurekaNodes {
+   public void start() 
+..............................
+        try {
+            updatePeerEurekaNodes(resolvePeerUrls());
+            //启动一个后台的线程
+            Runnable peersUpdateTask = new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        //就是基于配置文件中的url来刷新eureka server列表
+                        //resolvePeerUrls() 获取配置文件url集合
+                        updatePeerEurekaNodes(resolvePeerUrls());
+                    } catch (Throwable e) {
+                        logger.error("Cannot update the replica Nodes", e);
+                    }
+
+                }
+            };
+            //默认是每隔10分钟，会运行一个任务
+            //serverConfig.getPeerEurekaNodesUpdateIntervalMs()默认10分钟
+            taskExecutor.scheduleWithFixedDelay(
+                    peersUpdateTask,
+                    serverConfig.getPeerEurekaNodesUpdateIntervalMs(),
+                    serverConfig.getPeerEurekaNodesUpdateIntervalMs(),
+                    TimeUnit.MILLISECONDS
+            );
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+................................
+    
+}
+```
+
+**就是基于配置文件中的url来刷新eureka server列表。**   
+
+**List<PeerEurekaNode> peerEurekaNodes** 
+
+```java
+  public class PeerEurekaNodes {  
+      
+    private volatile List<PeerEurekaNode> peerEurekaNodes = Collections.emptyList();
+      
+    protected void updatePeerEurekaNodes(List<String> newPeerUrls) 
+........................
+        // 将配置文件 List<String> newPeerUrls，url server列表转换为PeerEurekaNode集合
+        this.peerEurekaNodes = newNodeList;
+        this.peerEurekaNodeUrls = new HashSet<>(newPeerUrls);
+
+}
+```
+
+（2）registry.syncUp()
+
+​	就是说，当前这个eureka server会从任何一个其他的eureka server拉取注册表过来放在自己本地，作为初始的注册表。将自己作为一个eureka client，找任意一个eureka server来拉取注册表，将拉取到的注册表放到自己本地去。
+
+```java
+public class EurekaBootStrap implements ServletContextListener {
+    protected void initEurekaServerContext() throws Exception 
+.......................
+        //eureka core的BootStrap里面，有一块代码，是PeerEurekaNodes的代码
+        serverContext.initialize();
+        logger.info("Initialized server context");
+        // Copy registry from neighboring eureka node
+        //第六步，处理一点善后的事情，从相邻的eureka节点拷贝注册信息
+        int registryCount = registry.syncUp();
+        //自动检查服务实例是否故障宕机的入口
+        registry.openForTraffic(applicationInfoManager, registryCount);
+.......................
+}
+```
+
+​	eurekaClient.getApplications();
+
+​	eureka server自己本身本来就是个eureka client，在初始化的时候，就会去找任意的一个eureka server拉取注册表到自己本地来，把这个注册表放到自己身上来，作为自己这个eureka server的注册表
+
+```java
+@Singleton
+public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry implements PeerAwareInstanceRegistry {
+    @Override
+    public int syncUp() {
+        // Copy entire entry from neighboring DS node
+        int count = 0;
+		
+        //serverConfig.getRegistrySyncRetries()默认重试5次
+        for (int i = 0; ((i < serverConfig.getRegistrySyncRetries()) && (count == 0)); i++) {
+            if (i > 0) {
+                try {
+                    //serverConfig.getRegistrySyncRetryWaitMs()默认30秒
+                    //如果第一次没有在自己本地的eureka client中获取注册表
+                    //说明自己本地的eureka client还没有从任何其他的eureka server上获取注册表
+                    //所以此时重试等待30秒
+                    Thread.sleep(serverConfig.getRegistrySyncRetryWaitMs());
+                } catch (InterruptedException e) {
+                    logger.warn("Interrupted during registry transfer..");
+                    break;
+                }
+            }
+            //以eureka client的方式拉取注册表(eureka server本身也是eureka client)
+            //eurekaClient.getApplications()就是获取本地的注册表信息
+            //因为eureka server自己本身就是eureka client，eureka client在初始化的时候就会拉取注册表到本地来
+            //所以这里 eurekaClient.getApplications()就是获取本地的注册表信息，作为eureka server的注册表
+            Applications apps = eurekaClient.getApplications();
+            for (Application app : apps.getRegisteredApplications()) {
+                for (InstanceInfo instance : app.getInstances()) {
+                    try {
+                        if (isRegisterable(instance)) {
+                            register(instance, instance.getLeaseInfo().getDurationInSecs(), true);
+                            count++;
+                        }
+                    } catch (Throwable t) {
+                        logger.error("During DS init copy", t);
+                    }
+                }
+            }
+        }
+        return count;
+    }
+}
+```
+
+（3）注册、下线、故障、心跳
+
+​	**如何从一台eureka server同步到另外一台eureka server上去的?以注册流程为示例**
+
+​	ApplicationResource的addInstance()方法，负责注册，现在自己本地完成一个注册
+
+```java
+@Produces({"application/xml", "application/json"})
+public class ApplicationResource {
+    @POST
+    @Consumes({"application/json", "application/xml"})
+    public Response addInstance(InstanceInfo info,
+                                @HeaderParam(PeerEurekaNode.HEADER_REPLICATION) String isReplication) 
+........................
+        registry.register(info, "true".equals(isReplication));
+}
+```
+
+​	接着会replicateToPeers()方法，这个方法就会将这次注册请求，同步到其他所有的eureka server上去 
+
+```java
+
+//如果是某台eureka client来找eureka server进行注册，isReplication是false
+@Singleton
+public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry implements PeerAwareInstanceRegistry {
+    @Override
+    public void register(final InstanceInfo info, final boolean isReplication) {
+        int leaseDuration = Lease.DEFAULT_DURATION_IN_SECS;
+        if (info.getLeaseInfo() != null && info.getLeaseInfo().getDurationInSecs() > 0) {
+            leaseDuration = info.getLeaseInfo().getDurationInSecs();
+        }
+        super.register(info, leaseDuration, isReplication);
+        //接着会replicateToPeers()方法，这个方法就会将这次注册请求，同步到其他所有的eureka server上去 
+        replicateToPeers(Action.Register, info.getAppName(), info.getId(), info, null, isReplication);
+    }
+    
+    private void replicateToPeers(Action action, String appName, String id,
+                                  InstanceInfo info /* optional */,
+                                  InstanceStatus newStatus /* optional */, boolean isReplication) {
+        Stopwatch tracer = action.getTimer().start();
+        //如果是某台eureka client来找eureka server进行注册，isReplication是false
+        try {
+            if (isReplication) {
+                numberOfReplicationsLastMin.increment();
+            }
+            // If it is a replication already, do not replicate again as this will create a poison replication
+            //isReplication是false才会进行下一步,将注册请求同步到所有配置的eureka server上去
+            if (peerEurekaNodes == Collections.EMPTY_LIST || isReplication) {
+                return;
+            }
+		   //此时会给其他所有的你配置的eureka server都同步这个注册请求
+           //peerEurekaNodes.getPeerEurekaNodes() 就是初始化定时任务，将配置的server url，转换为PeerEurekaNode，对应的server节点
+            for (final PeerEurekaNode node : peerEurekaNodes.getPeerEurekaNodes()) {
+                // If the url represents this host, do not replicate to yourself.
+                if (peerEurekaNodes.isThisMyUrl(node.getServiceUrl())) {
+                    continue;
+                }
+                 //此时一定会基于jersey，调用其他所有的eureka server的restful接口，去执行这个服务实例的注册的请求
+                replicateInstanceActionsToPeers(action, appName, id, info, newStatus, node);
+            }
+        } finally {
+            tracer.stop();
+        }
+    }
+}
+```
+
+此时一定会基于jersey，调用其他所有的eureka server的restful接口，去执行这个服务实例的注册的请求
+
+```java
+public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry implements PeerAwareInstanceRegistry {
+    
+    //下线、心跳、注册、状态等都会调用eureka server的restful接口去同步
+   private void replicateInstanceActionsToPeers(Action action, String appName,
+                                                 String id, InstanceInfo info, InstanceStatus newStatus,
+                                                 PeerEurekaNode node) {
+        try {
+            InstanceInfo infoFromRegistry = null;
+            CurrentRequestVersion.set(Version.V2);
+            switch (action) {
+                case Cancel:
+                    node.cancel(appName, id);
+                    break;
+                case Heartbeat:
+                    InstanceStatus overriddenStatus = overriddenInstanceStatusMap.get(id);
+                    infoFromRegistry = getInstanceByAppAndId(appName, id, false);
+                    node.heartbeat(appName, id, infoFromRegistry, overriddenStatus, false);
+                    break;
+                case Register:
+                    //注册举例
+                    node.register(info);
+                    break;
+                case StatusUpdate:
+                    infoFromRegistry = getInstanceByAppAndId(appName, id, false);
+                    node.statusUpdate(appName, id, newStatus, infoFromRegistry);
+                    break;
+                case DeleteStatusOverride:
+                    infoFromRegistry = getInstanceByAppAndId(appName, id, false);
+                    node.deleteStatusOverride(appName, id, infoFromRegistry);
+                    break;
+            }
+        } catch (Throwable t) {
+            logger.error("Cannot replicate information to {} for action {}", node.getServiceUrl(), action.name(), t);
+        }
+    }
+}
+```
+
+以注册举例：
+
+```java
+public class PeerEurekaNode {
+    
+  private final HttpReplicationClient replicationClient;
+    
+  public void register(final InstanceInfo info) throws Exception {
+        long expiryTime = System.currentTimeMillis() + getLeaseRenewalOf(info);
+        batchingDispatcher.process(
+                taskId("register", info),
+                new InstanceReplicationTask(targetHost, Action.Register, info, null, true) {
+                    public EurekaHttpResponse<Void> execute() {
+                        return replicationClient.register(info);
+                    }
+                },
+                expiryTime
+        );
+    }
+}
+```
+
+eureka-core-jersey2的工程，ReplicationHttpClient
+
+```java
+public class Jersey2ReplicationClient extends AbstractJersey2EurekaHttpClient implements HttpReplicationClient {
+    @Override
+    protected void addExtraHeaders(Builder webResource) {
+        //将isReplication设置为true
+        webResource.header(PeerEurekaNode.HEADER_REPLICATION, "true");
+    }
+}
+
+//此时实际调用的是父类的注册方法
+public abstract class AbstractJersey2EurekaHttpClient implements EurekaHttpClient {
+    @Override
+    public EurekaHttpResponse<Void> register(InstanceInfo info) {
+..........................
+    //发送注册请求之前，调用子类ReplicationHttpClient的addExtraHeaders方法，设置参数
+    //将isReplication设置为true
+    //这个东西可以确保说什么呢，其他eureka server接到这个同步的请求，仅仅在自己本地执行，不会再次向其他的eureka server去进行注册
+    //避免同步无限循环注册，陷入死循环
+    //也就是说只有在eureka client第一次进行注册的时候会发送对应eureka server进行同步，对应eureka server同步的时候就不会再发送请求同步了
+     addExtraHeaders(resourceBuilder);
+        response = resourceBuilder
+                    .accept(MediaType.APPLICATION_JSON)
+                    .acceptEncoding("gzip")
+                    .post(Entity.json(info));
+            return anEurekaHttpResponse(response.getStatus()).headers(headersOf(response)).build();
+..........................
+    }
+}
+```
+
+### 8.1.2 流程图
+
+https://www.processon.com/view/link/60e95aa4e401fd047de901df
 
 
 
+## 8.2 eureka server集群之间注册表同步使用的3层队列任务批处理机制
+
+### 8.2.1 流程
+
+以同步注册为例：
+
+PeerEurekaNode 的register方法
+
+```java
+public class PeerEurekaNode {
+    
+    private final TaskDispatcher<String, ReplicationTask> batchingDispatcher;
+    
+    public void register(final InstanceInfo info) throws Exception {
+        long expiryTime = System.currentTimeMillis() + getLeaseRenewalOf(info);
+        batchingDispatcher.process(
+                taskId("register", info),
+                new InstanceReplicationTask(targetHost, Action.Register, info, null, true) {
+                    public EurekaHttpResponse<Void> execute() {
+                        return replicationClient.register(info);
+                    }
+                },
+                expiryTime
+        );
+    }
+}
+```
+
+batchingDispatcher的poss方法
+
+```java
+public class TaskDispatchers {
+    public static <ID, T> TaskDispatcher<ID, T> createBatchingTaskDispatcher(String id,
+                                                                             int maxBufferSize,
+                                                                             int workloadSize,
+                                                                             int workerCount,
+                                                                             long maxBatchingDelay,
+                                                                             long congestionRetryDelayMs,
+                                                                             long networkFailureRetryMs,
+                                                                             TaskProcessor<T> taskProcessor) {
+        final AcceptorExecutor<ID, T> acceptorExecutor = new AcceptorExecutor<>(
+                id, maxBufferSize, workloadSize, maxBatchingDelay, congestionRetryDelayMs, networkFailureRetryMs
+        );
+        final TaskExecutors<ID, T> taskExecutor = TaskExecutors.batchExecutors(id, workerCount, taskProcessor, acceptorExecutor);
+        return new TaskDispatcher<ID, T>() {
+            @Override
+            public void process(ID id, T task, long expiryTime) {
+                //添加到第一层队列，该队列作用为写入
+                acceptorExecutor.process(id, task, expiryTime);
+            }
+
+            @Override
+            public void shutdown() {
+                acceptorExecutor.shutdown();
+                taskExecutor.shutdown();
+            }
+        };
+    }
+}
+
+class AcceptorExecutor<ID, T> {
+    
+    //有参构造
+        AcceptorExecutor(String id,
+                     int maxBufferSize,
+                     int maxBatchingSize,
+                     long maxBatchingDelay,
+                     long congestionRetryDelayMs,
+                     long networkFailureRetryMs) 
+............................
+        //启动AcceptorRunner后台线程
+        this.acceptorThread = new Thread(threadGroup, new AcceptorRunner(), "TaskAcceptor-" + id);
+        this.acceptorThread.setDaemon(true);
+        this.acceptorThread.start();
+.............................
+    
+   void process(ID id, T task, long expiryTime) {
+       //添加到第一层队列，该队列作用为写入
+        acceptorQueue.add(new TaskHolder<ID, T>(id, task, expiryTime));
+        acceptedTasks++;
+    }
+    
+class AcceptorRunner implements Runnable {
+
+        @Override
+        public void run() {
+            long scheduleTime = 0;
+            while (!isShutdown.get()) {
+                try {
+                    //循环将acceptorQueue(一层队列)数据放入,第二层队列processingOrder
+                    drainInputQueues();
+
+                    int totalItems = processingOrder.size();
+
+                    long now = System.currentTimeMillis();
+                    if (scheduleTime < now) {
+                        scheduleTime = now + trafficShaper.transmissionDelay();
+                    }
+                    if (scheduleTime <= now) {
+                        //拆分batch，放入第三个队列
+                        assignBatchWork();
+                        assignSingleItemWork();
+                    }
+
+                    // If no worker is requesting data or there is a delay injected by the traffic shaper,
+                    // sleep for some time to avoid tight loop.
+                    if (totalItems == processingOrder.size()) {
+                        Thread.sleep(10);
+                    }
+                } catch (InterruptedException ex) {
+                    // Ignore
+                } catch (Throwable e) {
+                    // Safe-guard, so we never exit this loop in an uncontrolled way.
+                    logger.warn("Discovery AcceptorThread error", e);
+                }
+            }
+        }
+        
+         //第二个队列，是用来根据时间和大小，来拆分队列
+    	private void drainInputQueues() throws InterruptedException {
+            do {
+                drainReprocessQueue();
+                //循环放入第二层队列
+                drainAcceptorQueue();
+
+                if (!isShutdown.get()) {
+                    // If all queues are empty, block for a while on the acceptor queue
+                    if (reprocessQueue.isEmpty() && acceptorQueue.isEmpty() && pendingTasks.isEmpty()) {
+                        TaskHolder<ID, T> taskHolder = acceptorQueue.poll(10, TimeUnit.MILLISECONDS);
+                        if (taskHolder != null) {
+                            appendTaskHolder(taskHolder);
+                        }
+                    }
+                }
+            } while (!reprocessQueue.isEmpty() || !acceptorQueue.isEmpty() || pendingTasks.isEmpty());
+  		}
+    
+        //循环放入第二层队列
+        private void drainAcceptorQueue() {
+            while (!acceptorQueue.isEmpty()) {
+                //循环放入第二层队列
+                appendTaskHolder(acceptorQueue.poll());
+            }
+        }
+        
+        //循环放入第二层队列
+        private void appendTaskHolder(TaskHolder<ID, T> taskHolder) {
+            if (isFull()) {
+                pendingTasks.remove(processingOrder.poll());
+                queueOverflows++;
+            }
+            TaskHolder<ID, T> previousTask = pendingTasks.put(taskHolder.getId(), taskHolder);
+            if (previousTask == null) {
+                //第二层队列
+                processingOrder.add(taskHolder.getId());
+            } else {
+                overriddenTasks++;
+            }
+        }
+    
+    //第三层队列，拆分batch
+        void assignBatchWork() {
+            //根据时间范围判断，如果超出对应时间范围则返回true,拆分batch
+            //默认每隔500毫秒,拆分batch
+            if (hasEnoughTasksForNextBatch()) {
+                if (batchWorkRequests.tryAcquire(1)) {
+                    long now = System.currentTimeMillis();
+                    //batch最大是250
+                    //maxBatchingSize为250
+                    int len = Math.min(maxBatchingSize, processingOrder.size());
+                    List<TaskHolder<ID, T>> holders = new ArrayList<>(len);
+                    while (holders.size() < len && !processingOrder.isEmpty()) {
+                        //取出第二层队列数据
+                        ID id = processingOrder.poll();
+                        TaskHolder<ID, T> holder = pendingTasks.remove(id);
+                        if (holder.getExpiryTime() > now) {
+                            holders.add(holder);
+                        } else {
+                            expiredTasks++;
+                        }
+                    }
+                    if (holders.isEmpty()) {
+                        batchWorkRequests.release();
+                    } else {
+                        batchSizeMetric.record(holders.size(), TimeUnit.MILLISECONDS);
+                        //添加对应数据到第三层batchWork队列
+                        batchWorkQueue.add(holders);
+                    }
+                }
+            }
+        }
+    
+    //根据时间范围判断，如果超出对应时间范围则返回true
+        private boolean hasEnoughTasksForNextBatch() {
+            if (processingOrder.isEmpty()) {
+                return false;
+            }
+            if (pendingTasks.size() >= maxBufferSize) {
+                return true;
+            }
+            TaskHolder<ID, T> nextHolder = pendingTasks.get(processingOrder.peek());
+            long delay = System.currentTimeMillis() - nextHolder.getSubmitTimestamp();
+            //如果在一定时间内超过maxBatchingDelay
+            //maxBatchingDelay默认参数为500毫秒
+            return delay >= maxBatchingDelay;
+        }
+    
+}
 
 
+}
+```
 
+ReplicationTaskProcessor后台线程从workQueue拿出batch
 
+```java
+class ReplicationTaskProcessor implements TaskProcessor<ReplicationTask> {
+    public ProcessingResult process(List<ReplicationTask> tasks)
+....................
+        	//将batch一次性发送给对应server
+            EurekaHttpResponse<ReplicationListResponse> response = replicationClient.submitBatchUpdates(list);
+.......................
+    
+}
+```
 
+将batch一次性发送给对应server
 
+```java
+public class Jersey2ReplicationClient extends AbstractJersey2EurekaHttpClient implements HttpReplicationClient {
+    @Override
+    public EurekaHttpResponse<ReplicationListResponse> submitBatchUpdates(ReplicationList replicationList) 
+..........................
+        	//PeerEurekaNode.BATCH_URL_PATH值为peerreplication/batch/
+            //相当于请求了 http://localhost:8080/v2/peerapplication/batch 接口
+            response = jerseyClient.target(serviceUrl)
+                    .path(PeerEurekaNode.BATCH_URL_PATH)
+                    .request(MediaType.APPLICATION_JSON_TYPE)
+                    .post(Entity.json(replicationList));
+............................................
+}
+```
 
+对应server接收，并将batch的批量请求进行分发
+
+```java
+@Path("/{version}/peerreplication")
+@Produces({"application/xml", "application/json"})
+public class PeerReplicationResource {
+    @Path("batch")
+    @POST
+    public Response batchReplication(ReplicationList replicationList) {
+        try {
+            ReplicationListResponse batchResponse = new ReplicationListResponse();
+            for (ReplicationInstance instanceInfo : replicationList.getReplicationList()) {
+                try {
+                    //dispatch分发请求
+                    batchResponse.addResponse(dispatch(instanceInfo));
+                } catch (Exception e) {
+                    batchResponse.addResponse(new ReplicationInstanceResponse(Status.INTERNAL_SERVER_ERROR.getStatusCode(), null));
+                    logger.error(instanceInfo.getAction() + " request processing failed for batch item "
+                            + instanceInfo.getAppName() + '/' + instanceInfo.getId(), e);
+                }
+            }
+            return Response.ok(batchResponse).build();
+        } catch (Throwable e) {
+            logger.error("Cannot execute batch Request", e);
+            return Response.status(Status.INTERNAL_SERVER_ERROR).build();
+        }
+    }
+    
+//dispatch分发请求,注册、心跳、下线等操作的分发   
+private ReplicationInstanceResponse dispatch(ReplicationInstance instanceInfo) {
+        ApplicationResource applicationResource = createApplicationResource(instanceInfo);
+        InstanceResource resource = createInstanceResource(instanceInfo, applicationResource);
+
+        String lastDirtyTimestamp = toString(instanceInfo.getLastDirtyTimestamp());
+        String overriddenStatus = toString(instanceInfo.getOverriddenStatus());
+        String instanceStatus = toString(instanceInfo.getStatus());
+
+        Builder singleResponseBuilder = new Builder();
+        switch (instanceInfo.getAction()) {
+            case Register:
+                //注册还是调用正常的ApplicationResource中的注册方法
+                //其他操作亦然
+                singleResponseBuilder = handleRegister(instanceInfo, applicationResource);
+                break;
+            case Heartbeat:
+                singleResponseBuilder = handleHeartbeat(serverConfig, resource, lastDirtyTimestamp, overriddenStatus, instanceStatus);
+                break;
+            case Cancel:
+                singleResponseBuilder = handleCancel(resource);
+                break;
+            case StatusUpdate:
+                singleResponseBuilder = handleStatusUpdate(instanceInfo, resource);
+                break;
+            case DeleteStatusOverride:
+                singleResponseBuilder = handleDeleteStatusOverride(instanceInfo, resource);
+                break;
+        }
+        return singleResponseBuilder.build();
+    }
+}
+```
+
+### 8.2.2 总结
+
+**1、集群同步的机制：闪光点，client可以找任何一个server发送请求，然后这个server会将请求同步到其他所有的server上去，但是其他的server仅仅会在自己本地执行，不会再次同步了**
+
+**2、数据同步的异步批处理机制：闪光点，三个队列，第一个队列，就是纯写入；第二个队列，是用来根据时间和大小，来拆分队列；第三个队列，用来放批处理任务 ==》 异步批处理机制**
+
+### 8.2.3 流程图
+
+https://www.processon.com/view/link/60e9828b5653bb26106e9b1b
+
+# 9 一图梳理eureka 整体架构 
+
+（1）eureka server启动：注册中心
+
+（2）eureka client启动：服务实例
+
+（3）服务注册：map数据结构
+
+（4）eureka server集群：注册表的同步，多级队列的任务批处理机制
+
+（5）全量拉取注册表：多级缓存机制
+
+（6）增量拉取注册表：一致性hash比对机制
+
+（7）心跳机制：服务续约，renew
+
+（8）服务下线：cancel
+
+（9）服务故障：expiration，eviction
+
+（10）自我保护：自动识别eureka server出现网络故障了
+
+（11）控制台：jsp页面
+
+**流程图：**
+
+![img](Eureka.assets/8LDO48C$8@[GWU0353$FOVS.png)https://www.processon.com/view/link/60ea9b951e08530964174078
+
+# 10 spring cloud eureka 源码剖析
+
+## 10.1 spring cloud eureka server源码
+
+### 10.1.1 前言
+
+​	spring cloud eureka，其实不是一个什么所谓很复杂的项目，他其实就是一个将netflix eureka整合到spring技术体系中的这么一个包装类的技术，spring-cloud-netflix-eureka项目，仅仅是对netflix eureka的一个封装。
+
+### 10.1.2 流程
+
+入口，@EnableEurekaServer注解，这个注解实际上来说就在spring boot跑起来一个内嵌的tomcat容器之后，就将eureka server在tomcat内部给启动起来了
+
+```java
+@SpringBootApplication
+@EnableEurekaServer
+public class EurekaServer {
+
+	public static void main(String[] args) {
+		SpringApplication.run(EurekaServer.class, args);
+	}
+	
+}
+```
+
+核心为 @EnableEurekaServer注解，通过spring boot auto configuation的方式自动启动eureka server
+
+```java
+@Target(ElementType.TYPE)
+@Retention(RetentionPolicy.RUNTIME)
+@Documented
+@Import(EurekaServerMarkerConfiguration.class)
+public @interface EnableEurekaServer {
+
+}
+```
+
+spring cloud eureka 相关类
+
+![image-20210711154117860](Eureka.assets/image-20210711154117860.png)
+
+**核心启动配置类 EurekaServerAutoConfiguration**
+
+​	EurekaServerAutoConfiguration，依托spring boot的auto configuration机制，直接我们就是使用一个注解@EnableEurekaServer，触发了EurekaServerAutoConfiguration的执行，直接一站式将我们需要的eureka server给初始化和启动。
+
+​	spring cloud通过EurekaServerAutoConfiguration及相关的类，替代了原有eureka server的监听核心启动类BootStrap，来完成eureka server的启动。
+
+```java
+@Configuration
+@Import(EurekaServerInitializerConfiguration.class)
+@ConditionalOnBean(EurekaServerMarkerConfiguration.Marker.class)
+@EnableConfigurationProperties({ EurekaDashboardProperties.class,
+		InstanceRegistryProperties.class })
+@PropertySource("classpath:/eureka/server.properties")
+public class EurekaServerAutoConfiguration extends WebMvcConfigurerAdapter {
+	/**
+	 * List of packages containing Jersey resources required by the Eureka server
+	 */
+	private static String[] EUREKA_PACKAGES = new String[] { "com.netflix.discovery",
+			"com.netflix.eureka" };
+
+    //
+	@Autowired
+	private ApplicationInfoManager applicationInfoManager;
+
+    //EurekaServerConfigBean，实现了EurekaServerConfig接口，相当于是什么，将spring boot风格的配置，application.yml风格的配置，全部用这个东西来表示配置相关的持有类以及加载
+	@Autowired
+	private EurekaServerConfig eurekaServerConfig;
+
+	@Autowired
+	private EurekaClientConfig eurekaClientConfig;
+
+	@Autowired
+	private EurekaClient eurekaClient;
+
+    //InstanceRegistry，是对注册表，进行了薄薄的一层封装，在注册、下线的时候，会先通过这个类执行一下简单的逻辑，然后将请求转发给eureka自己的注册表类，PeerAwareInstanceRegistryImpl类
+	@Autowired
+	private InstanceRegistryProperties instanceRegistryProperties;
+.........................................
+}
+
+```
+
+spring boot人家启动了自己本身的web应用，使用内嵌的tomcat容器，完成BootSrrap监听器一模一样的逻辑
+
+EurekaServerInitializerConfiguration,并且在start方法中初始化了EurekaServerBootstrap核心启动类
+
+```java
+@Configuration
+public class EurekaServerInitializerConfiguration
+		implements ServletContextAware, SmartLifecycle, Ordered {
+
+	private static final Log log = LogFactory.getLog(EurekaServerInitializerConfiguration.class);
+
+	@Autowired
+	private EurekaServerConfig eurekaServerConfig;
+
+	private ServletContext servletContext;
+
+	@Autowired
+	private ApplicationContext applicationContext;
+
+    //EurekaServerBootstrap为spring cloud 核心启动eureka server类
+	@Autowired
+	private EurekaServerBootstrap eurekaServerBootstrap;
+
+	private boolean running;
+
+	private int order = 1;
+
+	@Override
+	public void setServletContext(ServletContext servletContext) {
+		this.servletContext = servletContext;
+	}
+
+    //这个类本身是有生命周期的，在spring boot启动之后，就会来执行这个东西的start()方法。启动一个后台线程，完成了剩余的eureka server初始化的这么一个过程
+	@Override
+	public void start() {
+		new Thread(new Runnable() {
+			@Override
+			public void run() {
+				try {
+					//TODO: is this class even needed now?
+					eurekaServerBootstrap.contextInitialized(EurekaServerInitializerConfiguration.this.servletContext);
+					log.info("Started Eureka Server");
+
+					publish(new EurekaRegistryAvailableEvent(getEurekaServerConfig()));
+					EurekaServerInitializerConfiguration.this.running = true;
+					publish(new EurekaServerStartedEvent(getEurekaServerConfig()));
+				}
+				catch (Exception ex) {
+					// Help!
+					log.error("Could not initialize Eureka servlet context", ex);
+				}
+			}
+		}).start();
+	}
+..............................................
+
+}
+```
+
+EurekaServerBootstrap,spring cloud eureka server 核心启动类
+
+```java
+public class EurekaServerBootstrap {
+
+	private static final Log log = LogFactory.getLog(EurekaServerBootstrap.class);
+
+	private static final String TEST = "test";
+
+	private static final String ARCHAIUS_DEPLOYMENT_ENVIRONMENT = "archaius.deployment.environment";
+
+	private static final String EUREKA_ENVIRONMENT = "eureka.environment";
+
+	private static final String DEFAULT = "default";
+
+	private static final String ARCHAIUS_DEPLOYMENT_DATACENTER = "archaius.deployment.datacenter";
+
+	private static final String EUREKA_DATACENTER = "eureka.datacenter";
+
+	protected EurekaServerConfig eurekaServerConfig;
+
+	protected ApplicationInfoManager applicationInfoManager;
+
+	protected EurekaClientConfig eurekaClientConfig;
+
+	protected PeerAwareInstanceRegistry registry;
+
+	protected volatile EurekaServerContext serverContext;
+	protected volatile AwsBinder awsBinder;
+
+	public EurekaServerBootstrap(ApplicationInfoManager applicationInfoManager,
+			EurekaClientConfig eurekaClientConfig, EurekaServerConfig eurekaServerConfig,
+			PeerAwareInstanceRegistry registry, EurekaServerContext serverContext) {
+		this.applicationInfoManager = applicationInfoManager;
+		this.eurekaClientConfig = eurekaClientConfig;
+		this.eurekaServerConfig = eurekaServerConfig;
+		this.registry = registry;
+		this.serverContext = serverContext;
+	}
+
+..........................................
+
+}
+
+```
+
+### 10.1.3 总结
+
+1 EurekaServerAutoConfiguration、EurekaServerInitializerConfiguration、EurekaServerBootstrap，三个类，在spring boot启动之后，完成了原来BootStrap初始化和启动eureka server的几乎一模一样的所有的代码逻辑。
+
+2 唯一的区别，就是比如说读取配置，变成从application.yml中去读取，然后有几个类稍微变成了自己的实现类，继承了eureka的父类。稍微做了一点点薄薄的封装。
+
+3 spring boot的main方法启动，内嵌tomcat容器启动，自身作为一个web应用启动，然后带着@EnableEurekaServer注解走。EurekaServerAutoConfiguration、EurekaServerInitializerConfiguration、EurekaServerBootstrap执行，完成了原来的BootStrap一模一样的代码。完成eureka server的所有组件的初始化，已经eukrea server的启动。
+
+4 eureka server等待http请求调用了，人家自己有自己的jersey mvc框架，对外可以接收这个请求。
+
+## 10.2 spring cloud eureka client源码
+
+### 10.2.1 前言
+
+​	看完了spring cloud eureka server的注解式启动的这个过程，spring cloud eureka client是如何通过一个注解就启动一个服务实例的呢？肯定是那个注解触发了一个sping boot auto configuration，。肯定是spring boot启动了一个main方法，启动了内嵌的tomcat容器，然后同时会执行相关的auto configuration的类。
+
+​	在那些auto configuration的类中，就会完成eureka client的初始化和构造。而且这些eureka client初始化的代码，几乎都是跟netflix eureka中的代码是一样的。
+
+### 10.2.2 流程
+
+启动入口，添加EnableEurekaClient注解
+
+```java
+@SpringBootApplication
+@EnableEurekaClient
+public class ServiceBApplication {
+
+	public static void main(String[] args) {
+		SpringApplication.run(ServiceBApplication.class, args);
+	}
+
+}
+```
+
+EnableEurekaClient
+
+```java
+@Target(ElementType.TYPE)
+@Retention(RetentionPolicy.RUNTIME)
+@Documented
+@Inherited
+public @interface EnableEurekaClient {
+
+}
+```
+
+spring cloud eureka client相关类
+
+![image-20210711162558320](Eureka.assets/image-20210711162558320.png)
+
+**核心启动配置类 EurekaClientAutoConfiguration**
+
+​	这个里面EurekaClientAutoConfiguration，完成了DiscoveryClient的构造和初始化，eureka client初始化和启动的流程，全部在DiscoveryClient中的。EurekaDiscoveryClient，自己对eureka原生的DiscoveryClient进行了一层封装和包装，实现了eureka的DiscoveryClient接口，依赖了一个原生的EurekaClient。提供了一些额外的方法的实现。
+
+```java
+@Configuration
+@EnableConfigurationProperties
+@ConditionalOnClass(EurekaClientConfig.class)
+@Import(DiscoveryClientOptionalArgsConfiguration.class)
+@ConditionalOnBean(EurekaDiscoveryClientConfiguration.Marker.class)
+@ConditionalOnProperty(value = "eureka.client.enabled", matchIfMissing = true)
+@AutoConfigureBefore({ NoopDiscoveryClientAutoConfiguration.class,
+		CommonsClientAutoConfiguration.class, ServiceRegistryAutoConfiguration.class })
+@AutoConfigureAfter(name = {"org.springframework.cloud.autoconfigure.RefreshAutoConfiguration",
+		"org.springframework.cloud.netflix.eureka.EurekaDiscoveryClientConfiguration",
+		"org.springframework.cloud.client.serviceregistry.AutoServiceRegistrationAutoConfiguration"})
+public class EurekaClientAutoConfiguration {
+
+	@Autowired(required = false)
+	private HealthCheckHandler healthCheckHandler;
+    
+    //EurekaClientConfigBean一看就是，从application.yml中，将你的格式的配置项读取出来，通过这个bean来对外提供所有的eureka client相关的配置项的读取。实现的就是EurekaClientConfig接口。EurekaInstanceConfigBean，同理，加载application.yml中的服务实例相关的配置项。
+    @Bean
+	@ConditionalOnMissingBean(value = EurekaClientConfig.class, search = SearchStrategy.CURRENT)
+	public EurekaClientConfigBean eurekaClientConfigBean(ConfigurableEnvironment env) {
+		EurekaClientConfigBean client = new EurekaClientConfigBean();
+		if ("bootstrap".equals(new RelaxedPropertyResolver(env).getProperty("spring.config.name"))) {
+			// We don't register during bootstrap by default, but there will be another
+			// chance later.
+			client.setRegisterWithEureka(false);
+		}
+		
+................................................	
+    //根据Netflix EurekaClient，spring cloud封装一层EurekaDiscoveryClient
+	@Bean
+	public DiscoveryClient discoveryClient(EurekaInstanceConfig config, EurekaClient client) {
+		return new EurekaDiscoveryClient(config, client);
+	}
+    ................................................
+
+    @Bean
+	@ConditionalOnBean(AutoServiceRegistrationProperties.class)
+	@ConditionalOnProperty(value = "spring.cloud.service-registry.auto-registration.enabled", matchIfMissing = true)
+	public EurekaAutoServiceRegistration eurekaAutoServiceRegistration(ApplicationContext context, EurekaServiceRegistry registry, EurekaRegistration registration) {
+		return new EurekaAutoServiceRegistration(context, registry, registration);
+	}
+................................................
+}
+
+```
+
+EurekaAutoServiceRegistration
+
+​	这里就是将原来的InstanceInfoReplicator组件里面的服务注册的逻辑，进行了一定的封装，服务注册相关的重要的逻辑，不能封装在那么不清不楚的InstanceInfoReplicator中。在这里提供了服务注册的这么一些方法。
+
+```java
+public class EurekaAutoServiceRegistration implements AutoServiceRegistration, SmartLifecycle, Ordered {
+
+	private static final Log log = LogFactory.getLog(EurekaAutoServiceRegistration.class);
+
+	private AtomicBoolean running = new AtomicBoolean(false);
+
+	private int order = 0;
+
+	private AtomicInteger port = new AtomicInteger(0);
+
+	private ApplicationContext context;
+
+	private EurekaServiceRegistry serviceRegistry;
+
+	private EurekaRegistration registration;
+
+	public EurekaAutoServiceRegistration(ApplicationContext context, EurekaServiceRegistry serviceRegistry, EurekaRegistration registration) {
+		this.context = context;
+		this.serviceRegistry = serviceRegistry;
+		this.registration = registration;
+	}
+
+    //在原生的eureka client的注册里，其实eureka client启动之后，要延迟几十秒，才会去完成注册。EurekaAutoServiceRegistration，里面包含了一个start()方法，在这个spring boot启动之后，直接就会执行start()方法，我，一启动，不要按照原来的40秒才去注册，我一启动，直接就去执行一个注册。
+	@Override
+	public void start() {
+		// only set the port if the nonSecurePort or securePort is 0 and this.port != 0
+		if (this.port.get() != 0) {
+			if (this.registration.getNonSecurePort() == 0) {
+				this.registration.setNonSecurePort(this.port.get());
+			}
+
+			if (this.registration.getSecurePort() == 0 && this.registration.isSecure()) {
+				this.registration.setSecurePort(this.port.get());
+			}
+		}
+
+		// only initialize if nonSecurePort is greater than 0 and it isn't already running
+		// because of containerPortInitializer below
+		if (!this.running.get() && this.registration.getNonSecurePort() > 0) {
+
+			this.serviceRegistry.register(this.registration);
+
+			this.context.publishEvent(
+					new InstanceRegisteredEvent<>(this, this.registration.getInstanceConfig()));
+			this.running.set(true);
+		}
+	}
+.............................................................................
+
+}
+
+```
+
+**EurekaServiceRegistry**
+
+​	**实际上，在spring boot一启动的时候，就会去执行EurekaServiceRegistry.register()方法**，这个方法什么啊？看都看不懂，感觉根本没有注册啊。。。。spring cloud也是无奈之举，因为这个eureka client对注册这块的代码， 写的确实是太差了。
+
+​	ApplicationInfoManager.setInstanceStatus()调用的时候，会通知自己所有的注册的监听器，状态发生改变。DiscoveryClient.initScheduledTasks()方法的时候，会给ApplicationInfoManager注册一个监听器，在DiscoveryClient初始化的时候就会调用，注册这个监听器。
+
+​	搞了一个匿名内部类  通知InstanceInfoReplicator.onDemandUpdate()方法
+
+这里直接会调用DiscoveryClient.register()方法，完成一个服务的注册
+
+```java
+public class EurekaServiceRegistry implements ServiceRegistry<EurekaRegistration> {
+	@Override
+	public void register(EurekaRegistration reg) {
+		maybeInitializeClient(reg);
+
+		if (log.isInfoEnabled()) {
+			log.info("Registering application " + reg.getInstanceConfig().getAppname()
+					+ " with eureka with status "
+					+ reg.getInstanceConfig().getInitialStatus());
+		}
+		//ApplicationInfoManager.setInstanceStatus()调用的时候，会通知自己所有的注册的监听器，状态发生改变。DiscoveryClient.initScheduledTasks()方法的时候，会给ApplicationInfoManager注册一个监听器，在DiscoveryClient初始化的时候就会调用，注册这个监听器。
+		reg.getApplicationInfoManager()
+				.setInstanceStatus(reg.getInstanceConfig().getInitialStatus());
+
+		if (reg.getHealthCheckHandler() != null) {
+			reg.getEurekaClient().registerHealthCheck(reg.getHealthCheckHandler());
+		}
+	}
+}
+```
+
+### 10.2.3 总结
+
+​	1 核心启动配置类EurekaClientAutoConfiguration，完成了DiscoveryClient的构造和初始化，eureka client初始化和启动的流程，全部在DiscoveryClient中的。EurekaDiscoveryClient，自己对eureka原生的DiscoveryClient进行了一层封装和包装，实现了eureka的DiscoveryClient接口，依赖了一个原生的EurekaClient。提供了一些额外的方法的实现。
+
+​	2 EurekaClientConfigBean是，从application.yml中，将你的格式的配置项读取出来，通过这个bean来对外提供所有的eureka client相关的配置项的读取。实现的就是EurekaClientConfig接口。EurekaInstanceConfigBean，同理，加载application.yml中的服务实例相关的配置项。
+
+​	3 在原生的eureka client的注册里，其实eureka client启动之后，要延迟几十秒，才会去完成注册。EurekaAutoServiceRegistration，里面包含了一个start()方法，在这个spring boot启动之后，直接就会执行start()方法，我，一启动，不要按照原来的40秒才去注册，我一启动，直接就去执行一个注册。
+
+## 10.3 spring eureka server启动日志分析
+
+使用单节点方式启动eureka server
+
+```yaml
+server:
+  port: 8761
+eureka:
+  client:
+    registerWithEureka: false
+    fetchRegistry: false
+```
+
+启动
+
+![image-20210711165740628](Eureka.assets/image-20210711165740628.png)
+
+1 这几行日志，就说明了什么呢？系统启动，是先spring boot启动，启动自己内嵌的tomcat容器，将自己作为一个web应用在tomcat容器中来启动
+
+![image-20210711165933391](Eureka.assets/image-20210711165933391.png)
+
+2 **servletContainer** 从这一行就可以看出来什么呢？就是在spring cloud eureka server中，绝对是将jersey的核心过滤器，ServletContainer注册到了tomcat中去作为一个过滤器，拦截的是/eureka/*这个模式的请求，跟eureka server发出的这个请求，都会走jersey的过滤器，然后这些请求，会被交给后端的XXXResource来处理，XXXResource其实就是jersey框架的controller
+
+**PS:dispatcherServlet ，spring web mvc的核心servlet，拦截所有其他的这个请求组**
+
+![image-20210711170023406](Eureka.assets/image-20210711170023406.png)
+
+3 这种东西spring boot的监控提供的endpoint访问节点，可以让你比如请求/health，来看看应用的健康状况
+
+![image-20210711170347799](Eureka.assets/image-20210711170347799.png)
+
+4 启动相关初始化类
+
+**InstanceInfoFactory**:将服务实例的信息设置为STARTING，正在启动中
+
+**DiscoveryClient:**eureka server自己本身也是一个eureka client，所以这里很明显在构造自己的eureka client，构造DiscoveryClient(Client configured to neither register nor query for data.是因为你设置了不要注册也不要抓取注册表，所以这里的意思就是不注册，也不抓取注册表)
+
+**DefaultEurekaServerContext:** Initializing ...，，很明显，在构造自己的EurekaServerContext
+
+**PeerEurekaNodes:**初始化自己的PeerEurekaNodes，就是代表了eureka server集群
+
+**DefaultEurekaServerContext:** Initialized，EurekaSeverContext，很明显是初始化好了
+
+**EurekaServiceRegistry:** Registering application unknown with eureka with status UP，spring cloud自己扩展了一个EurekaServiceRegistry的类，这个类的意思，就是不要按照原来的延迟40秒去注册，就是spreing boot 一旦启动，就立即进行一次注册
+
+**EurekaServerBootstrap :**Initialized server context,这快是说是ServetContext初始化完成
+
+**PeerAwareInstanceRegistryImpl:** Changing status to UP ,这个的意思是说，从相邻的eureka server节点拉取了一个服务实例，就1个 (就是自己)  
+
+**EurekaServerInitializerConfiguration:** Started Eureka Server，完成eureka server的启动
+
+**PS:spring cloud整合eureka server，就是将原来人家BootStrap监听器里的初始化代码，放到spring boot auto configuration中去执行，在spring boot启动之后，然后来执行eureka server的初始化的代码**
+
+![image-20210711170936714](Eureka.assets/image-20210711170936714.png)
+
+5 evict task，EvictionTask，就是清理任务，每隔60s，每隔1分钟，后台线程会检查一次所有的服务注册表中的服务，如果在90 * 2 = 180s内，没有心跳过来，那么就认为这个服务实例挂了，就把这个服务实例给摘除
+
+![image-20210711171524986](Eureka.assets/image-20210711171524986.png)
