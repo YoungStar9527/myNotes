@@ -87,6 +87,10 @@ web服务被调用结果：
 
 ​	实验结果是什么呢？ribbon很棒，就是帮我们完成一个服务部署多个实例的时候，负载均衡的活儿，没问题，可以干到。10次请求，均匀分布在了两个服务实例上，每个服务实例承载了5次请求。
 
+分布式系统的负载均衡调用图  :
+
+![image-20210714195811040](Ribbon.assets/image-20210714195811040.png)
+
 ## 1.3 netflix ribbon的负载均衡器的原生接口以及内置的规则(rule)
 
 ​	默认使用round robin轮询策略，直接从服务器列表里轮询
@@ -237,4 +241,298 @@ public RestTemplate getRestTemplate() {
 
 ​	ILoadBalancer里面包含IRule和IPing，IRule负责从一堆server list中根据负载均衡的算法，选择出来某个server，关键是，server list从哪儿来？
 
-![image-20210713204308541](Ribbon.assets/image-20210713204308541.png)
+<img src="Ribbon.assets/image-20210713204308541.png" alt="image-20210713204308541" style="zoom: 200%;" />
+
+# 2 ribbon入口源码解读
+
+## 2.1 通过LoadBalanced注解作为突破口来找找线索
+
+这个注解的意思，其实说什么呢？将一个RestTemplate标志为底层采用LoadBalancerClient来执行实际的http请求，支持负载均衡
+
+```java
+	//LoadBalanced属于org.springframework.cloud.client.loadbalancer包下
+	//属于spring-clound-commons这个项目
+	@Bean
+	@LoadBalanced
+	public RestTemplate getRestTemplate() {
+		return new RestTemplate();
+	}
+```
+
+LoadBalanced注解
+
+```java
+@Target({ ElementType.FIELD, ElementType.PARAMETER, ElementType.METHOD })
+@Retention(RetentionPolicy.RUNTIME)
+@Documented
+@Inherited
+@Qualifier
+public @interface LoadBalanced {
+}
+
+```
+
+对应类，及包中相关类
+
+![image-20210714200823012](Ribbon.assets/image-20210714200823012.png)
+
+一般来说，如果是spring cloud或者是spring boot相关的项目，一定会有一个XXAutoConfiguraiton的一个东西
+
+有 AsyncLoadBalancerAutoConfiguration 及**LoadBalancerAutoConfiguration** 相关类后缀为AutoConfiguation
+
+ AsyncLoadBalancerAutoConfiguration 一看就是为支持异步负载均衡请求相关类，目前没有涉及到异步请求，所以只需关注LoadBalancerAutoConfiguration即可
+
+**LoadBalancerAutoConfiguration类：**Ribbon配置加载核心类
+
+```java
+@Configuration
+@ConditionalOnClass(RestTemplate.class)
+@ConditionalOnBean(LoadBalancerClient.class)
+@EnableConfigurationProperties(LoadBalancerRetryProperties.class)
+public class LoadBalancerAutoConfiguration {
+
+	@LoadBalanced
+	@Autowired(required = false)
+	private List<RestTemplate> restTemplates = Collections.emptyList();
+
+    //SmartInitializingSingleton一看就是初始化相关的东西，就是在系统启动的时候，一定会在某个时机来执行的
+	@Bean
+	public SmartInitializingSingleton loadBalancedRestTemplateInitializer(
+			final List<RestTemplateCustomizer> customizers) {
+		return new SmartInitializingSingleton() {
+            
+            //afterSingletonsInstantiated()这个方法，一看就是在spring singleton bean实例化完了之后来执行的
+			@Override
+			public void afterSingletonsInstantiated() {
+                //RestTemplate list是从哪儿来的呢？是LoadBalanced对应注解方法中实例化返回的RestTemplate
+                ///RestTemplate list加载涉及到spring及spring boot相关源码知识，这里就不做展开了
+				for (RestTemplate restTemplate : LoadBalancerAutoConfiguration.this.restTemplates) {
+					for (RestTemplateCustomizer customizer : customizers) {
+                        //Cutomizer（专门用来定制化RestTemplate的组件）,用每个Customizer来定制每个RestTemplate
+						customizer.customize(restTemplate);
+					}
+				}
+			}
+		};
+	}
+
+	@Autowired(required = false)
+	private List<LoadBalancerRequestTransformer> transformers = Collections.emptyList();
+
+	@Bean
+	@ConditionalOnMissingBean
+	public LoadBalancerRequestFactory loadBalancerRequestFactory(
+			LoadBalancerClient loadBalancerClient) {
+        //初始化，实例化 LoadBalancerRequestFactory
+		return new LoadBalancerRequestFactory(loadBalancerClient, transformers);
+	}
+
+	@Configuration
+	@ConditionalOnMissingClass("org.springframework.retry.support.RetryTemplate")
+	static class LoadBalancerInterceptorConfig {
+		@Bean
+		public LoadBalancerInterceptor ribbonInterceptor(
+				LoadBalancerClient loadBalancerClient,
+				LoadBalancerRequestFactory requestFactory) {
+            //设置的那个拦截器，很明显就是LoadBalancerInterceptor
+            //初始化，实例化 LoadBalancerInterceptor
+			return new LoadBalancerInterceptor(loadBalancerClient, requestFactory);
+		}
+
+		@Bean
+		@ConditionalOnMissingBean
+		public RestTemplateCustomizer restTemplateCustomizer(
+				final LoadBalancerInterceptor loadBalancerInterceptor) {/
+            //RestTemplateCustomizer，一看就是专门对RestTemplate进行定制化的一个组件
+			return new RestTemplateCustomizer() {
+				@Override
+				public void customize(RestTemplate restTemplate) {
+					List<ClientHttpRequestInterceptor> list = new ArrayList<>(
+							restTemplate.getInterceptors());
+                    //list里放了一个ClientHttpRequestInterceptor，interceptor，拦截器，给RestTemplate设置了一个拦截器
+					list.add(loadBalancerInterceptor);
+					restTemplate.setInterceptors(list);
+				}
+			};
+		}
+	}
+
+........................................
+
+
+}
+
+```
+
+**总结：**
+
+（1）@LoadBalanced注解入手，线索直接断掉
+
+（2）给大家一个经验技巧，从这个注解所在的项目和包下面入手，来找找相关的东西，有什么线索
+
+（3）spring boot和spring cloud相关的类，你别想多了，直接找XXXAutoConfiguraiton的类，就知道是怎么回事
+
+（4）找到了这个LoadBalancerAutoConfiguration，在这个类里面就有了重大的突破
+
+（5）里面有一个List<RestTemplate>，推测就是我们创建的那个RestTemplate会放到这里来
+
+（6）用这个RestTemplateCustomizer对每个RestTemplate进行了定制化，给每个RestTemplate设置了interceptor
+
+（7）具体是哪个interceptor呢？LoadBalancerInterceptor，拦截器
+
+流程图：
+
+![image-20210714210125192](Ribbon.assets/image-20210714210125192.png)
+
+## 2.2 spring cloud通过拦截器机制改变了RestTemplate的行为
+
+拦截器是干嘛用的? 就是如果你对一个东西发起一个请求，那么会被拦截器给拦截掉，由拦截器先来处理一下
+
+​	如果我们对RestTemplate执行某个操作，比如说restTemplate.getForObject()操作，相当于是希望发起一个http请求，请求一个服务的接口，**此时不会由RestTemplate自己原生的功能来实现**
+
+**而是会由拦截器来实现这个请求http服务的一个功能**
+
+```java
+public class LoadBalancerInterceptor implements ClientHttpRequestInterceptor {
+
+	private LoadBalancerClient loadBalancer;
+	private LoadBalancerRequestFactory requestFactory;
+
+	public LoadBalancerInterceptor(LoadBalancerClient loadBalancer, LoadBalancerRequestFactory requestFactory) {
+		this.loadBalancer = loadBalancer;
+		this.requestFactory = requestFactory;
+	}
+
+	public LoadBalancerInterceptor(LoadBalancerClient loadBalancer) {
+		// for backwards compatibility
+		this(loadBalancer, new LoadBalancerRequestFactory(loadBalancer));
+	}
+
+    //在执行下面那行intercept的时候，其实是将这个请求给封装了一下，将http://ServiceA/sayHello/封装到了HttpRequest里面去
+    //intercept(拦截)
+    //然后将HttpRequest加上其他的一些组件和数据，比如说byte[] body
+    //如果你发送请求的时候，带上了一个json串，一定是放请求体里面的，请求体里面的json串就会作为byte[] body传进来
+    //ClientHttpRequestExecution（是负责底层的http通信的组件）
+	@Override
+	public ClientHttpResponse intercept(final HttpRequest request, final byte[] body,
+			final ClientHttpRequestExecution execution) throws IOException {
+        //获取到的就是：http://ServiceA/sayHello/leo对应URI
+		final URI originalUri = request.getURI();
+        //获取到的就是：ServiceA
+        //serviceName，服务名称，就是获取到的那个ServiceA
+		String serviceName = originalUri.getHost();
+        //如果你的获取到的服务名称是null，那么就打印异常日志，告诉你，你的请求的url地址里面没有包含合格的hostname主机名
+		Assert.state(serviceName != null, "Request URI does not contain a valid hostname: " + originalUri);
+        //最终执行了LoadBalancerClient的execute方法
+		return this.loadBalancer.execute(serviceName, requestFactory.createRequest(request, body, execution));
+	}
+}
+```
+
+**方法调用与拦截器**
+
+```java
+restTemplate.getForObject("http://ServiceA/sayHello/leo", String.class);
+
+//相当于是底层调用了拦截器里的intercept()方法，实际的这个请求的逻辑，不再由RestTemplate原来原生的默认的逻辑来实现，而是由intercept()拦截方法来实现了
+```
+
+**总结：**
+
+1 梳理清楚了一个东西：LoadBalancerInterceptor，拦截掉RestTemplate所有的执行的请求，
+
+2 这个内部就干一件事儿，就是从你的url地址里获取hostname作为服务名称，就是你要请求的服务的名称，
+
+3 就是找LoadBalancerClient去执行	对应的负载均衡的请求，将解析出来的服务名称穿进去，
+
+4 还有就是基于RequestFactory创建出来的一个request
+
+## 2.3 LoadBalancerClient是从哪来的(具体实例化代码及相关实现)
+
+对应代码都在 spring-cloud-netflix-core这个包里面
+
+![image-20210715205739052](Ribbon.assets/image-20210715205739052.png)
+
+LoadBalancerClient是一个接口，所以需要一个实现类来实例化相关操作，RibbonLoadBalancerClient就是实现类
+
+而在RibbonAutoConfiguation就是将RibbonLoadBalancerClient实例化Bean
+
+```java
+//AutoConfigureAfter注解(after)明确说明了，这个RibbonAutoConfiguraion，是在EurekaClientAutoConfiguration之后来执行的，也就是说eureka必须先初始化完，才会轮到ribbon来初始化
+//AutoConfigureBefore(before),这个RibbonAutoConfiguration，必须在之前看的那个LoadBalancerAutoConfiguration之前来执行，LoadBalancerAutoConfiguration触发的一些列的代码，是依赖于LoadBalancerClient的
+@Configuration
+@ConditionalOnClass({ IClient.class, RestTemplate.class, AsyncRestTemplate.class, Ribbon.class})
+@RibbonClients
+@AutoConfigureAfter(name = "org.springframework.cloud.netflix.eureka.EurekaClientAutoConfiguration")
+@AutoConfigureBefore({LoadBalancerAutoConfiguration.class, AsyncLoadBalancerAutoConfiguration.class})
+@EnableConfigurationProperties({RibbonEagerLoadProperties.class, ServerIntrospectorProperties.class})
+public class RibbonAutoConfiguration {
+............................
+	@Bean
+	@ConditionalOnMissingBean(LoadBalancerClient.class)
+	public LoadBalancerClient loadBalancerClient() {
+		return new RibbonLoadBalancerClient(springClientFactory());
+	}
+................
+
+}
+```
+
+扩展-ribbon相关包说明：
+
+![image-20210715210148183](Ribbon.assets/image-20210715210148183.png)
+
+（1）ribbon-2.2.5.jar：理解为ribbon的内核级别的比较核心的一些组件
+
+（2）ribbon-transport-2.2.5.jar：基于netty封装的特别底层的进行http、tcp、udp各种协议的网络通信的组件
+
+（3）ribbon-core-2.2.5.jar：推测这是ribbon比较基础性的一些通用的代码组件
+
+（4）ribbon-httpclient-2.2.5.jar：是ribbon底层的http网络通信的一些组件
+
+（5）ribbon-loadbalancer-2.2.5.jar：都是ribbon最最核心的原生的API
+
+**PS:最终会发现，在LoadBalancerInterceptor拦截器里，会将RestTemplate的方法和请求转发给RibbonLoadBalancerClient.execute()方法去执行**
+
+
+
+## 2.4 对spring cloud整合ribbon源码的初步调试
+
+调试下execute方法，查看负载均衡效果
+
+```java
+public class RibbonLoadBalancerClient implements LoadBalancerClient {
+	@Override
+	public <T> T execute(String serviceId, LoadBalancerRequest<T> request) throws IOException {
+		ILoadBalancer loadBalancer = getLoadBalancer(serviceId);
+        //getServer就是获取负载均衡后真正调用的服务
+		Server server = getServer(loadBalancer);
+		if (server == null) {
+			throw new IllegalStateException("No instances available for " + serviceId);
+		}
+		RibbonServer ribbonServer = new RibbonServer(serviceId, server, isSecure(server,
+				serviceId), serverIntrospector(serviceId).getMetadata(server));
+
+		return execute(serviceId, ribbonServer, request);
+	}
+}
+```
+
+第一次：
+
+![image-20210715212649218](Ribbon.assets/image-20210715212649218.png)
+
+第二次：
+
+![image-20210715212722997](Ribbon.assets/image-20210715212722997.png)
+
+通过断点调试得知LoadBalancerClient获取server方法通过了负载均衡的方式获取具体地址请求
+
+
+
+
+
+
+
+
+
