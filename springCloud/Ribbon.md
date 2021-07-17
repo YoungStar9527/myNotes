@@ -423,7 +423,7 @@ public class LoadBalancerInterceptor implements ClientHttpRequestInterceptor {
 		String serviceName = originalUri.getHost();
         //如果你的获取到的服务名称是null，那么就打印异常日志，告诉你，你的请求的url地址里面没有包含合格的hostname主机名
 		Assert.state(serviceName != null, "Request URI does not contain a valid hostname: " + originalUri);
-        //最终执行了LoadBalancerClient的execute方法
+        //最终执行了LoadBalancerClient的execute方法 PS:2.3
 		return this.loadBalancer.execute(serviceName, requestFactory.createRequest(request, body, execution));
 	}
 }
@@ -446,6 +446,14 @@ restTemplate.getForObject("http://ServiceA/sayHello/leo", String.class);
 3 就是找LoadBalancerClient去执行	对应的负载均衡的请求，将解析出来的服务名称穿进去，
 
 4 还有就是基于RequestFactory创建出来的一个request
+
+流程图：
+
+![image-20210717160355688](Ribbon.assets/image-20210717160355688.png)
+
+**流程图整合（2.1-2.2 LoadBlanceled注解是如何改变RestTemplate行为的）：**
+
+https://www.processon.com/view/link/60f2996df346fb3f34141685
 
 ## 2.3 LoadBalancerClient是从哪来的(具体实例化代码及相关实现)
 
@@ -496,7 +504,7 @@ public class RibbonAutoConfiguration {
 
 
 
-## 2.4 对spring cloud整合ribbon源码的初步调试
+## 2.4 核心代码LoadBalancerClient.execute(对spring cloud整合ribbon源码的初步调试)
 
 调试下execute方法，查看负载均衡效果
 
@@ -504,6 +512,7 @@ public class RibbonAutoConfiguration {
 public class RibbonLoadBalancerClient implements LoadBalancerClient {
 	@Override
 	public <T> T execute(String serviceId, LoadBalancerRequest<T> request) throws IOException {
+        //getLoadBalancer获取ILoadBalancer PS:2.5
 		ILoadBalancer loadBalancer = getLoadBalancer(serviceId);
         //getServer就是获取负载均衡后真正调用的服务
 		Server server = getServer(loadBalancer);
@@ -528,9 +537,453 @@ public class RibbonLoadBalancerClient implements LoadBalancerClient {
 
 通过断点调试得知LoadBalancerClient获取server方法通过了负载均衡的方式获取具体地址请求
 
+## 2.5 spring cloud与ribbon整合时的默认ILoadBalancer(怎么获取到的)
 
+核心入口：RibbonLoadBalancerClient
 
+先来研究第一步：如何创建ILoadBalancer的，使用功能的是哪个ILoadBalancer呢？
 
+```java
+public class RibbonLoadBalancerClient implements LoadBalancerClient {
+    
+    //这块一定是对spring进行了一定程度上的封装，封装了一些东西，从spring里面获取bean的入口，都变成了这个spring cloud ribbon自己的SpringClientFactory
+	private SpringClientFactory clientFactory;
+
+    //我根据一个服务名，serviceId，类似ServiceA这样的一个服务名称
+	protected ILoadBalancer getLoadBalancer(String serviceId) {
+		return this.clientFactory.getLoadBalancer(serviceId);
+	}
+}
+
+public class SpringClientFactory extends NamedContextFactory<RibbonClientSpecification> {
+    public ILoadBalancer getLoadBalancer(String name) {
+		return getInstance(name, ILoadBalancer.class);
+	}
+    
+    @Override
+	public <C> C getInstance(String name, Class<C> type) {
+		C instance = super.getInstance(name, type);
+		if (instance != null) {
+			return instance;
+		}
+		IClientConfig config = getInstance(name, IClientConfig.class);
+		return instantiateWithConfig(getContext(name), type, config);
+	}
+}
+
+public abstract class NamedContextFactory<C extends NamedContextFactory.Specification>
+		implements DisposableBean, ApplicationContextAware {
+    
+    //存放对应服务的map
+    private Map<String, AnnotationConfigApplicationContext> contexts = new ConcurrentHashMap<>();
+    
+  	public <T> T getInstance(String name, Class<T> type) {
+		AnnotationConfigApplicationContext context = getContext(name);
+		if (BeanFactoryUtils.beanNamesForTypeIncludingAncestors(context,
+				type).length > 0) {
+			return context.getBean(type);
+		}
+		return null;
+	}
+    
+    //就是说，对每个服务名称，你要调用的每个服务，对应着服务名称，都有一个对应的spring的ApplicationContext容器，ServiceA对应着一个自己的独立的spring的ApplicationContext容器
+    protected AnnotationConfigApplicationContext getContext(String name) {
+		if (!this.contexts.containsKey(name)) {
+			synchronized (this.contexts) {
+				if (!this.contexts.containsKey(name)) {
+					this.contexts.put(name, createContext(name));
+				}
+			}
+		}
+		return this.contexts.get(name);
+	}
+}
+```
+
+​	很明确了，在SpringClientFactory里面，一个服务（比如说ServiceA） => 对应着一个独立的ApplicationContext，
+
+​	里面包含了自己这个服务的独立的一堆的组件，比如说LoadBalancer。如果要获取一个服务对应的LoadBalancer，
+
+​	**其实就是在自己的那个ApplicationContext里面去获取那个LoadBalancer即可。根据ILoadBalancer接口类型，获取一个ILoadBalancer接口类型的实例化的bean即可**
+
+​	**RibbonClientConfiguration：在这个里面可以找到对应的ILoadBalancer的实例bean**
+
+```java
+@Configuration
+@EnableConfigurationProperties
+//Order is important here, last should be the default, first should be optional
+// see https://github.com/spring-cloud/spring-cloud-netflix/issues/2086#issuecomment-316281653
+@Import({HttpClientConfiguration.class, OkHttpRibbonConfiguration.class, RestClientRibbonConfiguration.class, HttpClientRibbonConfiguration.class})
+public class RibbonClientConfiguration {
+	@Bean
+	@ConditionalOnMissingBean
+	public ILoadBalancer ribbonLoadBalancer(IClientConfig config,
+			ServerList<Server> serverList, ServerListFilter<Server> serverListFilter,
+			IRule rule, IPing ping, ServerListUpdater serverListUpdater) {
+		if (this.propertiesFactory.isSet(ILoadBalancer.class, name)) {
+			return this.propertiesFactory.get(ILoadBalancer.class, config, name);
+		}
+        //由此可见ZoneAwareLoadBalancer就是对应对应的ILoadBalancer的实例bean(实现类)
+        //ZoneAwareLoadBalancer的父类是：DynamicServerListLoadBalancer，他的父类又是：BaseLoadBalancer
+		return new ZoneAwareLoadBalancer<>(config, rule, ping, serverList,
+				serverListFilter, serverListUpdater);
+	}
+}
+```
+
+​	**PS:如果你要找一个bean，要么就在XXAutoConfiguration里面找，要么就是在XXConfiguration里面找。。。spring cloud或者是spring boot的项目的一个特点，去找bean**
+
+**流程图：**
+
+![image-20210717160240567](Ribbon.assets/image-20210717160240567.png)
+
+## 2.6 ribbon通过和eureka整合获取服务注册表
+
+**LoadBalancer->ZoneAwareLoadBalancer**
+
+​	LoadBalancer内部，必须要去获取到当前要访问的这个服务的server list。访问一个服务，那么就要获取一个LoadBalancer实例，**在LoadBalancer实例内部，必须是有这个服务的server list**。
+
+​	这样的话，才知道如何对这个服务进行负载均衡的访问
+
+```java
+public class ZoneAwareLoadBalancer<T extends Server> extends DynamicServerListLoadBalancer<T> {
+    
+    //这个ServerList是一个接口
+    public ZoneAwareLoadBalancer(IClientConfig clientConfig, IRule rule,
+                                 IPing ping, ServerList<T> serverList, ServerListFilter<T> filter,
+                                 ServerListUpdater serverListUpdater) {
+        super(clientConfig, rule, ping, serverList, filter, serverListUpdater);
+    }
+}
+```
+
+​	1 在创建ZoneAwareLoadBalancer实例的时候，通过调用其父类DynamicServerListLoadBalancer的构造函数，调用了restOfInit()方法，调用了**updateListOfServers()方法**，
+
+​	2 通过这个方法，从eureka client那里获取到ServiceA的server list
+
+​	3 将获取到的serverList更新到父类BaseLoadBalancer的属性中
+
+```java
+public class DynamicServerListLoadBalancer<T extends Server> extends BaseLoadBalancer {
+    
+    //存放ServerList接口的实例
+    volatile ServerList<T> serverListImpl;
+    
+    public DynamicServerListLoadBalancer(IClientConfig clientConfig, IRule rule, IPing ping,
+                                         ServerList<T> serverList, ServerListFilter<T> filter,
+                                         ServerListUpdater serverListUpdater) {
+        super(clientConfig, rule, ping);
+        //将传进来的ServerList赋给成员变量
+        this.serverListImpl = serverList;
+        this.filter = filter;
+        this.serverListUpdater = serverListUpdater;
+        if (filter instanceof AbstractServerListFilter) {
+            ((AbstractServerListFilter) filter).setLoadBalancerStats(getLoadBalancerStats());
+        }
+        restOfInit(clientConfig);
+    }
+    
+    void restOfInit(IClientConfig clientConfig) {
+        boolean primeConnection = this.isEnablePrimingConnections();
+        // turn this off to avoid duplicated asynchronous priming done in BaseLoadBalancer.setServerList()
+        this.setEnablePrimingConnections(false);
+        //初始化注册表更新线程
+        enableAndInitLearnNewServersFeature();
+		//更新server list
+        updateListOfServers();
+        if (primeConnection && this.getPrimeConnections() != null) {
+            this.getPrimeConnections()
+                    .primeConnections(getReachableServers());
+        }
+        this.setEnablePrimingConnections(primeConnection);
+        LOGGER.info("DynamicServerListLoadBalancer for client {} initialized: {}", clientConfig.getClientName(), this.toString());
+    }
+    
+    @VisibleForTesting
+    public void updateListOfServers() {
+        List<T> servers = new ArrayList<T>();
+        if (serverListImpl != null) {
+            //通过这个方法，从eureka client那里获取到ServiceA的server list
+            servers = serverListImpl.getUpdatedListOfServers();
+            LOGGER.debug("List of Servers for {} obtained from Discovery client: {}",
+                    getIdentifier(), servers);
+
+            if (filter != null) {
+                servers = filter.getFilteredListOfServers(servers);
+                LOGGER.debug("Filtered List of Servers for {} obtained from Discovery client: {}",
+                        getIdentifier(), servers);
+            }
+        }
+        //将获取到的serverList更新到父类BaseLoadBalancer的属性中
+        updateAllServerList(servers);
+    }
+}
+```
+
+我现在需要去**找ServerList的具体实例化代码**，他的getUpdatedListOfServers的方法的实现，**就是从erueka那儿获取服务的注册列表的实现代码**
+
+在spring-cloud-netflix-eureka-client工程下
+
+![image-20210717185802535](Ribbon.assets/image-20210717185802535.png)
+
+真正实例化ServerList的代码
+
+```java
+@Configuration
+public class EurekaRibbonClientConfiguration {
+    
+    //真正实例化ServerList的代码
+	@Bean
+	@ConditionalOnMissingBean
+	public ServerList<?> ribbonServerList(IClientConfig config, Provider<EurekaClient> eurekaClientProvider) {
+		if (this.propertiesFactory.isSet(ServerList.class, serviceId)) {
+			return this.propertiesFactory.get(ServerList.class, config, serviceId);
+		}
+		DiscoveryEnabledNIWSServerList discoveryServerList = new DiscoveryEnabledNIWSServerList(
+				config, eurekaClientProvider);
+		DomainExtractingServerList serverList = new DomainExtractingServerList(
+				discoveryServerList, config, this.approximateZoneFromHostname);
+		return serverList;
+	}
+}
+```
+
+​	就在obtainServersViaDiscovery()方法里面，我们发现了一堆euerka的代码，**从eureka client中获取到注册表，从注册表里可以获取到当前这个服务的ServiceA对应的server list**
+
+```java
+public class DomainExtractingServerList implements ServerList<DiscoveryEnabledServer> {
+    
+    //ServerList赋值成员变量
+	private ServerList<DiscoveryEnabledServer> list;
+
+	private IClientConfig clientConfig;
+
+	private boolean approximateZoneFromHostname;
+
+    //传进来的ServerList
+	public DomainExtractingServerList(ServerList<DiscoveryEnabledServer> list,
+			IClientConfig clientConfig, boolean approximateZoneFromHostname) {
+		this.list = list;
+		this.clientConfig = clientConfig;
+		this.approximateZoneFromHostname = approximateZoneFromHostname;
+	}
+	
+	@Override
+	public List<DiscoveryEnabledServer> getUpdatedListOfServers() {
+        //this.list才是真正执行getUpdatedListOfServers逻辑
+		List<DiscoveryEnabledServer> servers = setZones(this.list
+				.getUpdatedListOfServers());
+		return servers;
+	}
+}
+
+public class DiscoveryEnabledNIWSServerList extends AbstractServerList<DiscoveryEnabledServer>{
+    
+    String vipAddresses;
+    
+    @Override
+    public List<DiscoveryEnabledServer> getUpdatedListOfServers(){
+        return obtainServersViaDiscovery();
+    }
+
+    //真正获取ServerList的逻辑
+    private List<DiscoveryEnabledServer> obtainServersViaDiscovery() {
+        List<DiscoveryEnabledServer> serverList = new ArrayList<DiscoveryEnabledServer>();
+
+        if (eurekaClientProvider == null || eurekaClientProvider.get() == null) {
+            logger.warn("EurekaClient has not been initialized yet, returning an empty list");
+            return new ArrayList<DiscoveryEnabledServer>();
+        }
+		//获取EurekaClent
+        EurekaClient eurekaClient = eurekaClientProvider.get();
+        //vipAddresses就是服务名(ServiceA)
+        if (vipAddresses!=null){
+            for (String vipAddress : vipAddresses.split(",")) {
+                // if targetRegion is null, it will be interpreted as the same region of client
+                //getInstancesByVipAddress通过eurekaClient相关方法获取服务实例(注册表)
+                List<InstanceInfo> listOfInstanceInfo = eurekaClient.getInstancesByVipAddress(vipAddress, isSecure, targetRegion);
+                for (InstanceInfo ii : listOfInstanceInfo) {
+                    if (ii.getStatus().equals(InstanceStatus.UP)) {
+
+                        if(shouldUseOverridePort){
+                            if(logger.isDebugEnabled()){
+                                logger.debug("Overriding port on client name: " + clientName + " to " + overridePort);
+                            }
+
+                            // copy is necessary since the InstanceInfo builder just uses the original reference,
+                            // and we don't want to corrupt the global eureka copy of the object which may be
+                            // used by other clients in our system
+                            InstanceInfo copy = new InstanceInfo(ii);
+
+                            if(isSecure){
+                                ii = new InstanceInfo.Builder(copy).setSecurePort(overridePort).build();
+                            }else{
+                                ii = new InstanceInfo.Builder(copy).setPort(overridePort).build();
+                            }
+                        }
+					//从注册表获取对应服务(ServerA)的serverList
+                        DiscoveryEnabledServer des = new DiscoveryEnabledServer(ii, isSecure, shouldUseIpAddr);
+                        des.setZone(DiscoveryClient.getZone(ii));
+                        serverList.add(des);
+                    }
+                }
+                if (serverList.size()>0 && prioritizeVipAddressBasedServers){
+                    break; // if the current vipAddress has servers, we dont use subsequent vipAddress based servers
+                }
+            }
+        }
+        return serverList;
+    }
+}
+```
+
+**总结：**
+
+​	1 在创建ZoneAwareLoadBalancer实例的时候，通过调用其父类DynamicServerListLoadBalancer的构造函数，调用了restOfInit()方法，调用了updateListOfServers()方法，
+
+​	2 通过这个方法，从eureka client那里获取到ServiceA的server list
+
+​	3 将获取到的serverList更新到父类BaseLoadBalancer的属性中
+
+**流程图：**
+
+![image-20210717191653218](Ribbon.assets/image-20210717191653218.png)
+
+**完整流程图（2.5-2.6 如何获取到LoadBalancer及其注册表 ）：**
+
+https://www.processon.com/view/link/60f2c66a0e3e74539274f88c
+
+## 2.7 ribbon的服务注册表更新机制
+
+​	eureka client自己本身，是不断的去从eureka server每隔30秒更新一次注册表，拉取增量注册表，所以说ribbon和eureka整合的机制里，肯定得有一个组件，负责每隔一定的时间，从本地的eureka client里刷新一下服务的注册表到LoadBalancer中
+
+```java
+public class DynamicServerListLoadBalancer<T extends Server> extends BaseLoadBalancer {
+    
+    protected volatile ServerListUpdater serverListUpdater;
+    
+    public DynamicServerListLoadBalancer(IClientConfig clientConfig, IRule rule, IPing ping,
+                                         ServerList<T> serverList, ServerListFilter<T> filter,
+                                         ServerListUpdater serverListUpdater) {
+        super(clientConfig, rule, ping);
+        this.serverListImpl = serverList;
+        this.filter = filter;
+        //构造传入serverListUpdater
+        this.serverListUpdater = serverListUpdater;
+        if (filter instanceof AbstractServerListFilter) {
+            ((AbstractServerListFilter) filter).setLoadBalancerStats(getLoadBalancerStats());
+        }
+        restOfInit(clientConfig);
+    }
+    
+    //UpdateAction更新注册表相关
+    protected final ServerListUpdater.UpdateAction updateAction = new ServerListUpdater.UpdateAction() {
+        @Override
+        public void doUpdate() {
+            //调用真正的更新方法
+            updateListOfServers();
+        }
+    };
+    
+    //更新注册表
+    @VisibleForTesting
+    public void updateListOfServers() {
+        List<T> servers = new ArrayList<T>();
+        if (serverListImpl != null) {
+            //获取注册表
+            servers = serverListImpl.getUpdatedListOfServers();
+            LOGGER.debug("List of Servers for {} obtained from Discovery client: {}",
+                    getIdentifier(), servers);
+
+            if (filter != null) {
+                servers = filter.getFilteredListOfServers(servers);
+                LOGGER.debug("Filtered List of Servers for {} obtained from Discovery client: {}",
+                        getIdentifier(), servers);
+            }
+        }
+        //更新注册表
+        updateAllServerList(servers);
+    }
+    
+    void restOfInit(IClientConfig clientConfig) 
+        boolean primeConnection = this.isEnablePrimingConnections();
+        // turn this off to avoid duplicated asynchronous priming done in BaseLoadBalancer.setServerList()
+        this.setEnablePrimingConnections(false);
+        //初始化注册表更新线程
+        enableAndInitLearnNewServersFeature();
+...............................
+    public void enableAndInitLearnNewServersFeature() {
+        LOGGER.info("Using serverListUpdater {}", serverListUpdater.getClass().getSimpleName());
+    	//这里由serverListUpdater将updateAction放入start方法,初始化定时任务
+        serverListUpdater.start(updateAction);
+    }
+}
+```
+
+ServerListUpdater是谁呢？在RibbonClientConfiguration中实例化bean，并传进来的
+
+```java
+@Configuration
+@EnableConfigurationProperties
+//Order is important here, last should be the default, first should be optional
+// see https://github.com/spring-cloud/spring-cloud-netflix/issues/2086#issuecomment-316281653
+@Import({HttpClientConfiguration.class, OkHttpRibbonConfiguration.class, RestClientRibbonConfiguration.class, HttpClientRibbonConfiguration.class})
+public class RibbonClientConfiguration {
+
+	@Bean
+	@ConditionalOnMissingBean
+	public ServerListUpdater ribbonServerListUpdater(IClientConfig config) {
+		return new PollingServerListUpdater(config);
+	}
+}
+```
+
+​	在PollingServerListUpdater中，创建了一个Runnable线程，里面就是执行UpdateAction的行为,在延迟一定的时间过后，每隔一定的时间就执行一下那个Runnable线程，就会执行UpdateAction中的操作来刷新注册表，从eureka client中获取注册表，然后刷新到LoadBalancer中去
+
+​	默认的是1秒钟过后，会第一次执行那个Runnable线程，以后是每隔30秒执行一下那个Runnable线程，就去从eureka client刷新注册表到自己的ribbon的LoadBalancer中来
+
+```java
+public class PollingServerListUpdater implements ServerListUpdater {
+    @Override
+    public synchronized void start(final UpdateAction updateAction) {
+        if (isActive.compareAndSet(false, true)) {
+            final Runnable wrapperRunnable = new Runnable() {
+                @Override
+                public void run() {
+                    if (!isActive.get()) {
+                        if (scheduledFuture != null) {
+                            scheduledFuture.cancel(true);
+                        }
+                        return;
+                    }
+                    try {
+                        //线程调用对应action的更新注册表方法
+                        updateAction.doUpdate();
+                        lastUpdated = System.currentTimeMillis();
+                    } catch (Exception e) {
+                        logger.warn("Failed one update cycle", e);
+                    }
+                }
+            };
+			//默认的是1秒钟过后，会第一次执行那个Runnable线程，以后是每隔30秒执行一下那个Runnable线程
+            scheduledFuture = getRefreshExecutor().scheduleWithFixedDelay(
+                    wrapperRunnable,
+                	//默认1000ms,1秒
+                    initialDelayMs,
+                	//默认30*1000ms,30秒
+                    refreshIntervalMs,
+                    TimeUnit.MILLISECONDS
+            );
+        } else {
+            logger.info("Already active, no-op");
+        }
+    }
+}
+```
+
+**流程图：**
+
+https://www.processon.com/view/link/60f2f3e0637689739c3b30c0
 
 
 
