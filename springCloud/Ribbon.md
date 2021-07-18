@@ -93,6 +93,8 @@ web服务被调用结果：
 
 ## 1.3 netflix ribbon的负载均衡器的原生接口以及内置的规则(rule)
 
+### 1.3.1 样例及自定义负载均衡规则
+
 ​	默认使用round robin轮询策略，直接从服务器列表里轮询
 
 RestClient内部，底层，就是基于默认的BaseLoadBalancer来选择一个server
@@ -165,6 +167,30 @@ public class MyRule implements IRule {
 2 说这个，主要是，负载均衡的一些底层API罢了，主要是ILoadBalancer和IRule
 
 3 但是如果在后面要把这里做的比较复杂的话，很有可能会站在一些内置的Rule的基础之上，吸收他们的源码，自己定制一个复杂的高阶的涵盖很多功能的负载均衡器
+
+**PS:ribbon主打的就是负载均衡，网络通信，别的一些东西，都是次要，只要是看ribbon提供的各种负载均衡的算法的实现，另外一个是看ribbon + eureka + spring cloud如何整合使用的，看看ribbon源码里面去找比较重要的一些配置的参数**
+
+### 1.3.2  ribbon内置负载均衡规则
+
+**RoundRobinRule**：系统内置的默认负载均衡规范，直接round robin轮询，从一堆server list中，不断的轮询选择出来一个server，每个server平摊到的这个请求，基本上是平均的
+
+**AvailabilityFilteringRule**：这个rule就是会考察服务器的可用性
+
+​	如果3次连接失败，就会等待30秒后再次访问；如果不断失败，那么等待时间会不断边长
+
+​	如果某个服务器的并发请求太高了，那么会绕过去，不再访问
+
+**WeightedResponseTimeRule**：带着权重的，每个服务器可以有权重，权重越高优先访问，如果某个服务器响应时间比较长，那么权重就会降低，减少访问
+
+**ZoneAvoidanceRule**：根据区域和服气来进行负载均衡，说白了，就是机房的意思
+
+**BestAvailableRule**：忽略那些连接失败的服务器，然后尽量找并发比较低的服务器来请求
+
+**RandomRule**：随机找一个服务器
+
+**RetryRule**：可以重试，就是通过round robin找到的服务器请求失败，可以重新找一个服务器
+
+
 
 ## 1.4 ribbon原生API中用于定时ping服务器判断其是否存活的接口（ping）
 
@@ -1122,7 +1148,7 @@ public class BaseLoadBalancer extends AbstractLoadBalancer implements
 }
 ```
 
-ZoneAvoidanceRule继承PredicateBasedRule,实际choose是在PredicateBasedRule中实现的
+**ZoneAvoidanceRule继承PredicateBasedRule,实际choose是在PredicateBasedRule中实现的(其实就是RoundRobinRule中的负载均衡算法加机房筛选)**
 
 ​	用的是**RibbonClientConfiguraiton中实例化的一个ZoneAvoidanceRule**，调用了他的choose()方法来选择一个server，其实是用的父类，**PredicateBasedRule.choose()方法**，先执行过滤规则，过滤掉一批server，根据你自己指定的filter规则，然后用round robin轮询算法，依次获取下一个server
 
@@ -1166,7 +1192,7 @@ public abstract class AbstractServerPredicate implements Predicate<PredicateKey>
      */
     public Optional<Server> chooseRoundRobinAfterFiltering(List<Server> servers, Object loadBalancerKey) {
         //先执行过滤规则，过滤掉一批server，根据你自己指定的filter规则
-        //正常来说不会去指定/编写filter代码，所以这里不会过滤掉server
+        //在spring cloud环境中没有过滤相关，所以这里不会过滤掉server
         List<Server> eligible = getEligibleServers(servers, loadBalancerKey);
         if (eligible.size() == 0) {
             return Optional.absent();
@@ -1193,7 +1219,7 @@ public abstract class AbstractServerPredicate implements Predicate<PredicateKey>
 }
 ```
 
-**incrementAndGetModulo简单轮询算法总结：**
+**incrementAndGetModulo简单轮询算法总结(ZoneAvoidanceRule)：**
 
 PS:初始索引为0，每次都将索引值加1，数组下标是从0开始，所以针对数组长度的取模，需要加一
 
@@ -1528,15 +1554,79 @@ public class BaseLoadBalancer extends AbstractLoadBalancer implements
 }
 ```
 
+### 2.10.3 总结
+
+​	1 spring cloud环境下， 默认的情况下，IPing组件，不用ribbon自己去判断server是否存活，eureka去判断的。
+
+​	2 erueka自己会有故障发现和服务实例摘除的机制，如果某个服务实例挂了，eureka server会发现，然后摘除这个服务实例，然后所有的eureka client都会得到一个通知
+
+​	3 eureka  client本地的ribbon，不是有一个PollingServerListUpdater组件，每隔30秒去从自己本地的eureka client去拉取注册表。
+
+​	4 ribbon通过与eureka的整合，自动就有一套服务实例故障自动摘除的机制
+
+​	5 下次再请求的时候，就不会找原来的那个故障的服务器去请求了
+
+​	6 所以ribbon仅仅需要根据对应获取到eureka的serverList的状态来判断是否存活即可
+
+# 3 对ribbon自己原生的另外几种负载均衡算法的IRule源码探究一下
+
+## 3.1 前言
+
+​	spring cloud的设计的哲学和思想，尽量就是说开箱即用
+
+​	无论是zuul、eureka、feign、ribbon、hystrix，尽量刚开始上的时候，都用默认的参数就可以了，所以呢，你会发现一个问题，如果按照原生的一个round robin的负载均衡算法，会有一个问题
+
+​	在刚才的源码里，我们可以看到，他就是非常简单的去进行一个选择这样子，就是不断的从自己本地的server list中去round robin轮询选择一个server去请求
+
+​	他的问题就是说，可能会不断的请求一个已经不存在的，**故障的服务实例，请求失败**
+
+​	spring cloud的哲学，对于这个问题，是通过后面的**hystrix来解决，通过hystrix来做资源隔离，熔断和降级**，对这个请求失败的服务实例，就走降级机制，可能就是这样子，可以保证某个服务实例故障了，不会因为请求他失败，而影响当前的这个服务
+
+ 	一般来说，也不太建议大家在生产环境随意的自己更改负载均衡的算法
 
 
 
+**默认的负载均衡算法可能存在的问题:**
 
+![image-20210718195946693](Ribbon.assets/image-20210718195946693.png)
 
+**PS:存在的问题就是服务故障需要一定的时间才能感知并下线该服务，在这个期间内轮询算法还是会访问到故障的服务**
 
+## 3.2 探究一下IRule源码的负载均衡算法
 
+**RoundRobinRule**：系统内置的默认负载均衡规范，直接round robin轮询，从一堆server list中，不断的轮询选择出来一个server，每个server平摊到的这个请求，基本上是平均的
 
+这个算法，说白了是轮询，就是一台接着一台去请求，是按照顺序来的
 
+**AvailabilityFilteringRule**：这个rule就是会考察服务器的可用性
+
+如果3次连接失败，就会等待30秒后再次访问；如果不断失败，那么等待时间会不断边长
+
+如果某个服务器的并发请求太高了，那么会绕过去，不再访问
+
+先用round robin算法，轮询依次选择一台server，如果判断这个server是存活的可用的，如果这台server是不可以访问的，那么就用round robin算法再次选择下一台server，依次循环往复，10次。还是不行
+
+**WeightedResponseTimeRule**：带着权重的，每个服务器可以有权重，权重越高优先访问，如果某个服务器响应时间比较长，那么权重就会降低，减少访问
+
+**ZoneAvoidanceRule**：根据机房和服务器来进行负载均衡，说白了，就是机房的意思，看了源码就是知道了，这个就是所谓的spring cloud ribbon环境中的默认的Rule，选中机房后再基于轮询算法，选择出来一个server **(spring cloud默认负载均衡算法)**
+
+**BestAvailableRule**：忽略那些请求失败的服务器，然后尽量找并发比较低的服务器来请求
+
+**RandomRule**：随机找一个服务器，尽量将流量分散在各个服务器上
+
+**RetryRule**：可以重试，就是通过round robin找到的服务器请求失败，可以重新找一个服务器
+
+ **PS:AvailabilityFilteringRule、ZoneAvoidanceRule、RetryRule这些rule都是基于RoundRobinRule的轮询算法再加一些自己的东西进去**
+
+# 4 如果在spring cloud环境下就用ribbon来做服务调用会咋样
+
+​	比如说我们原来，其实就用了spring cloud里面的两个项目，一个是eureka，服务注册与发现；另外一个是ribbon，起码是得用的，因为要用ribbon来支持负载均衡；RestTemplate，spring-web里面的一个发送http请求的一个类库
+
+​	比较核心的一个问题，如果仅仅是使用RestTemplate + ribbon的方式来进行服务间的这个调用，会导致我们每次去调用人家一个接口，都要单独写一些代码
+
+​	我们追求一下极致，看看有没有办法，可以让我们不用写代码，直接用一些接口和注解一下子就可以完成对其他服务的调用呢？
+
+​	答案：feign，就可以完成声明式的服务调用。我们不用写代码去调用一个接口
 
 
 

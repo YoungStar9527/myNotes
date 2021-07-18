@@ -5020,7 +5020,7 @@ public class EurekaAutoServiceRegistration implements AutoServiceRegistration, S
 		this.registration = registration;
 	}
 
-    //在原生的eureka client的注册里，其实eureka client启动之后，要延迟几十秒，才会去完成注册。EurekaAutoServiceRegistration，里面包含了一个start()方法，在这个spring boot启动之后，直接就会执行start()方法，我，一启动，不要按照原来的40秒才去注册，我一启动，直接就去执行一个注册。
+    //在原生的eureka client的注册里，其实eureka client启动之后，要延迟几十秒，才会去完成注册。EurekaAutoServiceRegistration，里面包含了一个start()方法，在这个spring boot启动之后，直接就会执行start()方法，一启动，不要按照原来的40秒才去注册，一启动，直接就去执行一个注册。
 	@Override
 	public void start() {
 		// only set the port if the nonSecurePort or securePort is 0 and this.port != 0
@@ -5053,7 +5053,7 @@ public class EurekaAutoServiceRegistration implements AutoServiceRegistration, S
 
 **EurekaServiceRegistry**
 
-​	**实际上，在spring boot一启动的时候，就会去执行EurekaServiceRegistry.register()方法**，这个方法什么啊？看都看不懂，感觉根本没有注册啊。。。。spring cloud也是无奈之举，因为这个eureka client对注册这块的代码， 写的确实是太差了。
+​	**实际上，在spring boot一启动的时候，就会去执行EurekaServiceRegistry.register()方法**，一启动，不要按照原来的40秒才去注册，直接就去执行一个注册spring cloud也是无奈之举，因为这个eureka client对注册这块的代码， 写的确实是太差了。
 
 ​	ApplicationInfoManager.setInstanceStatus()调用的时候，会通知自己所有的注册的监听器，状态发生改变。DiscoveryClient.initScheduledTasks()方法的时候，会给ApplicationInfoManager注册一个监听器，在DiscoveryClient初始化的时候就会调用，注册这个监听器。
 
