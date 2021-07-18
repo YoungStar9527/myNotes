@@ -726,7 +726,9 @@ public class DynamicServerListLoadBalancer<T extends Server> extends BaseLoadBal
 
 ![image-20210717185802535](Ribbon.assets/image-20210717185802535.png)
 
-真正实例化ServerList的代码
+**真正实例化ServerList的代码(获取eureka注册表的serverList)**
+
+**PS:初始化ZoneAwareLoadBalancer的RibbonClientConfiguration配置类里，也有个ServerList的bean,但是该bean是根据配置文件获取serverList的bean(ConfigurationBasedServerList)，并不是获取eureka注册表的serverList**
 
 ```java
 @Configuration
@@ -741,6 +743,7 @@ public class EurekaRibbonClientConfiguration {
 		}
 		DiscoveryEnabledNIWSServerList discoveryServerList = new DiscoveryEnabledNIWSServerList(
 				config, eurekaClientProvider);
+        //DomainExtractingServerList为真正获取eureka注册表的serverList
 		DomainExtractingServerList serverList = new DomainExtractingServerList(
 				discoveryServerList, config, this.approximateZoneFromHostname);
 		return serverList;
@@ -984,6 +987,558 @@ public class PollingServerListUpdater implements ServerListUpdater {
 **流程图：**
 
 https://www.processon.com/view/link/60f2f3e0637689739c3b30c0
+
+## 2.8 spring cloud与ribbon整合时的默认负载均衡算法如何选择一个server
+
+​	通过LoadBalancer从一个服务对应的server list中选择一个server出来，保持负载均衡，将请求均匀的打到各个服务器上去
+
+​	LoadBalancer的chooseServer()方法，通过自己内置的负载均衡算法，选择一个server出来
+
+```java
+public class RibbonLoadBalancerClient implements LoadBalancerClient {
+	@Override
+	public <T> T execute(String serviceId, LoadBalancerRequest<T> request) throws IOException {
+		ILoadBalancer loadBalancer = getLoadBalancer(serviceId);
+        //getServer选择一个server
+		Server server = getServer(loadBalancer);
+		if (server == null) {
+			throw new IllegalStateException("No instances available for " + serviceId);
+		}
+		RibbonServer ribbonServer = new RibbonServer(serviceId, server, isSecure(server,
+				serviceId), serverIntrospector(serviceId).getMetadata(server));
+
+		return execute(serviceId, ribbonServer, request);
+	}
+    
+    protected Server getServer(ILoadBalancer loadBalancer) {
+		if (loadBalancer == null) {
+			return null;
+		}
+        //这里的loadBlancer是ZoneAwareLoadBalancer
+		return loadBalancer.chooseServer("default"); // TODO: better handling of key
+	}
+}
+```
+
+​	ZoneAwareLoadBalancer，**Zone**相关的前缀，或者代码，无需深究**Zone**相关的逻辑，因为正常来说没有 区域/多机房的概念，正常来说就就是单机房，除非是一些大公司等牵扯到 区域/多机房的概念
+
+**PS:机房的概念，多机房的话，他这里可以感知到多机房的，将一个机房里的请求，转发给自己这个机房里部署的其他的服务实例**
+
+```java
+public class ZoneAwareLoadBalancer<T extends Server> extends DynamicServerListLoadBalancer<T> {
+    
+    //这里的 IRule rule就是初始化ZoneAwareLoadBalancer的RibbonClientConfiguration一起初始化的bean,对应的是ZoneAvoidanceRule
+    public ZoneAwareLoadBalancer(IClientConfig clientConfig, IRule rule,
+                                 IPing ping, ServerList<T> serverList, ServerListFilter<T> filter,
+                                 ServerListUpdater serverListUpdater) {
+        super(clientConfig, rule, ping, serverList, filter, serverListUpdater);
+    }
+    
+    //在这里对服务的server list选择了一个出来
+    @Override
+    public Server chooseServer(Object key) {
+        if (!ENABLED.get() || getLoadBalancerStats().getAvailableZones().size() <= 1) {
+            logger.debug("Zone aware logic disabled or there is only one zone");
+            //正常来说没有区域/机房的划分，都是单机房，所以会走这里，父类的方法
+            return super.chooseServer(key);
+        }
+        //下列代码都是针对多机房/区域的情况下进行的处理
+        Server server = null;
+        try {
+            LoadBalancerStats lbStats = getLoadBalancerStats();
+            Map<String, ZoneSnapshot> zoneSnapshot = ZoneAvoidanceRule.createSnapshot(lbStats);
+            logger.debug("Zone snapshots: {}", zoneSnapshot);
+            if (triggeringLoad == null) {
+                triggeringLoad = DynamicPropertyFactory.getInstance().getDoubleProperty(
+                        "ZoneAwareNIWSDiscoveryLoadBalancer." + this.getName() + ".triggeringLoadPerServerThreshold", 0.2d);
+            }
+
+            if (triggeringBlackoutPercentage == null) {
+                triggeringBlackoutPercentage = DynamicPropertyFactory.getInstance().getDoubleProperty(
+                        "ZoneAwareNIWSDiscoveryLoadBalancer." + this.getName() + ".avoidZoneWithBlackoutPercetage", 0.99999d);
+            }
+            Set<String> availableZones = ZoneAvoidanceRule.getAvailableZones(zoneSnapshot, triggeringLoad.get(), triggeringBlackoutPercentage.get());
+            logger.debug("Available zones: {}", availableZones);
+            if (availableZones != null &&  availableZones.size() < zoneSnapshot.keySet().size()) {
+                String zone = ZoneAvoidanceRule.randomChooseZone(zoneSnapshot, availableZones);
+                logger.debug("Zone chosen: {}", zone);
+                if (zone != null) {
+                    //内部，一定是对每个zone，对每个机房都搞了一个LoadBalancer
+                    //所以呢ZoneAwareLoadBalancer内部还是基于BaseLoadBalander在工作的，封装了多个机房，对每个机房的请求，都找每个机房自己对应的一个BaseLoadBalancer，直接调用了BaseLoadBalancer的chooseServer()方法选择了一个server出来
+                    BaseLoadBalancer zoneLoadBalancer = getLoadBalancer(zone);
+                    //选择对应机房来执行chooseServer
+                    server = zoneLoadBalancer.chooseServer(key);
+                }
+            }
+        } catch (Exception e) {
+            logger.error("Error choosing server using zone aware logic for load balancer={}", name, e);
+        }
+        if (server != null) {
+            return server;
+        } else {
+            logger.debug("Zone avoidance logic is not invoked.");
+            return super.chooseServer(key);
+        }
+    }
+}
+```
+
+实际调用父类BaseLoadBalancer的chooseServer方法
+
+```java
+public class BaseLoadBalancer extends AbstractLoadBalancer implements
+        PrimeConnections.PrimeConnectionListener, IClientConfigAware {
+    
+    public DynamicServerListLoadBalancer(IClientConfig clientConfig, IRule rule, IPing ping,
+                                         ServerList<T> serverList, ServerListFilter<T> filter,
+                                         ServerListUpdater serverListUpdater) {
+        super(clientConfig, rule, ping);
+        this.serverListImpl = serverList;
+        this.filter = filter;
+        this.serverListUpdater = serverListUpdater;
+        if (filter instanceof AbstractServerListFilter) {
+            ((AbstractServerListFilter) filter).setLoadBalancerStats(getLoadBalancerStats());
+        }
+        restOfInit(clientConfig);
+    }
+    
+    public Server chooseServer(Object key) {
+        if (counter == null) {
+            counter = createCounter();
+        }
+        counter.increment();
+        if (rule == null) {
+            return null;
+        } else {
+            try {
+                //这里的rule就是通过构造层层传递的,对应的是ZoneAvoidanceRule
+                return rule.choose(key);
+            } catch (Exception e) {
+                logger.warn("LoadBalancer [{}]:  Error choosing server for key {}", name, key, e);
+                return null;
+            }
+        }
+    }
+}
+```
+
+ZoneAvoidanceRule继承PredicateBasedRule,实际choose是在PredicateBasedRule中实现的
+
+​	用的是**RibbonClientConfiguraiton中实例化的一个ZoneAvoidanceRule**，调用了他的choose()方法来选择一个server，其实是用的父类，**PredicateBasedRule.choose()方法**，先执行过滤规则，过滤掉一批server，根据你自己指定的filter规则，然后用round robin轮询算法，依次获取下一个server
+
+```java
+public class ZoneAvoidanceRule extends PredicateBasedRule {
+
+}
+
+public abstract class PredicateBasedRule extends ClientConfigEnabledRoundRobinRule {
+   
+    /**
+     * Method that provides an instance of {@link AbstractServerPredicate} to be used by this class.
+     * 
+     */
+    public abstract AbstractServerPredicate getPredicate();
+        
+    /**
+     * Get a server by calling {@link AbstractServerPredicate#chooseRandomlyAfterFiltering(java.util.List, Object)}.
+     * The performance for this method is O(n) where n is number of servers to be filtered.
+     */
+    @Override
+    public Server choose(Object key) {
+        ILoadBalancer lb = getLoadBalancer();
+        Optional<Server> server = getPredicate().chooseRoundRobinAfterFiltering(lb.getAllServers(), key);
+        if (server.isPresent()) {
+            return server.get();
+        } else {
+            return null;
+        }       
+    }
+}
+
+public abstract class AbstractServerPredicate implements Predicate<PredicateKey> {
+    
+    //原子类，避免并发问题
+    private final AtomicInteger nextIndex = new AtomicInteger();
+
+    
+    /**
+     * Choose a server in a round robin fashion after the predicate filters a given list of servers and load balancer key. 
+     */
+    public Optional<Server> chooseRoundRobinAfterFiltering(List<Server> servers, Object loadBalancerKey) {
+        //先执行过滤规则，过滤掉一批server，根据你自己指定的filter规则
+        //正常来说不会去指定/编写filter代码，所以这里不会过滤掉server
+        List<Server> eligible = getEligibleServers(servers, loadBalancerKey);
+        if (eligible.size() == 0) {
+            return Optional.absent();
+        }
+        return Optional.of(eligible.get(incrementAndGetModulo(eligible.size())));
+    }
+    
+    //真正进行负载均衡取值的核心逻辑方法
+    //round robin轮询算法
+    //轮询获取对应serverList下标，达到负载均衡的效果
+    //modulo=serverList长度
+    private int incrementAndGetModulo(int modulo) {
+        for (;;) {
+            //current=nextIndex=0,初始化第一次为0
+            int current = nextIndex.get();
+            //加一再取模
+            int next = (current + 1) % modulo;
+            //将next，取模后的结果赋值给nextIndex
+            if (nextIndex.compareAndSet(current, next) && current < modulo)
+                //返回current
+                return current;
+        }
+    }
+}
+```
+
+**incrementAndGetModulo简单轮询算法总结：**
+
+PS:初始索引为0，每次都将索引值加1，数组下标是从0开始，所以针对数组长度的取模，需要加一
+
+​	1 因为小数%大数，较小的数对较大的数取模=小数，比如 1%2=1,3%5=3，所以每次返回的下标都加1，只要不超过数组长度
+
+​	2 如果正好 索引值+1=数组长度，取模就直接返回0，又回到了数组0下标位置
+
+​	3 如此即可完成简单的轮询取下标的简单算法
+
+**流程图：**
+
+https://www.processon.com/view/link/60f3d43a0e3e745392758e85
+
+## 2.9 拿到了负载均衡算法选出来的server如何发起一个真正的网络请求
+
+请求是如何发起的?是LoadBalancerRequest的apply方法，LoadBalancerRequest，是一个匿名内部类的实例
+
+```java
+public class RibbonLoadBalancerClient implements LoadBalancerClient {
+	@Override
+	public <T> T execute(String serviceId, LoadBalancerRequest<T> request) throws IOException {
+		ILoadBalancer loadBalancer = getLoadBalancer(serviceId);
+        //getServer选择一个server
+		Server server = getServer(loadBalancer);
+		if (server == null) {
+			throw new IllegalStateException("No instances available for " + serviceId);
+		}
+		RibbonServer ribbonServer = new RibbonServer(serviceId, server, isSecure(server,
+				serviceId), serverIntrospector(serviceId).getMetadata(server));
+
+		return execute(serviceId, ribbonServer, request);
+	}
+    
+	@Override
+	public <T> T execute(String serviceId, ServiceInstance serviceInstance, LoadBalancerRequest<T> request) throws IOException 
+...................................
+        	//对这台server发起一个指定的一个请求
+			T returnVal = request.apply(serviceInstance);
+......................................
+	
+}
+```
+
+LoadBalancerRequest<T> request是拦截器传过来的组件
+
+```java
+public class LoadBalancerInterceptor implements ClientHttpRequestInterceptor {
+
+	private LoadBalancerRequestFactory requestFactory;
+
+	@Override
+	public ClientHttpResponse intercept(final HttpRequest request, final byte[] body,
+			final ClientHttpRequestExecution execution) throws IOException {
+		final URI originalUri = request.getURI();
+		String serviceName = originalUri.getHost();
+		Assert.state(serviceName != null, "Request URI does not contain a valid hostname: " + originalUri);
+        //这里requestFactory.createRequest 创建了一个LoadBalancerRequest
+        //http://ServiceA/sayHello/leo，这个URL地址是封装在LoadBalancerRequest中的
+		return this.loadBalancer.execute(serviceName, requestFactory.createRequest(request, body, execution));
+	}
+}
+
+public class LoadBalancerRequestFactory {
+    
+	public LoadBalancerRequest<ClientHttpResponse> createRequest(final HttpRequest request,
+			final byte[] body, final ClientHttpRequestExecution execution) {
+		return new LoadBalancerRequest<ClientHttpResponse>() {
+			//是调用这里的apply方法
+			@Override
+			public ClientHttpResponse apply(final ServiceInstance instance)
+					throws Exception {
+                //关键代码在这里ServiceRequestWrapper，将server转换为真正的网络请求
+                //将LoadBalancerRequest和server再次封装为了一个WrapperHttpRequest
+                //这个请求URL地址的替换，是最最重要的
+				HttpRequest serviceRequest = new ServiceRequestWrapper(request, instance, loadBalancer);
+				if (transformers != null) {
+					for (LoadBalancerRequestTransformer transformer : transformers) {
+						serviceRequest = transformer.transformRequest(serviceRequest, instance);
+					}
+				}
+                //execution是spring-web处理请求相关的组件
+                //将转换后的HttpRequest及body传入
+                //就用这个请求，基于底层的ClientHttpRequestExecution发起一次http请求
+				return execution.execute(serviceRequest, body);
+			}
+
+		};
+	}
+}
+```
+
+这个请求URL地址的替换，是最最重要的
+
+传入进去了负载均衡算法选择出来的一个server，getRequest().getURI() => http://ServiceA/sayHello/leo ==> 进行重构和替换，就是将ServiceA给替换成了实际选择出来的server对应的hostname:port
+
+```java
+public class ServiceRequestWrapper extends HttpRequestWrapper {
+	private final ServiceInstance instance;
+	private final LoadBalancerClient loadBalancer;
+
+	public ServiceRequestWrapper(HttpRequest request, ServiceInstance instance,
+								 LoadBalancerClient loadBalancer) {
+		super(request);
+		this.instance = instance;
+		this.loadBalancer = loadBalancer;
+	}
+
+    //这里重写了getURI方法
+	@Override
+	public URI getURI() {
+        //ServiceRequestWrapper里面的getURI()方法重写了，基于自己的逻辑重写了，这个里面，调用了RibbonLoadBalancerClient的reconstructURI()方法，基于选择出来的server的地址，重构了请求URI
+		URI uri = this.loadBalancer.reconstructURI(
+				this.instance, getRequest().getURI());
+		return uri;
+	}
+}
+
+
+public class RibbonLoadBalancerClient implements LoadBalancerClient {
+	@Override
+	public URI reconstructURI(ServiceInstance instance, URI original) {
+		Assert.notNull(instance, "instance can not be null");
+		String serviceId = instance.getServiceId();
+        //通过spring的上下文，获取对应bean,得到对应的RibbonLoadBalancerContext
+		RibbonLoadBalancerContext context = this.clientFactory
+				.getLoadBalancerContext(serviceId);
+		Server server = new Server(instance.getHost(), instance.getPort());
+		IClientConfig clientConfig = clientFactory.getClientConfig(serviceId);
+		ServerIntrospector serverIntrospector = serverIntrospector(serviceId);
+		URI uri = RibbonUtils.updateToHttpsIfNeeded(original, clientConfig,
+				serverIntrospector, server);
+        //这里才是真正转换的方法逻辑
+		return context.reconstructURIWithServer(server, uri);
+	}
+}
+
+//其实调用的是父类方法
+public class RibbonLoadBalancerContext extends LoadBalancerContext {
+    
+}
+
+public class LoadBalancerContext implements IClientConfigAware {
+    //这里才是真正转换uri的代码
+    //例:将 http://ServerA/sayHello/leo 转换为 http://localhost:8080/sayHello/leo
+    //对应spring-web中相关代码就能真正发起一个网络请求了
+    public URI reconstructURIWithServer(Server server, URI original) {
+        String host = server.getHost();
+        int port = server.getPort();
+        String scheme = server.getScheme();
+        
+        if (host.equals(original.getHost()) 
+                && port == original.getPort()
+                && scheme == original.getScheme()) {
+            return original;
+        }
+        if (scheme == null) {
+            scheme = original.getScheme();
+        }
+        if (scheme == null) {
+            scheme = deriveSchemeAndPortFromPartialUri(original).first();
+        }
+
+        try {
+            StringBuilder sb = new StringBuilder();
+            sb.append(scheme).append("://");
+            if (!Strings.isNullOrEmpty(original.getRawUserInfo())) {
+                sb.append(original.getRawUserInfo()).append("@");
+            }
+            sb.append(host);
+            if (port >= 0) {
+                sb.append(":").append(port);
+            }
+            sb.append(original.getRawPath());
+            if (!Strings.isNullOrEmpty(original.getRawQuery())) {
+                sb.append("?").append(original.getRawQuery());
+            }
+            if (!Strings.isNullOrEmpty(original.getRawFragment())) {
+                sb.append("#").append(original.getRawFragment());
+            }
+            URI newURI = new URI(sb.toString());
+            return newURI;            
+        } catch (URISyntaxException e) {
+            throw new RuntimeException(e);
+        }
+    }
+}
+```
+
+**流程图：**
+
+https://www.processon.com/view/link/60f3e61f1efad41bbea99f21
+
+## 2.10 ping机制来检查服务实例是否存活
+
+### 2.10.1 找到对应ping实例
+
+ping实际上是由spring来实例化传入对应ZoneAwareLoadBalancer的
+
+```java
+public class ZoneAwareLoadBalancer<T extends Server> extends DynamicServerListLoadBalancer<T> {
+    public ZoneAwareLoadBalancer(IClientConfig clientConfig, IRule rule,
+                                 IPing ping, ServerList<T> serverList, ServerListFilter<T> filter,
+                                 ServerListUpdater serverListUpdater) {
+        super(clientConfig, rule, ping, serverList, filter, serverListUpdater);
+    }
+}
+```
+
+​	因为Ribbon和eureka整合了，所以对应ping在spring-cloud-netflix-eureka-client项目的 org.springframework.cloud.netflix.ribbon.eureka包中的**EurekaRibbonClientConfiguration**
+
+​	而非ZoneAwareLoadBalancer对应包中的XXXconfiguation中实例化的DummyPing
+
+```java
+@Configuration
+public class EurekaRibbonClientConfiguration {
+	@Bean
+	@ConditionalOnMissingBean
+	public IPing ribbonPing(IClientConfig config) {
+		if (this.propertiesFactory.isSet(IPing.class, serviceId)) {
+			return this.propertiesFactory.get(IPing.class, config, serviceId);
+		}
+		NIWSDiscoveryPing ping = new NIWSDiscoveryPing();
+		ping.initWithNiwsConfig(config);
+		return ping;
+	}
+}
+```
+
+对应判断是否存活方法
+
+```java
+public class NIWSDiscoveryPing extends AbstractLoadBalancerPing {
+		public boolean isAlive(Server server) {
+		    boolean isAlive = true;
+		    if (server!=null && server instanceof DiscoveryEnabledServer){
+	            DiscoveryEnabledServer dServer = (DiscoveryEnabledServer)server;	            
+	            InstanceInfo instanceInfo = dServer.getInstanceInfo();
+	            if (instanceInfo!=null){	                
+	                InstanceStatus status = instanceInfo.getStatus();
+	                if (status!=null){
+	                    isAlive = status.equals(InstanceStatus.UP);
+	                }
+	            }
+	        }
+		    return isAlive;
+		}
+}
+```
+
+### 2.10.2 初始化ping的定时请求任务
+
+​	就是在ZoneAwareLoadBalancer实例构造的时候，一定会有一个地方，去启动一个定时调度的任务，这个定时调度的任务，一定会每隔一定的时间，就用IPing组件对server list中的每个server都执行一下isAlive()方法
+
+对应ZoneAwareLoadBalancer的父类DynamicServerListLoadBalancer的父类BaseLoadBalancer中初始化了ping定时请求的定时任务
+
+```java
+public class BaseLoadBalancer extends AbstractLoadBalancer implements
+        PrimeConnections.PrimeConnectionListener, IClientConfigAware {
+    public BaseLoadBalancer(IClientConfig config, IRule rule, IPing ping) {
+        initWithConfig(config, rule, ping);
+    }
+    
+    void initWithConfig(IClientConfig clientConfig, IRule rule, IPing ping)
+........................
+      int pingIntervalTime = Integer.parseInt(""
+                + clientConfig.getProperty(
+                        CommonClientConfigKey.NFLoadBalancerPingInterval,
+                        Integer.parseInt("30")));
+        //初始化定时任务
+    	//pingIntervalTime设置30秒
+        setPingInterval(pingIntervalTime);
+........................
+    public void setPingInterval(int pingIntervalSeconds) 
+.........................
+        setupPingTask(); // since ping data changed
+
+    void setupPingTask() 
+........................
+        //PingTask内部类
+        //这里pingIntervalSeconds默认是10秒，但是传递进来的pingIntervalSeconds值为30秒
+        //所以这里的定时任务是每隔30秒执行一次
+        lbTimer.schedule(new PingTask(), 0, pingIntervalSeconds * 1000);
+        forceQuickPing();
+    
+    
+    //内部类
+    class PingTask extends TimerTask {
+        public void run() {
+            try {
+                //Pinger内部类
+            	new Pinger(pingStrategy).runPinger();
+            } catch (Exception e) {
+                logger.error("LoadBalancer [{}]: Error pinging", name, e);
+            }
+        }
+    }
+    //内部类
+    class Pinger {
+        public void runPinger() throws Exception 
+        ......................
+            //SerialPingStrategy内部类
+                results = pingerStrategy.pingServers(ping, allServers);
+        ......................
+    }
+    
+    //真正执行ping的isAlive方法的内部类
+    private static class SerialPingStrategy implements IPingStrategy {
+
+        //真正执行ping的isAlive方法
+        @Override
+        public boolean[] pingServers(IPing ping, Server[] servers) {
+            int numCandidates = servers.length;
+            boolean[] results = new boolean[numCandidates];
+
+            logger.debug("LoadBalancer:  PingTask executing [{}] servers configured", numCandidates);
+
+            for (int i = 0; i < numCandidates; i++) {
+                results[i] = false; /* Default answer is DEAD. */
+                try {
+............................................
+                    if (ping != null) {
+                        //用IPing组件对每个server都执行一下isAlive()方法
+                        results[i] = ping.isAlive(servers[i]);
+                    }
+                } catch (Exception e) {
+                    logger.error("Exception while pinging Server: '{}'", servers[i], e);
+                }
+            }
+            return results;
+        }
+    }
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
