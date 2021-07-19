@@ -212,15 +212,15 @@ ribbon，三剑客，ILoadBalancer、IRule、IPing，这几个东东是最重要
 
 feign，也是一样的，也有很多核心的组件：
 
-（1）编码器和解码器：Encoder和Decoder，如果调用接口的时候，传递的参数是个对象，feign需要将这个对象进行encode，编码，搞成json序列化，就是把一个对象转成json的格式，Encoder干的事儿；Decoder，解码器，就是说你收到了一个json以后，如何来处理这个东西呢？如何将一个json转换成本地的一个对象
+（1）**编码器和解码器：Encoder和Decoder**，如果调用接口的时候，传递的参数是个对象，feign需要将这个对象进行encode，编码，搞成json序列化，就是把一个对象转成json的格式，Encoder干的事儿；Decoder，解码器，就是说你收到了一个json以后，如何来处理这个东西呢？如何将一个json转换成本地的一个对象
 
-（2）Logger：打印日志的，feign是负责接口调用，发送http请求，所以feign是可以打印这个接口调用请求的日志的
+（2）**Logger**：**打印日志的**，feign是负责接口调用，发送http请求，所以feign是可以打印这个接口调用请求的日志的
 
-（3）Contract：比如一般来说feign的@FeignClient注解和spring web mvc支持的@PathVariable、@RequestMapping、@RequestParam等注解结合起来使用了。feign本来是没法支持spring web mvc的注解的，但是有一个Contract组件之后，契约组件，这个组件负责解释别人家的注解，让feign可以跟别人家的注解结合起来使用
+（3）**Contract**：比如一般来说feign的@FeignClient注解和spring web mvc支持的@PathVariable、@RequestMapping、@RequestParam等注解结合起来使用了。feign本来是没法支持spring web mvc的注解的，但是有一个**Contract组件之后，契约组件**，这个组件负责解释别人家的注解，让feign可以跟别人家的注解结合起来使用
 
-（4）Feign.Builder：FeignClient的一个实例构造器，各种设计模式的使用，构造器，演示过，就是复杂对象的构造，非常适合，用了构造器模式之后，代码是很优雅的。
+（4）**Feign.Builder：FeignClient的一个实例构造器**，各种设计模式的使用，构造器，演示过，就是复杂对象的构造，非常适合，用了构造器模式之后，代码是很优雅的。
 
-（5）FeignClient：就是我们使用feign最最核心的入口，就是要构造一个FeignClient，里面包含了一系列的组件，比如说Encoder、Decoder、Logger、Contract，等等吧
+（5）**FeignClient：就是我们使用feign最最核心的入口**，就是要构造一个FeignClient，里面包含了一系列的组件，比如说Encoder、Decoder、Logger、Contract，等等吧
 
 ### 1.2.2  sprin cloud对feign的默认组件
 
@@ -282,3 +282,299 @@ public interface ServiceAClient {
 feign的拦截器的使用，就是说我们可以实现对feign的请求进行拦截的拦截器，实现一个接口即可，RequestInterceptor，然后所有的请求发送之前都会被我们给拦截，你看这里不就是拦截器模式，interceptor模式
 
 以自定义feign拦截器为样例，其他feign的组件也可以以此方式来自定义
+
+## 1.3 spring cloud环境下feign相关配置参数
+
+### 1.3.1 前言
+
+​	在做这个微服务架构的系统的时候，不用上来就胡乱配置太多的东西，很多时候，默认配置就ok，不要说你觉得自己很牛，胡乱调整配置，很可能就调错了。除了极其少数的关键的几个配置，要配置以外；然后在测试的环节，看看有没有什么问题，如果有可以调整配置；在压力测试的环节，可以看看有没有什么问题，如果有可以调整配置；如果在线上发生了生产环境的问题，那么可以调整配置
+
+### 1.3.2 相关配置
+
+```yaml
+feign:
+  client:
+    config:
+    #单独给对应服务配置
+      ServiceA:
+        connectTimeout: 5000
+        readTimeout: 5000
+        loggerLevel: full
+        #是否启用异常时返回404
+        decode404: false
+
+feign:
+  client:
+    config:
+    #给所有服务默认配置
+      default:
+        connectTimeout: 5000
+        readTimeout: 5000
+        loggerLevel: full
+```
+
+启用feign的压缩
+
+```properties
+feign.compression.request.enabled: true
+feign.compression.request.mime-types: text/xml,application/xml,application/json
+feign.compression.request.min-request-size: 2048
+feign.compression.response.enabled: true
+```
+
+日志相关
+
+1 正常生产环境不需要开启feign日志打印，请求多的话，占用太多空间了，无用日志
+
+2 在开发/测试环境可以开启日志打印
+
+3 生产环境如果需要日志的话，关于log的打印，最好是用统一的日志组件,可以将log打印到日志中心里去，基于ELK、Kafka那套技术栈来做的日志中心
+
+在测试环境添加日志打印
+
+1 首先添加对应配置类
+
+```java
+//logger level：　NONE，无记录（DEFAULT）。BASIC，只记录请求方法和URL以及响应状态代码和执行时间。HEADERS，记录基本信息以及请求和响应标头。FULL，记录请求和响应的头文件，正文和元数据。
+
+@Configuration
+public class MyConfiguration {
+    @Bean
+    Logger.Level feignLoggerLevel() {
+        return Logger.Level.FULL;
+    }
+}
+```
+
+2 然后配置对应接口日志打印
+
+```yaml
+server:
+  port: 9090
+spring:
+  application:
+    name: ServiceB
+eureka:
+  instance:
+    hostname: localhost
+  client:
+    serviceUrl:
+      defaultZone: http://localhost:8761/eureka
+      
+#这里就是配置了ServiceAClient打印所有日志
+logging.level.com.zhss.service.ServiceAClient: DEBUG
+```
+
+发送请求就能打印请求所有的日志信息
+
+![image-20210719204028670](Feign.assets/image-20210719204028670.png)
+
+# 2 feign流程图
+
+​	你就定义了一个ServiceAClient的接口，凭啥说，你就@Autowried注入一个ServiceAClient接口的实例，就可以去调用接口的方法，然后直接http请求就发出去了？ 一定是feign在运行的时候，针对我们打了@FeignClient的注解的接口，在运行的时候动态生成了一个动态代理
+
+​	接口是没有实现的，是不能调用的
+
+​	feign一定是整合了ribbon的，因为必须基于ribbon来进行负载均衡，因为每个服务都是部署多台机器的，必须有负载均衡的机制，所以feign肯定不会自己去干负载均衡的事情，ribbon都干的很好了
+
+​	feign + ribbon + eureka，ServiceA服务名称 => server list，必须结合eureka来，从eureka获取到对应的服务的server list
+
+![image-20210719204531799](Feign.assets/image-20210719204531799.png)
+
+# 3 feign源码
+
+## 3.1 从@EnableFeignClients入手来找一找扫描@FeignClient的入口在哪儿
+
+### 3.1.1 前言
+
+​	就得进入一下feign的源码的剖析，尤其是要剖析spring cloud环境下的feign的源码和工作机制，那么我们考虑一下，研究spring cloud环境下的feign的源码，入口在哪儿啊 ？能够让我们研究的入口就俩：
+
+​	第一个入口：Application启动类的**@EnableFeignClients**注解
+
+​	第二个入口：我们自定义的接口的，比如说ServiceAClient接口，上面打的这个**@FeignClient**注解
+
+​	1 这块，先不看注解的源码，大胆的假设：我觉得我们用@FeignClient标注了自定义的接口，作用就是给feign的一个核心机制来扫描的，**feign核心机制一定会去扫描所有打了@FeignClient注解的接口**
+
+​	2 feign核心机制，扫描到那些打了**@FeignClient注解的接口之后，就会针对这些接口，生成自己的feign动态代理**，以及解析和处理接口上打的那些spring web mvc的注解，比如@RequestMapping，@PathVarialbe，@RequestParam，**基于spring web mvc的注解，来生成接口对应的http请求**
+
+一个问题来了，谁来扫描@FeignClient注解的接口呢？？？
+
+​	3 大胆的猜想一下**：Application启动类的@EnableFeignClients注解**，这个注解一定会作为一个全局的东东，一旦你**加了这个注解之后，就会触发对应的Feign的核心机制**，那个被触发的feign核心机制，就会去扫描所有包下面的@FeignClient注解的接口
+
+我们来看看这俩注解的源码
+
+### 3.1.2 对应源码
+
+​	通过@FeignClient的注解，都可以看得出来，人家都说的很明确了，你用这个**注解标注一个接口，就是让feign对这个接口创建一个对应的动态代理出来**，这个**动态代理就是所谓的REST client，发送rest请求的客户端**
+
+```java
+
+/**
+ * Annotation for interfaces declaring that a REST client with that interface should be
+ * created (e.g. for autowiring into another component). If ribbon is available it will be
+ * used to load balance the backend requests, and the load balancer can be configured
+ * using a <code>@RibbonClient</code> with the same name (i.e. value) as the feign client.
+ *
+ * @author Spencer Gibb
+ * @author Venil Noronha
+ */
+//@FeignClient注解的解释:
+//你用这个@FeignClient注解标注了一个接口，这个接口会被创建为一个REST client（发送restful请求的客户端），然后可以将这个REST client注入其他的组件（比如说ServiceBController）
+@Target(ElementType.TYPE)
+@Retention(RetentionPolicy.RUNTIME)
+@Documented
+public @interface FeignClient {
+
+	/**
+	 * The name of the service with optional protocol prefix. Synonym for {@link #name()
+	 * name}. A name must be specified for all clients, whether or not a url is provided.
+	 * Can be specified as property key, eg: ${propertyKey}.
+	 */
+    //value和name表达的意思是一样的,都是指代的你要调用的那个服务名称
+	@AliasFor("name")
+	String value() default "";
+
+	/**
+	 * The service id with optional protocol prefix. Synonym for {@link #value() value}.
+	 *
+	 * @deprecated use {@link #name() name} instead
+	 */
+	@Deprecated
+	String serviceId() default "";
+
+	/**
+	 * The service id with optional protocol prefix. Synonym for {@link #value() value}.
+	 */
+	@AliasFor("value")
+	String name() default "";
+	
+	/**
+	 * Sets the <code>@Qualifier</code> value for the feign client.
+	 */
+	String qualifier() default "";
+
+	/**
+	 * An absolute URL or resolvable hostname (the protocol is optional).
+	 */
+    //url，一看就是说，如果你不用ribbon的话，那么就没法做负载均衡了，你可以就用url地址指定你要请求的地址
+	String url() default "";
+
+	/**
+	 * Whether 404s should be decoded instead of throwing FeignExceptions
+	 */
+    //decode404的意思，就是说用404替代抛出FeignException异常，替代为404异常
+	boolean decode404() default false;
+
+	/**
+	 * A custom <code>@Configuration</code> for the feign client. Can contain override
+	 * <code>@Bean</code> definition for the pieces that make up the client, for instance
+	 * {@link feign.codec.Decoder}, {@link feign.codec.Encoder}, {@link feign.Contract}.
+	 *
+	 * @see FeignClientsConfiguration for the defaults
+	 */
+    //configurtation指定一个配置类，可以在里面自定义自己的Encoder、Decoder、Contract。。。
+	Class<?>[] configuration() default {};
+
+	/**
+	 * Fallback class for the specified Feign client interface. The fallback class must
+	 * implement the interface annotated by this annotation and be a valid spring bean.
+	 */
+	Class<?> fallback() default void.class;
+
+	/**
+	 * Define a fallback factory for the specified Feign client interface. The fallback
+	 * factory must produce instances of fallback classes that implement the interface
+	 * annotated by {@link FeignClient}. The fallback factory must be a valid spring
+	 * bean.
+	 *
+	 * @see feign.hystrix.FallbackFactory for details.
+	 */
+	Class<?> fallbackFactory() default void.class;
+
+	/**
+	 * Path prefix to be used by all method-level mappings. Can be used with or without
+	 * <code>@RibbonClient</code>.
+	 */
+	String path() default "";
+
+	/**
+	 * Whether to mark the feign proxy as a primary bean. Defaults to true.
+	 */
+	boolean primary() default true;
+
+}
+
+```
+
+@EnableFeignClients，极为关键，扫描那些标注了@FeignClient注解的接口，这里有一些参数，就是指定你要扫描哪些包下面的@FeignClient注解的接口
+
+1 有一个极为重要的东西：@Import(FeignClientsRegistrar.class)
+
+2 这个@Import其实就是负责扫描@FeignClient注解的极为关键的一个入口，导入了一个FeignClientRegistrar类
+
+```java
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.TYPE)
+@Documented
+@Import(FeignClientsRegistrar.class)
+public @interface EnableFeignClients {
+
+	String[] value() default {};
+
+
+	String[] basePackages() default {};
+
+
+	Class<?>[] basePackageClasses() default {};
+
+	Class<?>[] defaultConfiguration() default {};
+
+
+	Class<?>[] clients() default {};
+}
+```
+
+3 我们猜测一下，FeignClientRegistrar是什么东西？负责FeignClient注册的一个组件
+
+4 我们猜想的就是：这个FeignClientRegistrar组件，负责扫描所有包下面的@FeignClient注解的接口，然后触发后面所有的处理流程
+
+5 FeignClientRegistrar实现了一堆接口，XXXAware，不用问，一定是实现了这个接口，持有了对应的引用，然后让spring给他注入一堆东西，XXX
+
+```java
+class FeignClientsRegistrar implements ImportBeanDefinitionRegistrar,
+		ResourceLoaderAware, BeanClassLoaderAware, EnvironmentAware {
+	private ResourceLoader resourceLoader;
+
+	private ClassLoader classLoader;
+
+	private Environment environment;
+
+	public FeignClientsRegistrar() {
+	}
+
+	@Override
+	public void setResourceLoader(ResourceLoader resourceLoader) {
+		this.resourceLoader = resourceLoader;
+	}
+
+	@Override
+	public void setBeanClassLoader(ClassLoader classLoader) {
+		this.classLoader = classLoader;
+	}
+
+//这个方法就是最最核心的，扫描各个包下面的@FeignClient注解，然后生成@FeignClient的动态代理，注册这些@FeignClient
+	@Override
+	public void registerBeanDefinitions(AnnotationMetadata metadata,
+			BeanDefinitionRegistry registry) {
+		registerDefaultConfiguration(metadata, registry);
+		registerFeignClients(metadata, registry);
+	}
+.......................
+}
+```
+
+​	1 **registerBeanDefinitions是feign的核心的入口方法**，这个方法是什么时候会调用呢？分析一下**I他的实现接口，mportBeanDefinitionRegistrar**，这个接口，发现说是spring-context项目里带的
+
+​	2 肯定是在spring boot启动的时候，**spring容器初始化的时候，一定会在某个时间点，会对实现这个接口的类的registerBeanDefinitions()方法会来调用**，让你来实例化一些bean，注册到spring容器里去
+
+​	3 所以我们的**spring boot启动的时候，FeignClientRegistrar.registerBeanDefinitions()方法，将会作为扫描@FeignClient注解的入口**，也就是我们研究spring cloud环境下的feign的源码的一个关键的入口

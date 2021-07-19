@@ -261,6 +261,31 @@ public RestTemplate getRestTemplate() {
 
 ![image-20210713204134354](Ribbon.assets/image-20210713204134354.png)
 
+如果要对ribbon装配自己的负载均衡规则和ping规则，就可以这样来搞：
+
+ 配置自定义的Rule及Ping,然后通过配置类加载
+
+```java
+public class MyConfiguration {
+    @Bean
+    public IRule getRule() {
+        return new MyRule();
+    }
+ 
+    @Bean
+    public IPing getPing() {
+        return new MyPing();
+    }
+}
+ 
+@RibbonClient(name = “ServiceB”, configuration = MyConfiguration.class)
+public class ServiceBConfiguration {
+ 
+}
+```
+
+
+
 ## 1.6 ribbon流程图
 
 ​	RestTemplate，请求：http://localhost:8080/sayHello，如果给：http://ServiceA/sayHello，RestTemplate绝对100%报错，因为你里面搞了一个ServiceA，他是一个服务名称，不是ip地址和主机名，也没有端口号，根本没法请求这个东西
