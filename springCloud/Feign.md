@@ -578,3 +578,318 @@ class FeignClientsRegistrar implements ImportBeanDefinitionRegistrar,
 ​	2 肯定是在spring boot启动的时候，**spring容器初始化的时候，一定会在某个时间点，会对实现这个接口的类的registerBeanDefinitions()方法会来调用**，让你来实例化一些bean，注册到spring容器里去
 
 ​	3 所以我们的**spring boot启动的时候，FeignClientRegistrar.registerBeanDefinitions()方法，将会作为扫描@FeignClient注解的入口**，也就是我们研究spring cloud环境下的feign的源码的一个关键的入口
+
+## 3.2 feign入口源码初探
+
+（1）Application启动类的全限定类名：default.com.zhss.service.ServiceBApplication
+
+（2）解析了一下@EnableFeignClients注解的attrs属性值，defaultConfiguration
+
+（3）基于上面两块东西，在一个叫做BeanDefinicitonRegistry（spring-beans项目）的东西里
+
+```java
+class FeignClientsRegistrar implements ImportBeanDefinitionRegistrar,
+		ResourceLoaderAware, BeanClassLoaderAware, EnvironmentAware {
+	private ResourceLoader resourceLoader;
+
+
+//这个方法就是最最核心的，扫描各个包下面的@FeignClient注解，然后生成@FeignClient的动态代理，注册这些@FeignClient
+	@Override
+	public void registerBeanDefinitions(AnnotationMetadata metadata,
+			BeanDefinitionRegistry registry) {
+        //获取EnableFeignClients注解相关信息，并根据信息构造FeignClientSpecification类
+		registerDefaultConfiguration(metadata, registry);
+        //这个方法的话，在这个方法里会对所有的包进行扫描，专门扫描包含了@FeignClient注解的接口
+		registerFeignClients(metadata, registry);
+	}
+    
+    //AnnotationMetadata元数据就是类信息及相关属性值信息
+	private void registerDefaultConfiguration(AnnotationMetadata metadata,
+			BeanDefinitionRegistry registry) {
+        //获取EnableFeignClients注解对应属性值
+		Map<String, Object> defaultAttrs = metadata
+				.getAnnotationAttributes(EnableFeignClients.class.getName(), true);
+
+		if (defaultAttrs != null && defaultAttrs.containsKey("defaultConfiguration")) {
+			String name;
+			if (metadata.hasEnclosingClass()) {
+				name = "default." + metadata.getEnclosingClassName();
+			}
+			else {
+                //获取Aplication启动类的全限定名：default.com.zhss.service.ServiceBApplication
+				name = "default." + metadata.getClassName();
+			}
+            //将全限定名及默认配置作为构造FeignClientSpecification的bean的入参
+			registerClientConfiguration(registry, name,
+					defaultAttrs.get("defaultConfiguration"));
+		}
+	}
+	//将全限定名及默认配置作为构造FeignClientSpecification的bean的入参
+	private void registerClientConfiguration(BeanDefinitionRegistry registry, Object name,
+			Object configuration) {
+        //BeanDefinitionRetistry（bean实例的注册器）
+		BeanDefinitionBuilder builder = BeanDefinitionBuilder
+				.genericBeanDefinition(FeignClientSpecification.class);
+        //全限定名
+		builder.addConstructorArgValue(name);
+        //注解对应defaultConfiguration配置，没配置就是空的
+		builder.addConstructorArgValue(configuration);
+        //将全限定名及默认配置作为构造FeignClientSpecification的bean的入参
+		registry.registerBeanDefinition(
+				name + "." + FeignClientSpecification.class.getSimpleName(),
+				builder.getBeanDefinition());
+        //BeanDefinitionBuilder及BeanDefinitionRegistry registry相关属于spring-beans工程相关，目前不深究
+	}
+.......................
+}
+
+
+```
+
+## 3.3 终于找到了feign核心机制的入口：来看看如何扫描包下面的@FeignClient注解
+
+（1）registerFeignClients()方法，这个方法的话，在这个方法里会对所有的包进行扫描，专门扫描包含了@FeignClient注解的接口
+
+（2）registerFeignClient()方法，最终应该是基于这个方法完成了扫描出来的@FeignClient相关接口的注册
+
+```java
+class FeignClientsRegistrar implements ImportBeanDefinitionRegistrar,
+		ResourceLoaderAware, BeanClassLoaderAware, EnvironmentAware {
+	private ResourceLoader resourceLoader;
+
+
+//这个方法就是最最核心的，扫描各个包下面的@FeignClient注解，然后生成@FeignClient的动态代理，注册这些@FeignClient
+	@Override
+	public void registerBeanDefinitions(AnnotationMetadata metadata,
+			BeanDefinitionRegistry registry) {
+        //获取EnableFeignClients注解相关信息，并根据信息构造FeignClientSpecification类
+		registerDefaultConfiguration(metadata, registry);
+        //这个方法的话，在这个方法里会对所有的包进行扫描，专门扫描包含了@FeignClient注解的接口
+		registerFeignClients(metadata, registry);
+	}
+	
+	//这个方法的话，在这个方法里会对所有的包进行扫描，专门扫描包含了@FeignClient注解的接口
+	public void registerFeignClients(AnnotationMetadata metadata,
+			BeanDefinitionRegistry registry) {
+         //在classpath中扫描候选的组件的provider类
+		//这个类就是复杂在指定的路径中，扫描你指定的条件的相关的bean，类，接口
+        //getScanner很关键，通过匿名内部类的方式构造对象实例，然后重载了ClassPathScanningCandidateComponentProvider类中的ClassPathScanningCandidateComponentProvider方法
+		ClassPathScanningCandidateComponentProvider scanner = getScanner();
+		scanner.setResourceLoader(this.resourceLoader);
+
+		Set<String> basePackages;
+
+		Map<String, Object> attrs = metadata
+				.getAnnotationAttributes(EnableFeignClients.class.getName());
+        //这行代码非常关键
+        //就是一个根据注解的类型进行过滤的过滤器，传入进去的是@FeignClient注解的类型
+        //一看就是什么呢？用于过滤出来@FeignClient注解类型的过滤器
+		AnnotationTypeFilter annotationTypeFilter = new AnnotationTypeFilter(
+				FeignClient.class);
+		final Class<?>[] clients = attrs == null ? null
+				: (Class<?>[]) attrs.get("clients");
+        //clients，在正常情况下，都是空的，为啥？因为我们一般不会在@EnableFeignClients注解中来配置clients属性，所以可以默认一般都是空的
+        //所以会进这个if判断
+		if (clients == null || clients.length == 0) {
+            //就会给组件扫描器添加一个注解过滤器，@FeignClient注解的注解过滤器，就会加入组件扫描器中
+			scanner.addIncludeFilter(annotationTypeFilter);
+            //这行代码也很关键
+            //先是去获取了@EnableFeignClients里面的属性，因为这个属性里是可以配置basePackages，就是可以自己指定要扫描的包路径的
+            //如果你的@EnableFefignClients中没有配置要扫描的包路径，那么默认就是你的Application启动类所在的包，
+            //此时就会发现我们要扫描的包路径，就是com.zhss.service包
+			basePackages = getBasePackages(metadata);
+		}
+		else {
+			final Set<String> clientClasses = new HashSet<>();
+			basePackages = new HashSet<>();
+			for (Class<?> clazz : clients) {
+				basePackages.add(ClassUtils.getPackageName(clazz));
+				clientClasses.add(clazz.getCanonicalName());
+			}
+			AbstractClassTestingTypeFilter filter = new AbstractClassTestingTypeFilter() {
+				@Override
+				protected boolean match(ClassMetadata metadata) {
+					String cleaned = metadata.getClassName().replaceAll("\\$", ".");
+					return clientClasses.contains(cleaned);
+				}
+			};
+			scanner.addIncludeFilter(
+					new AllTypeFilter(Arrays.asList(filter, annotationTypeFilter)));
+		}
+
+		for (String basePackage : basePackages) {
+            //这行代码也很关键
+            //使用了组件扫描器（搭载了@FeignClient注解过滤器），在com.zhss.service包中扫描，包含了@FeignClient注解的接口，扫描出来了一堆BeanDefinition
+			Set<BeanDefinition> candidateComponents = scanner
+					.findCandidateComponents(basePackage);
+            //所谓的candicateComponent就是我们的标注了@FeignClient的接口，ServiceAClient接口
+            //过滤出来的都是搭载了@FeignClient的接口
+			for (BeanDefinition candidateComponent : candidateComponents) {
+                //这个if判断就是说，你这个候选bean，必须是加了注解的bean（接口）
+				if (candidateComponent instanceof AnnotatedBeanDefinition) {
+					// verify annotated class is an interface
+					AnnotatedBeanDefinition beanDefinition = (AnnotatedBeanDefinition) candidateComponent;
+					AnnotationMetadata annotationMetadata = beanDefinition.getMetadata();
+                    //@FeignClient注解必须标注在接口
+                    //这个Assert意思就是搭载了这个注解的类，必须是个接口
+					Assert.isTrue(annotationMetadata.isInterface(),
+							"@FeignClient can only be specified on an interface");
+					
+                    //获取FeignClient注解的所有属性值
+					Map<String, Object> attributes = annotationMetadata
+							.getAnnotationAttributes(
+									FeignClient.class.getCanonicalName());
+					//这里是获取服务名称
+					String name = getClientName(attributes);
+                    //这块，就是说，拿到@FeignClient注解里，我们加入的属性，比如说我们，就加入了一个value，一个是configuration属性，最主要的就是获取我们的@FeignClient指定的要访问的那个服务的名称
+                    //在BeanDefinitionRegistry中注册一下
+					registerClientConfiguration(registry, name,
+							attributes.get("configuration"));
+					//最终是基于这个方法完成了扫描出来的@FeignClient相关接口的注册
+					registerFeignClient(registry, annotationMetadata, attributes);
+				}
+			}
+		}
+	}
+	//getScanner很关键，通过匿名内部类的方式构造对象实例，然后重写（覆盖）了ClassPathScanningCandidateComponentProvider类中的ClassPathScanningCandidateComponentProvider方法
+	protected ClassPathScanningCandidateComponentProvider getScanner() {
+		return new ClassPathScanningCandidateComponentProvider(false, this.environment) {
+
+            //重写（覆盖）
+			@Override
+			protected boolean isCandidateComponent(
+					AnnotatedBeanDefinition beanDefinition) {
+				if (beanDefinition.getMetadata().isIndependent()) {
+					// TODO until SPR-11711 will be resolved
+					if (beanDefinition.getMetadata().isInterface()
+							&& beanDefinition.getMetadata()
+									.getInterfaceNames().length == 1
+							&& Annotation.class.getName().equals(beanDefinition
+									.getMetadata().getInterfaceNames()[0])) {
+						try {
+							Class<?> target = ClassUtils.forName(
+									beanDefinition.getMetadata().getClassName(),
+									FeignClientsRegistrar.this.classLoader);
+							return !target.isAnnotation();
+						}
+						catch (Exception ex) {
+							this.logger.error(
+									"Could not load target class: "
+											+ beanDefinition.getMetadata().getClassName(),
+									ex);
+
+						}
+					}
+					return true;
+				}
+				return false;
+
+			}
+		};
+	}
+            
+.......................
+}
+```
+
+扩展： 匿名内部类
+一个没有名字的类，是内部类的简化写法
+**本质：其实是继承该类或者实现接口的子类匿名对象**
+
+​	组件扫描器，scanner，我们之前给设置了一个@FeignClient注解的过滤器，这样的话呢，scanner会将com.zhss.service包下面的@FeignClient标注的接口扫描出来，然后交给isCandidateComponent()方法来处理，过滤出来符合条件的集合
+
+```java
+public class ClassPathScanningCandidateComponentProvider implements EnvironmentCapable, ResourceLoaderAware {
+    
+	public Set<BeanDefinition> findCandidateComponents(String basePackage) {
+		Set<BeanDefinition> candidates = new LinkedHashSet<BeanDefinition>();
+		try {
+			String packageSearchPath = ResourcePatternResolver.CLASSPATH_ALL_URL_PREFIX +
+					resolveBasePackage(basePackage) + '/' + this.resourcePattern;
+			Resource[] resources = this.resourcePatternResolver.getResources(packageSearchPath);
+			boolean traceEnabled = logger.isTraceEnabled();
+			boolean debugEnabled = logger.isDebugEnabled();
+			for (Resource resource : resources) {
+				if (traceEnabled) {
+					logger.trace("Scanning " + resource);
+				}
+				if (resource.isReadable()) {
+					try {
+						MetadataReader metadataReader = this.metadataReaderFactory.getMetadataReader(resource);
+                          //极为关键，就是这个isCandidateComponent方法来判断对应类是否符合类过滤器(搭载了@FeignClient注解过滤器)
+                          //符合搭载了@FeignClient的类就返回true
+						if (isCandidateComponent(metadataReader)) {
+							ScannedGenericBeanDefinition sbd = new ScannedGenericBeanDefinition(metadataReader);
+							sbd.setResource(resource);
+							sbd.setSource(resource);
+                              //注意，注意 这个也很关键，isCandidateComponent方法在这个类是重载的，根据传递类型不同
+                              //和上面那个同名方法是重载的啷个方法
+                              //然后这个方法又在之前被匿名内部类重写了，所以这里真正调用的是匿名内部类重写的方法
+                              //重写的方法主要逻辑就是判断一下类型之类的，正常情况都会返回true,主要是上面一个isCandidateComponent去过滤类
+							if (isCandidateComponent(sbd)) {
+								if (debugEnabled) {
+									logger.debug("Identified candidate component class: " + resource);
+								}
+                                  //将符合过滤条件的类添加到返回的set集合
+								candidates.add(sbd);
+							}
+							else {
+								if (debugEnabled) {
+									logger.debug("Ignored because not a concrete top-level class: " + resource);
+								}
+							}
+						}
+						else {
+							if (traceEnabled) {
+								logger.trace("Ignored because not matching any filter: " + resource);
+							}
+						}
+					}
+					catch (Throwable ex) {
+						throw new BeanDefinitionStoreException(
+								"Failed to read candidate component class: " + resource, ex);
+					}
+				}
+				else {
+					if (traceEnabled) {
+						logger.trace("Ignored because not readable: " + resource);
+					}
+				}
+			}
+		}
+		catch (IOException ex) {
+			throw new BeanDefinitionStoreException("I/O failure during classpath scanning", ex);
+		}
+		return candidates;
+	}
+    
+    
+	//极为关键，就是这个isCandidateComponent方法来判断对应类是否符合类过滤器(搭载了@FeignClient注解过滤器)
+    //符合搭载了@FeignClient的类就返回true
+	protected boolean isCandidateComponent(MetadataReader metadataReader) throws IOException {
+		for (TypeFilter tf : this.excludeFilters) {
+			if (tf.match(metadataReader, this.metadataReaderFactory)) {
+				return false;
+			}
+		}
+		for (TypeFilter tf : this.includeFilters) {
+            //主要是这个判断，判断传进来的类是否符合类过滤器
+            //这里是搭载了@FeignClient接口类就返回true
+			if (tf.match(metadataReader, this.metadataReaderFactory)) {
+                 //符合搭载了@FeignClient的类就返回true
+				return isConditionMatch(metadataReader);
+			}
+		}
+		return false;
+	}
+}
+```
+
+流程图：
+
+https://www.processon.com/view/link/60f6ef57f346fb761bba348d
+
+
+
+
+
