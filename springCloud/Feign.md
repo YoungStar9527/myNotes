@@ -381,7 +381,7 @@ logging.level.com.zhss.service.ServiceAClient: DEBUG
 
 ![image-20210719204531799](Feign.assets/image-20210719204531799.png)
 
-# 3 feign源码
+# 3 spring cloud - feign入口源码探索
 
 ## 3.1 从@EnableFeignClients入手来找一找扫描@FeignClient的入口在哪儿
 
@@ -646,7 +646,7 @@ class FeignClientsRegistrar implements ImportBeanDefinitionRegistrar,
 
 ```
 
-## 3.3 终于找到了feign核心机制的入口：来看看如何扫描包下面的@FeignClient注解
+## 3.3 feign核心机制的入口，如何扫描包下面的@FeignClient注解
 
 （1）registerFeignClients()方法，这个方法的话，在这个方法里会对所有的包进行扫描，专门扫描包含了@FeignClient注解的接口
 
@@ -729,6 +729,7 @@ class FeignClientsRegistrar implements ImportBeanDefinitionRegistrar,
 				if (candidateComponent instanceof AnnotatedBeanDefinition) {
 					// verify annotated class is an interface
 					AnnotatedBeanDefinition beanDefinition = (AnnotatedBeanDefinition) candidateComponent;
+                    //获取元数据信息
 					AnnotationMetadata annotationMetadata = beanDefinition.getMetadata();
                     //@FeignClient注解必须标注在接口
                     //这个Assert意思就是搭载了这个注解的类，必须是个接口
@@ -746,6 +747,7 @@ class FeignClientsRegistrar implements ImportBeanDefinitionRegistrar,
 					registerClientConfiguration(registry, name,
 							attributes.get("configuration"));
 					//最终是基于这个方法完成了扫描出来的@FeignClient相关接口的注册
+                    //根据元数据信息及配置信息去注册到spring容器中
 					registerFeignClient(registry, annotationMetadata, attributes);
 				}
 			}
@@ -888,6 +890,228 @@ public class ClassPathScanningCandidateComponentProvider implements EnvironmentC
 流程图：
 
 https://www.processon.com/view/link/60f6ef57f346fb761bba348d
+
+## 3.4 来看看将@FeignClient接口构造为bean的过程以及是如何注册到容器里的
+
+
+
+```java
+class FeignClientsRegistrar implements ImportBeanDefinitionRegistrar,
+		ResourceLoaderAware, BeanClassLoaderAware, EnvironmentAware {
+     
+     //annotationMetadata被注解的类的元数据信息
+     //attributes @FeignClient注解相关属性值
+	private void registerFeignClient(BeanDefinitionRegistry registry,
+			AnnotationMetadata annotationMetadata, Map<String, Object> attributes) {
+        //
+		String className = annotationMetadata.getClassName();
+        //其实就是用了构造器模式，这个构造器模式呢，就会将@FeignClient注解的属性以及ServiceAClient相关的东西，都放到这个BeanDefinition中去
+        //这行代码，非常关键：FeignClientFactoryBean，极为关键的一个组件，就是用来创建核心的FeignClient组件的一个工厂bean
+		BeanDefinitionBuilder definition = BeanDefinitionBuilder
+				.genericBeanDefinition(FeignClientFactoryBean.class);
+        //验证相关
+		validate(attributes);
+        
+        //构造器模式-将@FeignClient注解的属性以及ServiceAClient相关的东西，都放到这个BeanDefinition中去
+		definition.addPropertyValue("url", getUrl(attributes));
+		definition.addPropertyValue("path", getPath(attributes));
+        //name/value值(样例name是：ServiceA)
+		String name = getName(attributes);
+		definition.addPropertyValue("name", name);
+		definition.addPropertyValue("type", className);
+		definition.addPropertyValue("decode404", attributes.get("decode404"));
+		definition.addPropertyValue("fallback", attributes.get("fallback"));
+		definition.addPropertyValue("fallbackFactory", attributes.get("fallbackFactory"));
+		definition.setAutowireMode(AbstractBeanDefinition.AUTOWIRE_BY_TYPE);
+
+        //样例生成的alias=ServiceAFeignClient
+		String alias = name + "FeignClient";
+        //就是通过构造器模式完成了@FeignClient标注的ServiceAClient接口对应的BeanDefinition的构造的过程，成功构造出来了一个BeanDefinition，里面包含了@FeignClient注解和ServicewAClient接口相关的所有信息
+		AbstractBeanDefinition beanDefinition = definition.getBeanDefinition();
+
+		boolean primary = (Boolean)attributes.get("primary"); // has a default, won't be null
+
+		beanDefinition.setPrimary(primary);
+		//获取别名
+        //正常也不会取别名
+		String qualifier = getQualifier(attributes);
+		if (StringUtils.hasText(qualifier)) {
+			alias = qualifier;
+		}
+		
+        //基于接口类名（ServiceAClient接口的类名），alias（ServiceAFeignClient），刚刚构造好的BeanDefinition，构造了一个BeanDefinitionHolder
+		BeanDefinitionHolder holder = new BeanDefinitionHolder(beanDefinition, className,
+				new String[] { alias });
+        //就基于BeanDefinitionRegistry和BeanDefinitionHolder，完成了BeanDefinition的注册，注册的逻辑就不要看了，走的是spring-beans项目的源码了
+		BeanDefinitionReaderUtils.registerBeanDefinition(holder, registry);
+	}
+}
+```
+
+1 spring boot系统启动的时候，刚启动，就跑到这段代码里来了，这段代码，其实是在扫描包路径下的@FeignClient标注的接口都有哪些？？
+
+2 然后将@FeignClient注解的属性和我们自定义的ServiceAClient接口的信息封装为了BeanDefinition，注册到了一个所谓的BeanDefinitionRegistry的地方
+
+3 大胆的推测一下，**其实就是在系统刚启动的时候，这里就是单纯的完成包的扫描，以及信息的解析，将这些东西存储到spring框架中去，留待后面来使用**
+
+4 下一步，其实就是应该去**基于扫描出来的@FeignClient注解和ServiceAClident接口的信息，然后去创建实现ServiceAClient接口的动态代理**
+
+5 **feign核心的动态代理，将动态代理作为一个bean，注入给ServiceBControler，然后ServiceBController后面调用的都是这个feign动态代理**
+
+**创建动态代理Bean的核心代码:**
+
+```java
+		BeanDefinitionBuilder definition = BeanDefinitionBuilder
+				.genericBeanDefinition(FeignClientFactoryBean.class);
+```
+
+1 FeignClientFactoryBean，**这个作为一个工厂，在后面spring容器初始化的某个阶段，根据之前扫描出来的信息完成ServiceAClient的feign动态代理的构造**
+
+2 FeignClientFactoryBean中，保存了@FeignClient注解的所有属性的值,要根据这些属性的值，来完成feign动态代理的构造
+
+3 在FeignClientFactoryBean中，有构造FeignClient的代码，前面仅仅是扫描@FeignClient和接口信息，后面其实会在FeignClientFactoryBean中，在spring容器初始化的某个过程中，调用这个工厂bean的某个方法，创建和获取到ServiceAClient对应的feign动态代理，放到spring容器中去
+
+4 后面ServiceBController就是直接注入刚才创建好的那个动态代理
+
+ **流程图：**
+
+https://www.processon.com/view/link/60f6ef57f346fb761bba348d
+
+# 4 feign相关核心组件
+
+## 4.1 spring cloud 中的FeignClientFactoryBean有哪些东西和操作
+
+1 扫描包下面的@FeignClient的注解，以及搞完了，扫描到内存里来了，形成了BeanDefinition
+
+2 下面一步，其实就是在spring容器初始化的时候，一定是会根据扫描出来的@FeignClient的信息，去构造一个原生的feign的FeignClient出来，然后基于这个FeignClient来构造一个ServiceAClient接口的动态代理
+
+3 也就是说ServiceAClient接口调用的时候，一定是会走这个动态代理的
+
+4 FeignClientFactoryBean里面去，我们其实在这里找到了相关的一些构造FeignClient的过程
+
+5 FeignClientFactoryBean包含了@FeignClient注解中的所有的属性的值，所以肯定是根据你定义的@FeignClient注解的属性，来进行FeignClient的生成
+
+```java
+class FeignClientFactoryBean implements FactoryBean<Object>, InitializingBean,
+		ApplicationContextAware {
+
+
+	private Class<?> type;
+
+	private String name;
+
+	private String url;
+
+	private String path;
+
+	private boolean decode404;
+
+	private ApplicationContext applicationContext;
+
+	private Class<?> fallback = void.class;
+
+	private Class<?> fallbackFactory = void.class;
+    //看起来直接就是再构造Feign.Builder，FeignBuilder构造好了以后，就可以基于这个Feign.Builder来构造对应的FeignClient来使用了。getObject()这个方法里，会去调用feign()方法   
+	protected Feign.Builder feign(FeignContext context) {
+		FeignLoggerFactory loggerFactory = get(context, FeignLoggerFactory.class);
+		Logger logger = loggerFactory.create(this.type);
+
+		// @formatter:off
+		Feign.Builder builder = get(context, Feign.Builder.class)
+				// required values
+				.logger(logger)
+				.encoder(get(context, Encoder.class))
+				.decoder(get(context, Decoder.class))
+				.contract(get(context, Contract.class));
+		// @formatter:on
+
+		configureFeign(context, builder);
+
+		return builder;
+	}       
+...................  
+//看着就是像是对Feign.Builder进行配置     
+	protected void configureFeign(FeignContext context, Feign.Builder builder) {
+		FeignClientProperties properties = applicationContext.getBean(FeignClientProperties.class);
+		if (properties != null) {
+			if (properties.isDefaultToProperties()) {
+				configureUsingConfiguration(context, builder);
+				configureUsingProperties(properties.getConfig().get(properties.getDefaultConfig()), builder);
+				configureUsingProperties(properties.getConfig().get(this.name), builder);
+			} else {
+				configureUsingProperties(properties.getConfig().get(properties.getDefaultConfig()), builder);
+				configureUsingProperties(properties.getConfig().get(this.name), builder);
+				configureUsingConfiguration(context, builder);
+			}
+		} else {
+			configureUsingConfiguration(context, builder);
+		}
+	}
+...................
+//入口方法就是getObject()方法   
+	@Override
+	public Object getObject() throws Exception {
+		FeignContext context = applicationContext.getBean(FeignContext.class);
+		Feign.Builder builder = feign(context);
+
+		if (!StringUtils.hasText(this.url)) {
+			String url;
+			if (!this.name.startsWith("http")) {
+				url = "http://" + this.name;
+			}
+			else {
+				url = this.name;
+			}
+			url += cleanPath();
+			return loadBalance(builder, context, new HardCodedTarget<>(this.type,
+					this.name, url));
+		}
+		if (StringUtils.hasText(this.url) && !this.url.startsWith("http")) {
+			this.url = "http://" + this.url;
+		}
+		String url = this.url + cleanPath();
+		Client client = getOptional(context, Client.class);
+		if (client != null) {
+			if (client instanceof LoadBalancerFeignClient) {
+				// not lod balancing because we have a url,
+				// but ribbon is on the classpath, so unwrap
+				client = ((LoadBalancerFeignClient)client).getDelegate();
+			}
+			builder.client(client);
+		}
+		Targeter targeter = get(context, Targeter.class);
+		return targeter.target(this, builder, context, new HardCodedTarget<>(
+				this.type, this.name, url));
+	}       
+...................
+}
+```
+
+**总结：**
+
+1 入口方法就是getObject()方法，
+
+2 如果你有比较丰富的经验的话，Targeter一类的东西，一遍就代表的是动态代理
+
+3 很可能说这个getObject()方法，就是在spring容器初始化的时候，被作为入口来调用，然后在这个里面，创建了一个ServiceAClient的动态代理，然后返回给spring容器，注册到Spring容器里去 
+
+4 @FeignCilent标注的ServiceAClient接口，就有动态代理实现的bean了
+
+5 这个动态代理bean就可以注入的ServiceBController里面去了
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
