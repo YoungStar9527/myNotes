@@ -4031,10 +4031,12 @@ public class PeerAwareInstanceRegistryImpl extends AbstractInstanceRegistry impl
 
 ​	2 evict()方法内部，先会判断上一分钟的心跳次数，**是否小于我期望的一分钟的心跳次数，如果小于，那么压根儿就不让清理任何服务实例**
 
-​	3 **numberOfRenewsPerMinThreshold:期望的一分钟的心跳次数是怎么算出来的?**分别在eureka server初始化，服务注册，服务下线，以及注册表初始化创建的定时任务，这4个地方会去更新期望心跳数。但是服务故障自动下线的时候没有对期望心跳次数更新的操作
+​	3 **numberOfRenewsPerMinThreshold:期望的一分钟的心跳次数是怎么算出来的?**分别在eureka server初始化，服务注册，服务下线，以及注册表初始化创建的定时任务，这4个地方会去更新期望心跳数。
 
 ​	4 **实际的上一分钟的心跳次数是怎么算出来的?**
 每次一个心跳过来，一定会更新这个MeasturedRate。来计算每一分钟的心跳的实际的次数。
+
+**PS:但是服务故障自动下线的时候没有对期望心跳次数更新的操作**
 
 ### 7.4.3 流程图
 

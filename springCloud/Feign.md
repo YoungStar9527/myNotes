@@ -995,6 +995,53 @@ https://www.processon.com/view/link/60f6ef57f346fb761bba348d
 class FeignClientFactoryBean implements FactoryBean<Object>, InitializingBean,
 		ApplicationContextAware {
 
+	private Class<?> type;
+
+	private String name;
+
+	private String url;
+
+	private String path;
+
+	private boolean decode404;
+
+	private ApplicationContext applicationContext;
+
+	private Class<?> fallback = void.class;
+
+	private Class<?> fallbackFactory = void.class;
+    //看起来直接就是再构造Feign.Builder，FeignBuilder构造好了以后，就可以基于这个Feign.Builder来构造对应的FeignClient来使用了。getObject()这个方法里，会去调用feign()方法   
+	protected Feign.Builder feign(FeignContext context)    
+...................  
+//看着就是像是对Feign.Builder进行配置     
+	protected void configureFeign(FeignContext context, Feign.Builder builder)
+...................
+//入口方法就是getObject()方法   
+	@Override
+	public Object getObject() throws Exception   
+...................
+}
+```
+
+**总结：**
+
+1 入口方法就是getObject()方法，
+
+2 如果你有比较丰富的经验的话，Targeter一类的东西，一遍就代表的是动态代理
+
+3 很可能说这个getObject()方法，就是在spring容器初始化的时候，被作为入口来调用，然后在这个里面，创建了一个ServiceAClient的动态代理，然后返回给spring容器，注册到Spring容器里去 
+
+4 @FeignCilent标注的ServiceAClient接口，就有动态代理实现的bean了
+
+5 这个动态代理bean就可以注入的ServiceBController里面去了
+
+## 4.2 Feign.Builder的构造过程：spring cloud环境下默认组件以及配置参数
+
+### 4.2.1 FeignClientFactoryBean-Feign.Builder构造过程
+
+```java
+class FeignClientFactoryBean implements FactoryBean<Object>, InitializingBean,
+		ApplicationContextAware {
 
 	private Class<?> type;
 
@@ -1013,30 +1060,51 @@ class FeignClientFactoryBean implements FactoryBean<Object>, InitializingBean,
 	private Class<?> fallbackFactory = void.class;
     //看起来直接就是再构造Feign.Builder，FeignBuilder构造好了以后，就可以基于这个Feign.Builder来构造对应的FeignClient来使用了。getObject()这个方法里，会去调用feign()方法   
 	protected Feign.Builder feign(FeignContext context) {
+        //使用了get()方法，获取FeignLoggerFactory
 		FeignLoggerFactory loggerFactory = get(context, FeignLoggerFactory.class);
+        //通过FeignLoggerFactory创建了一个Logger，这个Logger其实就是feign关联的一个记录日志的组件
 		Logger logger = loggerFactory.create(this.type);
 
-		// @formatter:off
+		//这行代码极为关键，一看这个代码，就知道，是从FeignContext中获取Feign.Builder对应的一个bean
 		Feign.Builder builder = get(context, Feign.Builder.class)
-				// required values
+            //给Builder设置了logger，Slf4jLogger，设置给了Feign.Builder
 				.logger(logger)
+            //直接从FeignContext中，获取了预定义好的Encoder、Decoder、Contract，设置给了Feign.Builder
 				.encoder(get(context, Encoder.class))
 				.decoder(get(context, Decoder.class))
 				.contract(get(context, Contract.class));
-		// @formatter:on
-
+		//一看就是使用我们配置的参数，来设置Feign.Builder
 		configureFeign(context, builder);
 
 		return builder;
-	}       
+	}
+            
+	protected <T> T get(FeignContext context, Class<T> type) {
+        //this.name就是获取@FeignClient注解中的value/name值
+        //就会是根据ServiceA服务名称，先获取对应的spring容器，然后从那个spring容器中，获取自己独立的一个FeignLoggerFactory
+		T instance = context.getInstance(this.name, type);
+		if (instance == null) {
+			throw new IllegalStateException("No bean found of type " + type + " for "
+					+ this.name);
+		}
+		return instance;
+	}
 ...................  
-//看着就是像是对Feign.Builder进行配置     
+//一看就是使用我们在application.yml中配置的参数，来设置Feign.Builder
 	protected void configureFeign(FeignContext context, Feign.Builder builder) {
+    //FeignClientPropeties一看就是在读取application.yml中的feign.client打头的一些参数，包括了connectionTimeout、readTimeout之类的参数，
+    //都是在初始化的时候，去读取application.yml中的参数
 		FeignClientProperties properties = applicationContext.getBean(FeignClientProperties.class);
 		if (properties != null) {
 			if (properties.isDefaultToProperties()) {
+				//然后就是读取我们自定义的MyConfiguration中配置的一些bean，比如说Logger.Level，日志等级，我们设置为了FULL，就在这里给读出来了
 				configureUsingConfiguration(context, builder);
+                //如果没有配置feign.client打头的一些参数,properties.getConfig()相关就是空
+                //applicaton.yml中，也可以配置上面的那些东西，如果配置了，会覆盖MyConfiguration中的配置，优先级更高
+                //第一行是说，采用的是application.yml中针对所有feign client配置的参数
 				configureUsingProperties(properties.getConfig().get(properties.getDefaultConfig()), builder);
+                //第二行，是说，针对的是当前的这个服务进行的feign client的配置，当前服务的配置优先级最高
+                //就是yml文件中ServerA和default的区别
 				configureUsingProperties(properties.getConfig().get(this.name), builder);
 			} else {
 				configureUsingProperties(properties.getConfig().get(properties.getDefaultConfig()), builder);
@@ -1047,10 +1115,46 @@ class FeignClientFactoryBean implements FactoryBean<Object>, InitializingBean,
 			configureUsingConfiguration(context, builder);
 		}
 	}
+   //读取我们自定义的MyConfiguration中配置的一些bean       
+	protected void configureUsingConfiguration(FeignContext context, Feign.Builder builder) {
+        //获取自定义的MyConfiguration中配置的一些bean中的日志等级
+		Logger.Level level = getOptional(context, Logger.Level.class);
+		if (level != null) {
+			builder.logLevel(level);
+		}
+        //默认情况下是从不重试，请求是没有重试的
+		Retryer retryer = getOptional(context, Retryer.class);
+		if (retryer != null) {
+			builder.retryer(retryer);
+		}
+		ErrorDecoder errorDecoder = getOptional(context, ErrorDecoder.class);
+        //默认ErrorDecoder为空
+		if (errorDecoder != null) {
+			builder.errorDecoder(errorDecoder);
+		}
+		Request.Options options = getOptional(context, Request.Options.class);
+        //Request.Options，请求相关的参数，connectTimeout = 10s，readTimeout = 60s，直接用默认的
+		if (options != null) {
+			builder.options(options);
+		}
+		Map<String, RequestInterceptor> requestInterceptors = context.getInstances(
+				this.name, RequestInterceptor.class);
+        //请求拦截器，都是可以自定义
+		if (requestInterceptors != null) {
+			builder.requestInterceptors(requestInterceptors.values());
+		}
+		//默认decode404=false
+		if (decode404) {
+			builder.decode404();
+		}
+	}            
+            
 ...................
 //入口方法就是getObject()方法   
 	@Override
 	public Object getObject() throws Exception {
+   		 //FeignContext是什么呢？我们如果要调用一个服务的话，ServiceA，那么那个服务（ServiceA）就会关联一个独立的spring容器，FeignContext（代表了一个独立的容器），关联着自己独立的一些组件，比如说独立的Logger组件，独立的Decoder组件，独立的Encoder组件，都是某个服务自己独立的
+    	//和ribbon中通过SpringclientFactory获取对应服务中的组件，套路是一样的
 		FeignContext context = applicationContext.getBean(FeignContext.class);
 		Feign.Builder builder = feign(context);
 
@@ -1082,38 +1186,155 @@ class FeignClientFactoryBean implements FactoryBean<Object>, InitializingBean,
 		Targeter targeter = get(context, Targeter.class);
 		return targeter.target(this, builder, context, new HardCodedTarget<>(
 				this.type, this.name, url));
-	}       
+	}
 ...................
 }
 ```
 
-**总结：**
+FeignClientPropeties一看就是在读取application.yml中的feign.client打头的一些参数
 
-1 入口方法就是getObject()方法，
-
-2 如果你有比较丰富的经验的话，Targeter一类的东西，一遍就代表的是动态代理
-
-3 很可能说这个getObject()方法，就是在spring容器初始化的时候，被作为入口来调用，然后在这个里面，创建了一个ServiceAClient的动态代理，然后返回给spring容器，注册到Spring容器里去 
-
-4 @FeignCilent标注的ServiceAClient接口，就有动态代理实现的bean了
-
-5 这个动态代理bean就可以注入的ServiceBController里面去了
+```java
+@ConfigurationProperties("feign.client")
+public class FeignClientProperties {
+}
+```
 
 
 
+###	4.2.2 FeignClientFactoryBean-获取spring中相关bean实例化(默认)代码
 
+​	spring cloud整合feign相关的胶水代码，在Ribbon中找过了，就在spring-cloud-netflix-core项目里
 
+​	在FeignAutoConfiguration中，就定义好了一个FeignContext
 
+```java
+@Configuration
+@ConditionalOnClass(Feign.class)
+@EnableConfigurationProperties({FeignClientProperties.class, FeignHttpClientProperties.class})
+public class FeignAutoConfiguration {
+	@Autowired(required = false)
+	private List<FeignClientSpecification> configurations = new ArrayList<>();
 
+........................
 
+	@Bean
+	public FeignContext feignContext() {
+		FeignContext context = new FeignContext();
+		context.setConfigurations(this.configurations);
+		return context;
+	}
+}
+```
 
+这个FeignContext内部是负责来对每个服务都维护一个对应的spring容器的，这里维护一个map，就是一个服务对应一个spring容器
 
+```java
+public class FeignContext extends NamedContextFactory<FeignClientSpecification> {
 
+	public FeignContext() {
+		super(FeignClientsConfiguration.class, "feign", "feign.client.name");
+	}
 
+}
 
+public abstract class NamedContextFactory<C extends NamedContextFactory.Specification>
+		implements DisposableBean, ApplicationContextAware {
+	private Map<String, AnnotationConfigApplicationContext> contexts = new ConcurrentHashMap<>();
+    
+	public void setConfigurations(List<C> configurations) {
+		for (C client : configurations) {
+			this.configurations.put(client.getName(), client);
+		}
+	}
+}
+```
 
+1 那么默认用的是哪个FeignLoggerFactory呢？直接就在spring-cloud-netflix-core里面找到了DefaultFeignLoggerFactory
 
+2 找到了两个Feign.Builder的一个实现,一个是Hystrix相关的，另外一个是Retryer相关的。
 
+​	（1）一个是跟Hystrix熔断降级相关的一个Feign.Builder，另外一个是跟Retryer（请求超时、失败重试）相关的一个Feign.Builder
 
+​	（2） 默认情况下的FeignBuilder，是走的是HystrixFeign.Builder，因为默认情况下，feign就是跟hystrix整合在一起使用的
 
+3 预定义好的Encoder、Decoder、Contract，设置给了Feign.Builder。
 
+​	(1) 这个几个组件的默认是谁？在FeignClientsConfiguraiton中去找找：SpringEncoder、ResponseEntityDecoder、SpringMvcContract
+
+```java
+@Configuration
+public class FeignClientsConfiguration {
+    
+	@Bean
+	@ConditionalOnMissingBean
+	public Decoder feignDecoder() {
+		return new ResponseEntityDecoder(new SpringDecoder(this.messageConverters));
+	}
+
+	@Bean
+	@ConditionalOnMissingBean
+	public Encoder feignEncoder() {
+		return new SpringEncoder(this.messageConverters);
+	}
+
+	@Bean
+	@ConditionalOnMissingBean
+	public Contract feignContract(ConversionService feignConversionService) {
+		return new SpringMvcContract(this.parameterProcessors, feignConversionService);
+	}
+.......................
+	@Configuration
+	@ConditionalOnClass({ HystrixCommand.class, HystrixFeign.class })
+	protected static class HystrixFeignConfiguration {
+		@Bean
+		@Scope("prototype")
+		@ConditionalOnMissingBean
+		@ConditionalOnProperty(name = "feign.hystrix.enabled", matchIfMissing = false)
+		public Feign.Builder feignHystrixBuilder() {
+			return HystrixFeign.builder();
+		}
+	}
+...........................
+
+	@Bean
+	@Scope("prototype")
+	@ConditionalOnMissingBean
+	public Feign.Builder feignBuilder(Retryer retryer) {
+		return Feign.builder().retryer(retryer);
+	}
+	@Bean
+	@ConditionalOnMissingBean(FeignLoggerFactory.class)
+	public FeignLoggerFactory feignLoggerFactory() {
+		return new DefaultFeignLoggerFactory(logger);
+	}
+}
+```
+
+默认创建的是一个Slf4jLogger
+
+```java
+public class DefaultFeignLoggerFactory implements FeignLoggerFactory {
+
+	private Logger logger;
+
+	public DefaultFeignLoggerFactory(Logger logger) {
+		this.logger = logger;
+	}
+
+	@Override
+	public Logger create(Class<?> type) {
+		return this.logger != null ? this.logger : new Slf4jLogger(type);
+	}
+
+}
+```
+
+### 4.2.3 流程图及最终构造结果
+
+Feign.Builder构造结果
+
+![image-20210722215622274](Feign.assets/image-20210722215622274.png)
+
+流程图：
+
+https://www.processon.com/view/link/60f981b6e401fd208cbb4256
