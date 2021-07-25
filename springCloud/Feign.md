@@ -1367,7 +1367,8 @@ class FeignClientFactoryBean implements FactoryBean<Object>, InitializingBean,
             //这里是拼接@FeignClient中的path参数
             //如果有path，则 url = http://ServiceA/user(假设：path=user)
 			url += cleanPath();
-            //用了ribbon的支持负载均衡的这么一个东西，可能就是一个基于ribbon进行负载均衡的动态代理
+            //用了ribbon的支持负载均衡的这么一个东西，就是一个基于ribbon进行负载均衡的动态代理
+            //先是构造了一个HardCodedTarget，硬编码的Target，里面包含了接口类型（com.zhss.service.ServiceAClient）、服务名称（ServiceA）、url地址（http://ServiceA），跟Feign.Builder、FeignContext，一起，传入了loadBalance()方法里去
 			return loadBalance(builder, context, new HardCodedTarget<>(this.type,
 					this.name, url));
 		}
@@ -1385,6 +1386,7 @@ class FeignClientFactoryBean implements FactoryBean<Object>, InitializingBean,
 			builder.client(client);
 		}
 		Targeter targeter = get(context, Targeter.class);
+        
 		return targeter.target(this, builder, context, new HardCodedTarget<>(
 				this.type, this.name, url));
 	}
@@ -1397,7 +1399,7 @@ class FeignClientFactoryBean implements FactoryBean<Object>, InitializingBean,
 		if (client != null) {
 			builder.client(client);
 			Targeter targeter = get(context, Targeter.class);
-            //先是构造了一个HardCodedTarget，硬编码的Target，里面包含了接口类型（com.zhss.service.ServiceAClient）、服务名称（ServiceA）、url地址（http://ServiceA），跟Feign.Builder、FeignContext，一起，传入了loadBalance()方法里去
+            
 			return targeter.target(this, builder, context, target);
 		}
 
@@ -1719,6 +1721,7 @@ public class ReflectiveFeign extends Feign {
       } else {
        //将ServiceAClient接口中的每个方法，加上对应的nameToHandler中存放的对应的SynchronousMethodHandler（异步化的方法代理处理组件），放到一个map中去，methodToHandler
          //说白了就是将nameToHandler转换为methodToHandler，除了key值类型不同，value是一样的
+          //target.type()，这个就是ServiceAClient接口
         methodToHandler.put(method, nameToHandler.get(Feign.configKey(target.type(), method)));
       }
     }
@@ -1817,7 +1820,89 @@ public interface InvocationHandlerFactory {
 
 https://www.processon.com/view/link/60fd1fd3f346fb1b4f5fdd3f
 
+## 4.5 结合feign动态代理的生成原理来画图剧透一下feign请求处理机制
+
+​	除非你在@FeignClient里配置一个url属性，指定你要访问的服务的url地址，才会走我们没看的一段源码逻辑，否则的话，直接是走loadBalance()方法来生成动态代理
+
+```java
+class FeignClientFactoryBean implements FactoryBean<Object>, InitializingBean,
+		ApplicationContextAware {
+       
+            
+...................
+//入口方法就是getObject()方法   
+	@Override
+	public Object getObject() throws Exception {
+   		 //FeignContext是什么呢？我们如果要调用一个服务的话，ServiceA，那么那个服务（ServiceA）就会关联一个独立的spring容器，FeignContext（代表了一个独立的容器），关联着自己独立的一些组件，比如说独立的Logger组件，独立的Decoder组件，独立的Encoder组件，都是某个服务自己独立的
+    	//和ribbon中通过SpringclientFactory获取对应服务中的组件，套路是一样的
+		FeignContext context = applicationContext.getBean(FeignContext.class);
+		Feign.Builder builder = feign(context);
+
+		if (!StringUtils.hasText(this.url)) {
+			String url;
+			if (!this.name.startsWith("http")) {
+				url = "http://" + this.name;
+			}
+			else {
+				url = this.name;
+			}
+			url += cleanPath();
+            //直接走这里loadBalance
+			return loadBalance(builder, context, new HardCodedTarget<>(this.type,
+					this.name, url));
+		}
+    	//除非在@FeignClient里配置一个url属性，指定你要访问的服务的url地址，才会走这里的一段源码逻辑
+		if (StringUtils.hasText(this.url) && !this.url.startsWith("http")) {
+			this.url = "http://" + this.url;
+		}
+		String url = this.url + cleanPath();
+		Client client = getOptional(context, Client.class);
+		if (client != null) {
+			if (client instanceof LoadBalancerFeignClient) {
+				// not lod balancing because we have a url,
+				// but ribbon is on the classpath, so unwrap
+				client = ((LoadBalancerFeignClient)client).getDelegate();
+			}
+			builder.client(client);
+		}
+		Targeter targeter = get(context, Targeter.class);
+		return targeter.target(this, builder, context, new HardCodedTarget<>(
+				this.type, this.name, url));
+	}
+...................
+}
+```
+
+target.type()，这个就是ServiceAClient接口
+
+```java
+public class ReflectiveFeign extends Feign {
 
 
+  @Override
+  public <T> T newInstance(Target<T> target) {
+	//这行代码，极为关键，其实是基于我们配置的Contract、Encoder等一堆组件，加上Target对象（知道是ServiceAClient接口），去进行接口的所有的spring mvc的注解的解析
+    //以及接口中各个方法的一些解析，获取了这个接口中有哪些方法
+    Map<String, MethodHandler> nameToHandler = targetToHandlersByName.apply(target);
+    //nameToHandler和methodToHandler的value存放是一样的数据，区别是key一个为string,一个为Method类型的方法key值
+    Map<Method, MethodHandler> methodToHandler = new LinkedHashMap<Method, MethodHandler>();
+    List<DefaultMethodHandler> defaultMethodHandlers = new LinkedList<DefaultMethodHandler>();
 
+    for (Method method : target.type().getMethods()) {
+........................
+    	//target.type()，这个就是ServiceAClient接口
+        methodToHandler.put(method, nameToHandler.get(Feign.configKey(target.type(), method)));
+........................
+    }
+...................................
+  }
+ 
 
+}
+```
+
+**PS:JDK动态代理，你可以认为他动态生成了一个类，没有名字的，匿名类，这个类是实现了ServiceAClient接口，基于这个匿名的类创建了一个对象，T proxy，他就是所谓的动态代理，对这个T proxy对象所有接口方法的调用，都会交给InvocationHandler来处理**
+
+流程图：
+
+https://www.processon.com/view/link/60fd7402637689719d25c638
