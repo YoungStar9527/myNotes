@@ -400,7 +400,7 @@ test.dependsOn war
 
 ```
 
-
+**PS:对应下载的eureka版本为netflix项目的1.7.x的1.7.2的tag版本**
 
 ### 2.1.2 web.xml解读
 

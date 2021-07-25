@@ -1251,11 +1251,11 @@ public abstract class NamedContextFactory<C extends NamedContextFactory.Specific
 
 1 那么默认用的是哪个FeignLoggerFactory呢？直接就在spring-cloud-netflix-core里面找到了DefaultFeignLoggerFactory
 
-2 找到了两个Feign.Builder的一个实现,一个是Hystrix相关的，另外一个是Retryer相关的。
+**2 找到了两个Feign.Builder的一个实现,一个是Hystrix相关的，另外一个是Retryer相关的。**
 
-​	（1）一个是跟Hystrix熔断降级相关的一个Feign.Builder，另外一个是跟Retryer（请求超时、失败重试）相关的一个Feign.Builder
+​	**（1）一个是跟Hystrix熔断降级相关的一个Feign.Builder，另外一个是跟Retryer（请求超时、失败重试）相关的一个Feign.Builder，这个是默认使用的**
 
-​	（2） 默认情况下的FeignBuilder，是走的是HystrixFeign.Builder，因为默认情况下，feign就是跟hystrix整合在一起使用的
+​	**（2） feign.hystrix.enabled为true情况下的FeignBuilder，是走的是HystrixFeign.Builder，因为生产环境情况下，feign就是跟hystrix整合在一起使用的**
 
 3 预定义好的Encoder、Decoder、Contract，设置给了Feign.Builder。
 
@@ -1337,4 +1337,487 @@ Feign.Builder构造结果
 
 流程图：
 
-https://www.processon.com/view/link/60f981b6e401fd208cbb4256
+https://www.processon.com/view/link/60f986f3e401fd208cbb4892
+
+## 4.3 如何构建url path及Feign默认实例
+
+### 4.3.1  如何构建url path及Feign默认实例流程
+
+```java
+class FeignClientFactoryBean implements FactoryBean<Object>, InitializingBean,
+		ApplicationContextAware {
+		
+	@Override
+	public Object getObject() throws Exception {
+   		 //FeignContext是什么呢？我们如果要调用一个服务的话，ServiceA，那么那个服务（ServiceA）就会关联一个独立的spring容器，FeignContext（代表了一个独立的容器），关联着自己独立的一些组件，比如说独立的Logger组件，独立的Decoder组件，独立的Encoder组件，都是某个服务自己独立的
+    	//和ribbon中通过SpringclientFactory获取对应服务中的组件，套路是一样的
+		FeignContext context = applicationContext.getBean(FeignContext.class);
+		Feign.Builder builder = feign(context);
+		
+        //这里没指定url的话，就会进入，利用ribbon对服务名进行负载均衡访问
+		if (!StringUtils.hasText(this.url)) {
+			String url;
+            //拼接url,url = http://ServiceA;
+			if (!this.name.startsWith("http")) {
+				url = "http://" + this.name;
+			}
+			else {
+				url = this.name;
+			}
+            //这里是拼接@FeignClient中的path参数
+            //如果有path，则 url = http://ServiceA/user(假设：path=user)
+			url += cleanPath();
+            //用了ribbon的支持负载均衡的这么一个东西，可能就是一个基于ribbon进行负载均衡的动态代理
+			return loadBalance(builder, context, new HardCodedTarget<>(this.type,
+					this.name, url));
+		}
+		if (StringUtils.hasText(this.url) && !this.url.startsWith("http")) {
+			this.url = "http://" + this.url;
+		}
+		String url = this.url + cleanPath();
+		Client client = getOptional(context, Client.class);
+		if (client != null) {
+			if (client instanceof LoadBalancerFeignClient) {
+				// not lod balancing because we have a url,
+				// but ribbon is on the classpath, so unwrap
+				client = ((LoadBalancerFeignClient)client).getDelegate();
+			}
+			builder.client(client);
+		}
+		Targeter targeter = get(context, Targeter.class);
+		return targeter.target(this, builder, context, new HardCodedTarget<>(
+				this.type, this.name, url));
+	}
+
+	//用了ribbon的支持负载均衡的这么一个东西，可能就是一个基于ribbon进行负载均衡的动态代理
+	protected <T> T loadBalance(Feign.Builder builder, FeignContext context,
+			HardCodedTarget<T> target) {
+        //默认的就是这里返回的LoadBalancerFeignClient
+		Client client = getOptional(context, Client.class);
+		if (client != null) {
+			builder.client(client);
+			Targeter targeter = get(context, Targeter.class);
+            //先是构造了一个HardCodedTarget，硬编码的Target，里面包含了接口类型（com.zhss.service.ServiceAClient）、服务名称（ServiceA）、url地址（http://ServiceA），跟Feign.Builder、FeignContext，一起，传入了loadBalance()方法里去
+			return targeter.target(this, builder, context, target);
+		}
+
+		throw new IllegalStateException(
+				"No Feign Client for loadBalancing defined. Did you forget to include spring-cloud-starter-netflix-ribbon?");
+	}
+}
+```
+
+​	先是构造了一个HardCodedTarget，硬编码的Target，里面包含了接口类型（com.zhss.service.ServiceAClient）、服务名称（ServiceA）、url地址（http://ServiceA），跟Feign.Builder、FeignContext，一起，传入了loadBalance()方法里去
+
+```java
+package org.springframework.cloud.netflix.feign;
+
+interface Targeter {
+   <T> T target(FeignClientFactoryBean factory, Feign.Builder feign, FeignContext context,
+             Target.HardCodedTarget<T> target);
+}
+```
+
+​	HardCodedTarget，硬编码的Target，里面包含了接口类型（com.zhss.service.ServiceAClient）、服务名称（ServiceA）、url地址（http://ServiceA）
+
+```java
+package feign;
+
+public interface Target<T> {
+    
+  /* The type of the interface this target applies to. ex. {@code Route53}. */
+  Class<T> type();
+
+  /* configuration key associated with this target. For example, {@code route53}. */
+  String name();
+
+  /* base HTTP URL of the target. For example, {@code https://api/v2}. */
+  String url();
+
+  public Request apply(RequestTemplate input);
+
+  public static class HardCodedTarget<T> implements Target<T> {
+
+    private final Class<T> type;
+    private final String name;
+    private final String url;
+
+    public HardCodedTarget(Class<T> type, String url) {
+      this(type, url, url);
+    }
+
+    public HardCodedTarget(Class<T> type, String name, String url) {
+      this.type = checkNotNull(type, "type");
+      this.name = checkNotNull(emptyToNull(name), "name");
+      this.url = checkNotNull(emptyToNull(url), "url");
+    }
+...........................
+}
+.............................
+}
+```
+
+
+
+### 4.3.2  如何构建url path及FeignClient默认实例相关bean的实例化(默认)代码
+
+在spring-cloud-netflix-core项目中的org.springframework.cloud.netflix.feign.ribbon包中
+
+```java
+@ConditionalOnClass({ ILoadBalancer.class, Feign.class })
+@Configuration
+@AutoConfigureBefore(FeignAutoConfiguration.class)
+@EnableConfigurationProperties({ FeignHttpClientProperties.class })
+//Order is important here, last should be the default, first should be optional
+// see https://github.com/spring-cloud/spring-cloud-netflix/issues/2086#issuecomment-316281653
+@Import({ HttpClientFeignLoadBalancedConfiguration.class,
+		OkHttpFeignLoadBalancedConfiguration.class,
+		DefaultFeignLoadBalancedConfiguration.class })
+public class FeignRibbonClientAutoConfiguration {
+.....................
+    //Request.Options用的是默认的配置
+	@Bean
+	@ConditionalOnMissingBean
+	public Request.Options feignRequestOptions() {
+		return LoadBalancerFeignClient.DEFAULT_OPTIONS;
+	}
+.....................
+}
+```
+
+找到了三个东西：
+
+DefaultFeignLoadBalancedConfiguration.class
+
+HttpClientFeignLoadBalancedConfiguration.class
+
+OkHttpFeignLoadBalancedConfiguration.class
+
+那么如果出现这种情况，想都不用想，直接默认肯定是Default的，肯定是用默认的
+
+1 HttpClientFeignLoadBalancedConfiguration.class，**要求的是feign.httpclient.enabled属性设置为true**
+
+2 OkHttpFeignLoadBalancedConfiguration.class，**要求的是feign.okhttp.enabled属性设置为true**
+
+3 DefaultFeignLoadBalancedConfiguration.class，**默认的是这里返回的Feign.Client**
+
+```java
+@Configuration
+class DefaultFeignLoadBalancedConfiguration {
+	@Bean
+	@ConditionalOnMissingBean
+	public Client feignClient(CachingSpringLoadBalancerFactory cachingFactory,
+							  SpringClientFactory clientFactory) {
+		return new LoadBalancerFeignClient(new Client.Default(null, null),
+				cachingFactory, clientFactory);
+	}
+}
+```
+
+**默认的就是这里返回的LoadBalancerFeignClient**
+
+## 4.4 核心中的核心：针对一个接口创建feign动态代理的实现细节
+
+
+
+```java
+class FeignClientFactoryBean implements FactoryBean<Object>, InitializingBean,
+		ApplicationContextAware {
+		
+	@Override
+	public Object getObject() throws Exception {
+   		 //FeignContext是什么呢？我们如果要调用一个服务的话，ServiceA，那么那个服务（ServiceA）就会关联一个独立的spring容器，FeignContext（代表了一个独立的容器），关联着自己独立的一些组件，比如说独立的Logger组件，独立的Decoder组件，独立的Encoder组件，都是某个服务自己独立的
+    	//和ribbon中通过SpringclientFactory获取对应服务中的组件，套路是一样的
+		FeignContext context = applicationContext.getBean(FeignContext.class);
+		Feign.Builder builder = feign(context);
+		
+        //这里没指定url的话，就会进入，利用ribbon对服务名进行负载均衡访问
+		if (!StringUtils.hasText(this.url)) {
+			String url;
+            //拼接url,url = http://ServiceA;
+			if (!this.name.startsWith("http")) {
+				url = "http://" + this.name;
+			}
+			else {
+				url = this.name;
+			}
+            //这里是拼接@FeignClient中的path参数
+            //如果有path，则 url = http://ServiceA/user(假设：path=user)
+			url += cleanPath();
+            //用了ribbon的支持负载均衡的这么一个东西，可能就是一个基于ribbon进行负载均衡的动态代理
+			return loadBalance(builder, context, new HardCodedTarget<>(this.type,
+					this.name, url));
+		}
+		if (StringUtils.hasText(this.url) && !this.url.startsWith("http")) {
+			this.url = "http://" + this.url;
+		}
+		String url = this.url + cleanPath();
+		Client client = getOptional(context, Client.class);
+		if (client != null) {
+			if (client instanceof LoadBalancerFeignClient) {
+				// not lod balancing because we have a url,
+				// but ribbon is on the classpath, so unwrap
+				client = ((LoadBalancerFeignClient)client).getDelegate();
+			}
+			builder.client(client);
+		}
+		Targeter targeter = get(context, Targeter.class);
+		return targeter.target(this, builder, context, new HardCodedTarget<>(
+				this.type, this.name, url));
+	}
+
+	//用了ribbon的支持负载均衡的这么一个东西，可能就是一个基于ribbon进行负载均衡的动态代理
+    //先是构造了一个HardCodedTarget，硬编码的Target，里面包含了接口类型（com.zhss.service.ServiceAClient）、服务名称（ServiceA）、url地址（http://ServiceA），跟Feign.Builder、FeignContext，一起，传入了loadBalance()方法里去
+	protected <T> T loadBalance(Feign.Builder builder, FeignContext context,
+			HardCodedTarget<T> target) {
+        //默认的就是这里返回的LoadBalancerFeignClient
+		Client client = getOptional(context, Client.class);
+		if (client != null) {
+			builder.client(client);
+			Targeter targeter = get(context, Targeter.class);
+            //基于Feign.Builder和HardCodedTarget，来最终基于feign的动态代理的机制，针对一个接口创建出来动态代理
+			return targeter.target(this, builder, context, target);
+		}
+
+		throw new IllegalStateException(
+				"No Feign Client for loadBalancing defined. Did you forget to include spring-cloud-starter-netflix-ribbon?");
+	}
+}
+```
+
+如何来基于Feign.Builder和HardCodedTarget，来最终基于feign的动态代理的机制，针对一个接口创建出来动态代理呢？
+
+在spring-cloud-netflix-core中的org.springframework.cloud.netflix.feign包中的FeignAutoConfiguration找到了对应Target
+
+```java
+package org.springframework.cloud.netflix.feign;
+
+@Configuration
+@ConditionalOnClass(Feign.class)
+@EnableConfigurationProperties({FeignClientProperties.class, FeignHttpClientProperties.class})
+public class FeignAutoConfiguration {
+    
+    //判断classpath路径下是否有feign.hystrix.HystrixFeign，有则为HystrixTargeter
+	@Configuration
+	@ConditionalOnClass(name = "feign.hystrix.HystrixFeign")
+	protected static class HystrixFeignTargeterConfiguration {
+		@Bean
+		@ConditionalOnMissingBean
+		public Targeter feignTargeter() {
+			return new HystrixTargeter();
+		}
+	}
+
+    //判断classpath路径下是否有feign.hystrix.HystrixFeign，DefaultTargeter
+	@Configuration
+	@ConditionalOnMissingClass("feign.hystrix.HystrixFeign")
+	protected static class DefaultFeignTargeterConfiguration {
+		@Bean
+		@ConditionalOnMissingBean
+		public Targeter feignTargeter() {
+			return new DefaultTargeter();
+		}
+	}
+}
+```
+
+在对应jar包依赖找到了
+
+![image-20210725131211132](Feign.assets/image-20210725131211132.png)
+
+所以对应的Targeter为HystrixTargeter
+
+```java
+class HystrixTargeter implements Targeter {
+
+	@Override
+	public <T> T target(FeignClientFactoryBean factory, Feign.Builder feign, FeignContext context,
+						Target.HardCodedTarget<T> target) {
+         //这里如果是和hystrix整合使用的，就不会进入if判断
+		//目前未和hystrix整合所以，Feign.Builder为默认的Feign.Builder不是HystrixFeign.Builder
+        //进入if判断，直接调用feign.target(target)
+		if (!(feign instanceof feign.hystrix.HystrixFeign.Builder)) {
+			return feign.target(target);
+		}
+		feign.hystrix.HystrixFeign.Builder builder = (feign.hystrix.HystrixFeign.Builder) feign;
+		SetterFactory setterFactory = getOptional(factory.getName(), context,
+			SetterFactory.class);
+		if (setterFactory != null) {
+			builder.setterFactory(setterFactory);
+		}
+		Class<?> fallback = factory.getFallback();
+		if (fallback != void.class) {
+			return targetWithFallback(factory.getName(), context, target, builder, fallback);
+		}
+		Class<?> fallbackFactory = factory.getFallbackFactory();
+		if (fallbackFactory != void.class) {
+			return targetWithFallbackFactory(factory.getName(), context, target, builder, fallbackFactory);
+		}
+
+		return feign.target(target);
+	}
+
+}
+```
+
+
+
+```java
+public abstract class Feign {
+.................
+public static class Builder {
+.................
+    public <T> T target(Target<T> target) {
+    	return build().newInstance(target);
+	}
+.................
+    public Feign build() {
+      SynchronousMethodHandler.Factory synchronousMethodHandlerFactory =
+          new SynchronousMethodHandler.Factory(client, retryer, requestInterceptors, logger,
+                                               logLevel, decode404);
+      ParseHandlersByName handlersByName =
+          new ParseHandlersByName(contract, options, encoder, decoder,
+                                  errorDecoder, synchronousMethodHandlerFactory);
+    //核心是构建ReflectiveFeign，然后调用ReflectiveFeign的newInstance方法
+      return new ReflectiveFeign(handlersByName, invocationHandlerFactory);
+    }
+}
+.................
+}    
+```
+
+核心是构建ReflectiveFeign，然后调用ReflectiveFeign的newInstance方法
+
+```java
+public class ReflectiveFeign extends Feign {
+
+  private final ParseHandlersByName targetToHandlersByName;
+  private final InvocationHandlerFactory factory;
+
+  
+  ReflectiveFeign(ParseHandlersByName targetToHandlersByName, InvocationHandlerFactory factory) {
+    this.targetToHandlersByName = targetToHandlersByName;
+    this.factory = factory;
+  }
+  
+  @Override
+  public <T> T newInstance(Target<T> target) {
+	//这行代码，极为关键，其实是基于我们配置的Contract、Encoder等一堆组件，加上Target对象（知道是ServiceAClient接口），去进行接口的所有的spring mvc的注解的解析
+    //以及接口中各个方法的一些解析，获取了这个接口中有哪些方法
+    Map<String, MethodHandler> nameToHandler = targetToHandlersByName.apply(target);
+    //nameToHandler和methodToHandler的value存放是一样的数据，区别是key一个为string,一个为Method类型的方法key值
+    Map<Method, MethodHandler> methodToHandler = new LinkedHashMap<Method, MethodHandler>();
+    List<DefaultMethodHandler> defaultMethodHandlers = new LinkedList<DefaultMethodHandler>();
+
+    for (Method method : target.type().getMethods()) {
+      if (method.getDeclaringClass() == Object.class) {
+        continue;
+      } else if(Util.isDefault(method)) {
+        DefaultMethodHandler handler = new DefaultMethodHandler(method);
+        defaultMethodHandlers.add(handler);
+        methodToHandler.put(method, handler);
+      } else {
+       //将ServiceAClient接口中的每个方法，加上对应的nameToHandler中存放的对应的SynchronousMethodHandler（异步化的方法代理处理组件），放到一个map中去，methodToHandler
+         //说白了就是将nameToHandler转换为methodToHandler，除了key值类型不同，value是一样的
+        methodToHandler.put(method, nameToHandler.get(Feign.configKey(target.type(), method)));
+      }
+    }
+    //创建jdk动态代理的核心代理方法
+    InvocationHandler handler = factory.create(target, methodToHandler);
+    //这块就是核心的，基于JDK的动态代理，创建出来了一个动态代理 
+    //对应传入三个参数分别为
+    //target.type().getClassLoader() 类加载器
+    //new Class<?>[]{target.type()} 这个就是ServiceAClient接口，意思就是说，基于JDK动态代理的机制，创建一个实现了ServiceAClient接口的动态代理
+    //handler，InvocationHandler的意思，就是说，对上面创建的那个proxy动态代理，所有对接口方法的调用，都会走这个InvocationHandler的拦截方法，由这个InvocationHandler中的一个方法来提供所有方法的一个实现的逻辑
+    T proxy = (T) Proxy.newProxyInstance(target.type().getClassLoader(), new Class<?>[]{target.type()}, handler);
+
+    for(DefaultMethodHandler defaultMethodHandler : defaultMethodHandlers) {
+      defaultMethodHandler.bindTo(proxy);
+    }
+    return proxy;
+  }
+ 
+  //内部类继承了InvocationHandler接口，完成jdk动态代理的核心逻辑
+  static class FeignInvocationHandler implements InvocationHandler {
+
+    private final Target target;
+    private final Map<Method, MethodHandler> dispatch;
+
+    FeignInvocationHandler(Target target, Map<Method, MethodHandler> dispatch) {
+      this.target = checkNotNull(target, "target");
+      this.dispatch = checkNotNull(dispatch, "dispatch for %s", target);
+    }
+
+    //invoke拦截方法
+    @Override
+    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+      if ("equals".equals(method.getName())) {
+        try {
+          Object
+              otherHandler =
+              args.length > 0 && args[0] != null ? Proxy.getInvocationHandler(args[0]) : null;
+          return equals(otherHandler);
+        } catch (IllegalArgumentException e) {
+          return false;
+        }
+      } else if ("hashCode".equals(method.getName())) {
+        return hashCode();
+      } else if ("toString".equals(method.getName())) {
+        return toString();
+      }
+      return dispatch.get(method).invoke(args);
+    }
+}
+```
+
+  Map<String, MethodHandler> nameToHandler方法中构建的数据
+
+<img src="Feign.assets/image-20210725143403174.png" alt="image-20210725143403174"  />
+
+这里就是遍历ServiceAClient接口中的每个方法，包括sayHello()等方法，通过反射来获取方法
+
+![image-20210725144156582](Feign.assets/image-20210725144156582.png)
+
+**nameToHandler：**就是接口中的每个方法的名称，对应一个处理这个方法的SynchronousMethodHandler
+
+**methodToHandler：**就是接口中的每个方法对应的Method对象，对应一个处理这个方法的SynchronousMethodHandler
+
+![image-20210725144906100](Feign.assets/image-20210725144906100.png)
+
+
+
+这行代码，是基于一个factory工厂，创建了一个InvocationHandler，如果学习过JDK的动态代理的话，就会知道，InvocationHandler就是JDK中的动态代理
+
+```java
+public interface InvocationHandlerFactory {
+
+  InvocationHandler create(Target target, Map<Method, MethodHandler> dispatch);
+
+  /**
+   * Like {@link InvocationHandler#invoke(Object, java.lang.reflect.Method, Object[])}, except for a
+   * single method.
+   */
+  interface MethodHandler {
+
+    Object invoke(Object[] argv) throws Throwable;
+  }
+
+  static final class Default implements InvocationHandlerFactory {
+
+    //默认是调用了这里ReflectiveFeign.FeignInvocationHandler方法实现了jdk动态代理的核心InvocationHandler接口的实例
+    @Override
+    public InvocationHandler create(Target target, Map<Method, MethodHandler> dispatch) {
+      return new ReflectiveFeign.FeignInvocationHandler(target, dispatch);
+    }
+  }
+}
+```
+
+流程图：
+
+https://www.processon.com/view/link/60fd1fd3f346fb1b4f5fdd3f
+
+
+
+
+
