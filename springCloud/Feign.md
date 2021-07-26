@@ -1906,3 +1906,190 @@ public class ReflectiveFeign extends Feign {
 流程图：
 
 https://www.processon.com/view/link/60fd7402637689719d25c638
+
+## 4.6 回过头看看看细节：MethodHandler的创建以及Contract解析springmvc注解
+
+​	在这里，创建RefrectiveFeign的时候，就创建了一个SynchronousMethodHandler.Factory，穿进去了发送请求相关的LoadBalancerFeignClient、Retryer（负责请求重试）、请求拦截器、日志打印的东西，等等
+
+```java
+ public abstract class Feign {
+ public static class Builder {
+    public Feign build() {
+      //通过这个源码，你就可以看到，对每个方法都创建了一个对应的SynchronousMethodHandler，同步方法处理器，这个SynchronousMethodHandler里面包含了后面发送请求需要的所有的组件，LoadBalancerFeignClient、Retryer（负责请求重试）、请求拦截器、日志打印的东西，等等
+      SynchronousMethodHandler.Factory synchronousMethodHandlerFactory =
+          new SynchronousMethodHandler.Factory(client, retryer, requestInterceptors, logger,
+                                               logLevel, decode404);
+      //这里的handlersByName就包含了所有的组件
+      ParseHandlersByName handlersByName =
+          new ParseHandlersByName(contract, options, encoder, decoder,
+                                  errorDecoder, synchronousMethodHandlerFactory);
+      return new ReflectiveFeign(handlersByName, invocationHandlerFactory);
+    }
+}
+}
+```
+
+
+
+```java
+public class ReflectiveFeign extends Feign {
+  private final ParseHandlersByName targetToHandlersByName;
+  private final InvocationHandlerFactory factory;
+
+//这里的targetToHandlersByName就包含了所有的组件
+  ReflectiveFeign(ParseHandlersByName targetToHandlersByName, InvocationHandlerFactory factory) {
+    this.targetToHandlersByName = targetToHandlersByName;
+    this.factory = factory;
+  }
+
+  //HardCodedTarget(type=ServiceAClient, name=ServiceA, url=http://ServiceA)
+  @Override
+  public <T> T newInstance(Target<T> target) {
+	//targetToHandlersByName，包含了Decoder、Encoder、Contract等feign的核心组件
+    //List<MethodMetadata>,ServiceAClient接口里的每个方法，都会被SpringMvcContract组件来解析，最后对每个方法都生成一个MethodMetadata，代表了这个方法的一些元数据
+    Map<String, MethodHandler> nameToHandler = targetToHandlersByName.apply(target);
+    Map<Method, MethodHandler> methodToHandler = new LinkedHashMap<Method, MethodHandler>();
+    List<DefaultMethodHandler> defaultMethodHandlers = new LinkedList<DefaultMethodHandler>();
+	//key.type()：可以获取到的就是ServiceAClient接口
+    for (Method method : target.type().getMethods()) {
+      if (method.getDeclaringClass() == Object.class) {
+        continue;
+      } else if(Util.isDefault(method)) {
+        DefaultMethodHandler handler = new DefaultMethodHandler(method);
+        defaultMethodHandlers.add(handler);
+        methodToHandler.put(method, handler);
+      } else {
+        methodToHandler.put(method, nameToHandler.get(Feign.configKey(target.type(), method)));
+      }
+    }
+    InvocationHandler handler = factory.create(target, methodToHandler);
+    T proxy = (T) Proxy.newProxyInstance(target.type().getClassLoader(), new Class<?>[]{target.type()}, handler);
+
+    for(DefaultMethodHandler defaultMethodHandler : defaultMethodHandlers) {
+      defaultMethodHandler.bindTo(proxy);
+    }
+    return proxy;
+  }
+  
+}
+```
+
+​	SpringMvcContract，他是负责解析我们在接口上打的各种spring mvc的注解的，@RequestMappinng、@PathVariable、RequestParam，默认情况下，feign是不理解spring mvc的这些注解的，feign是不知道如何处理的
+
+所以全都靠feign的Contract组件，来解析接口上的spring mvc的注解
+
+```java
+ public class ReflectiveFeign extends Feign {
+ static final class ParseHandlersByName {
+
+    private final Contract contract;
+    private final Options options;
+    private final Encoder encoder;
+    private final Decoder decoder;
+    private final ErrorDecoder errorDecoder;
+    private final SynchronousMethodHandler.Factory factory;
+
+    ParseHandlersByName(Contract contract, Options options, Encoder encoder, Decoder decoder,
+                        ErrorDecoder errorDecoder, SynchronousMethodHandler.Factory factory) {
+      this.contract = contract;
+      this.options = options;
+      this.factory = factory;
+      this.errorDecoder = errorDecoder;
+      this.encoder = checkNotNull(encoder, "encoder");
+      this.decoder = checkNotNull(decoder, "decoder");
+    }
+
+    public Map<String, MethodHandler> apply(Target key) {
+      //SpringMvcContract，他是负责解析我们在接口上打的各种spring mvc的注解的
+      //SpringMvcContract为Contract接口的一个实现
+      List<MethodMetadata> metadata = contract.parseAndValidatateMetadata(key.type());
+      Map<String, MethodHandler> result = new LinkedHashMap<String, MethodHandler>();
+      for (MethodMetadata md : metadata) {
+        BuildTemplateByResolvingArgs buildTemplate;
+        if (!md.formParams().isEmpty() && md.template().bodyTemplate() == null) {
+          buildTemplate = new BuildFormEncodedTemplateFromArgs(md, encoder);
+        } else if (md.bodyIndex() != null) {
+          buildTemplate = new BuildEncodedTemplateFromArgs(md, encoder);
+        } else {
+          buildTemplate = new BuildTemplateByResolvingArgs(md);
+        }
+        result.put(md.configKey(),
+                   factory.create(key, md, buildTemplate, options, decoder, errorDecoder));
+      }
+      return result;
+    }
+  }
+ }
+
+//通过这个源码，你就可以看到，对每个方法都创建了一个对应的SynchronousMethodHandler，同步方法处理器，这个SynchronousMethodHandler里面包含了后面发送请求需要的所有的组件，LoadBalancerFeignClient、Retryer（负责请求重试）、请求拦截器、日志打印的东西，等等
+final class SynchronousMethodHandler implements MethodHandler {
+.........................
+  static class Factory {
+    private final Client client;
+    private final Retryer retryer;
+    private final List<RequestInterceptor> requestInterceptors;
+    private final Logger logger;
+    private final Logger.Level logLevel;
+    private final boolean decode404;
+
+    Factory(Client client, Retryer retryer, List<RequestInterceptor> requestInterceptors,
+            Logger logger, Logger.Level logLevel, boolean decode404) {
+      this.client = checkNotNull(client, "client");
+      this.retryer = checkNotNull(retryer, "retryer");
+      this.requestInterceptors = checkNotNull(requestInterceptors, "requestInterceptors");
+      this.logger = checkNotNull(logger, "logger");
+      this.logLevel = checkNotNull(logLevel, "logLevel");
+      this.decode404 = decode404;
+    }
+
+    public MethodHandler create(Target<?> target, MethodMetadata md,
+                                RequestTemplate.Factory buildTemplateFromArgs,
+                                Options options, Decoder decoder, ErrorDecoder errorDecoder) {
+      return new SynchronousMethodHandler(target, client, retryer, requestInterceptors, logger,
+                                          logLevel, md, buildTemplateFromArgs, options, decoder,
+                                          errorDecoder, decode404);
+    }
+  }
+}
+```
+
+MethodMetadata里面放了什么呢？
+
+以这个deleteUser()这个接口来举例，其实获取到了方法的相关的方方面面的所有的东西
+
+（1）方法的定义（configKey）：ServiceAClient#deleteUser(Long)
+
+（2）方法的返回类型(returnType)：class java.lang.String
+
+（3）发送HTTP请求的模板(template)：DELETE /user/{id} HTTP/1.1
+
+@RequestMapping(value = "/{id}", method = RequestMethod.DELETE)
+
+String deleteUser(@PathVariable("id") Long id);
+
+我们定义的接口长的是这个样子的
+
+DELETE /user/{id} HTTP/1.1
+
+发送HTTP请求的模板，这个模板，不就是靠的是SpringMvcContract组件解析spring mvc的注解，才能解析出来这个HTTP请求的模板
+
+![image-20210726075704454](Feign.assets/image-20210726075704454.png)
+
+SpringMvcContract组件的工作原理
+
+```
+      List<MethodMetadata> metadata = contract.parseAndValidatateMetadata(key.type());
+```
+
+（1）解析@RequestMapping注解，看看里面的method属性是谁？一看发现要发送的请求方法是DELETE，所以在HTTP template里就加了一个DELETE
+
+（2）找到了ServiceAInterface上定义的@RequestMapping注解，解析里面的value值，就可以拿到/user，此时HTTP template变成：DELETE /user
+
+（3）再次解析deleteUser()方法上的@RequestMapping注解，找到里面的value，获取到/{id}，拼接到HTTP template里去：DELETE /user/{id}
+
+（4）直接硬编码拼死一个HTTP协议，http 1.1，HTTP template：DELETE /user/{id} HTTP/1.1
+
+（5）indexToName：我们猜想这个是说，解析的是@PathVariable注解，就可以知道什么呢？第一个占位符（index是0）要替换成方法入参里的id这个参数的值。。。，0 -> id
+
+（6）假如后面来调用这个deleteUser()方法，传递进来的id = 1.那么此时就会拿出之前解析好的HTTP template：DELETE /user/{id} HTTP/1.1。然后用传递进来的id = 1替换掉第一个占位符的值，DELETE /user/1 HTTP/1.1 
+
