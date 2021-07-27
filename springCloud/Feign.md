@@ -8,7 +8,7 @@
 
 首先给serverA加入crud代码样例
 
-```
+```java
 @RestController
 public class ServiceAController implements ServiceAInterface {
 
@@ -1261,6 +1261,8 @@ public abstract class NamedContextFactory<C extends NamedContextFactory.Specific
 
 ​	(1) 这个几个组件的默认是谁？在FeignClientsConfiguraiton中去找找：SpringEncoder、ResponseEntityDecoder、SpringMvcContract
 
+4 Retryer 默认Retryer.NEVER_RETRY，不重试
+
 ```java
 @Configuration
 public class FeignClientsConfiguration {
@@ -1294,7 +1296,12 @@ public class FeignClientsConfiguration {
 			return HystrixFeign.builder();
 		}
 	}
-...........................
+    
+	@Bean
+	@ConditionalOnMissingBean
+	public Retryer feignRetryer() {
+		return Retryer.NEVER_RETRY;
+	}
 
 	@Bean
 	@Scope("prototype")
@@ -1768,6 +1775,7 @@ public class ReflectiveFeign extends Feign {
       } else if ("toString".equals(method.getName())) {
         return toString();
       }
+      //调用SynchronousMethodHandler的invoke方法
       return dispatch.get(method).invoke(args);
     }
 }
@@ -1784,6 +1792,8 @@ public class ReflectiveFeign extends Feign {
 **nameToHandler：**就是接口中的每个方法的名称，对应一个处理这个方法的SynchronousMethodHandler
 
 **methodToHandler：**就是接口中的每个方法对应的Method对象，对应一个处理这个方法的SynchronousMethodHandler
+
+**PS:这里的Method是反射包(java.lang.reflect)中相关类，用于结合动态代理使用。对应SynchronousMethodHandler为feign定义的MethodHandler接口实现类，在动态代理的invoke方法中根据对应的key(Method)去调用。**
 
 ![image-20210725144906100](Feign.assets/image-20210725144906100.png)
 
@@ -2092,4 +2102,587 @@ SpringMvcContract组件的工作原理
 （5）indexToName：我们猜想这个是说，解析的是@PathVariable注解，就可以知道什么呢？第一个占位符（index是0）要替换成方法入参里的id这个参数的值。。。，0 -> id
 
 （6）假如后面来调用这个deleteUser()方法，传递进来的id = 1.那么此时就会拿出之前解析好的HTTP template：DELETE /user/{id} HTTP/1.1。然后用传递进来的id = 1替换掉第一个占位符的值，DELETE /user/1 HTTP/1.1 
+
+**流程图：**
+
+https://www.processon.com/view/link/60ff3fc00e3e7423a32b35c3
+
+# 5 feign动态代理是怎么接收和处理请求的
+
+## 5.1 前言
+
+​	1 T proxy是一个匿名类的对象，这个类是动态生成的，是没有名字的，这个类是实现了ServiceAClient接口的，然后我们访问ServiceBController，都是在调用T proxy，对T proxy的调用都会交给InvocationHandler
+
+​	2 所以如果我们要研究动态代理是如何处理请求的，那么就在之前看到的那个InvocationHandler里面打一个断点，然后对ServiceBController发送请求。我们找到ReflectiveFeign.FeignInvocationHandler，invoke()方法
+
+​	3 如果我们对动态代理发起请求，都会交给FeignInvocationHandler的invoke()方法来处理，我们在invoke()方法里打一个断点，就ok，就可以接收到我们发起的所有的请求
+
+## 5.2 初步发送一个请求来源码调试一下feign动态代理是怎么接收和处理请求的
+
+参数说明
+
+args：你传递进来的参数
+
+proxy:当前动态代理对象
+
+method:方法对象
+
+![image-20210727055202555](Feign.assets/image-20210727055202555.png)
+
+dispatch，methodToHandler，map，里面包含的就是每个方法名称 => MethodHandler
+
+找到方法对应的MethodHandler，将args参数交给他来处理请求
+
+```java
+public class ReflectiveFeign extends Feign {
+
+  static class FeignInvocationHandler implements InvocationHandler {
+    @Override
+    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+      if ("equals".equals(method.getName())) {
+        try {
+          Object
+              otherHandler =
+              args.length > 0 && args[0] != null ? Proxy.getInvocationHandler(args[0]) : null;
+          return equals(otherHandler);
+        } catch (IllegalArgumentException e) {
+          return false;
+        }
+      } else if ("hashCode".equals(method.getName())) {
+        return hashCode();
+      } else if ("toString".equals(method.getName())) {
+        return toString();
+      }
+      //这里的method.getName()为方法名，所以直接进入这里
+      return dispatch.get(method).invoke(args);
+    }
+  }
+}
+```
+
+
+
+```java
+final class SynchronousMethodHandler implements MethodHandler {
+
+  @Override
+  public Object invoke(Object[] argv) throws Throwable {
+    //这里template生成 
+    //GET /user/sayHello/1?name=%E5%BC%A0%E4%B8%89&age=18 HTTP/1.1
+    RequestTemplate template = buildTemplateFromArgs.create(argv);
+    //这里的Retryer是默认不重试
+    Retryer retryer = this.retryer.clone();
+    while (true) {
+      try {
+        //核心方法，下一讲继续说明
+        return executeAndDecode(template);
+      } catch (RetryableException e) {
+        retryer.continueOrPropagate(e);
+        if (logLevel != Logger.Level.NONE) {
+          logger.logRetry(metadata.configKey(), logLevel);
+        }
+        continue;
+      }
+    }
+  }
+  
+}
+```
+
+
+
+![image-20210727055930124](Feign.assets/image-20210727055930124.png)
+
+
+
+```
+RequestTemplate template = buildTemplateFromArgs.create(argv);
+```
+
+通过参数
+
+args：id=1，name=张三，age=20
+
+生成
+
+GET /user/sayHello/1?name=%E5%BC%A0%E4%B8%89&age=20 HTTP/1.1
+
+之前的时候，我们用SpringMvcContract解析spring mvc的注解，最终拿到的是一个什么东西？
+
+DELETE /user/{id} HTTP/1.1
+
+**所以这里根据@RequestParam等相关注解将参数替换，将传进来的参数替换之前的占位符和拼接参数，生成一个要访问的接口**
+
+GET /user/sayHello/1?name=张三&age=20 HTTP/1.1
+
+## 5.3 feign处理请求的核心：LoadBalancerFeignClient的工作流程
+
+```java
+final class SynchronousMethodHandler implements MethodHandler {
+
+  //核心方法
+  Object executeAndDecode(RequestTemplate template) throws Throwable {
+    //其实就是基于RequestTemplate，创建了一个Request出来
+    //主要就是多个个http前缀
+    Request request = targetRequest(template);
+
+    //打印一些日志
+    if (logLevel != Logger.Level.NONE) {
+      logger.logRequest(metadata.configKey(), logLevel, request);
+    }
+
+    Response response;
+    long start = System.nanoTime();
+    try {
+      //交给LoadBalancerFeignClient，根据request和时间参数去执行
+      //连接超时时间是10s，读超时时间是60s
+      //我们其实是基于LoadBalancerFeignClient完成了请求的处理和发送，在这个里面，就是肯定是将http请求发送到了对方的ServiceA的某个server上去，同时获取了response响应，下面的代码都是在处理response了
+      response = client.execute(request, options);
+      // ensure the request is set. TODO: remove in Feign 10
+      response.toBuilder().request(request).build();
+    } catch (IOException e) {
+      if (logLevel != Logger.Level.NONE) {
+        logger.logIOException(metadata.configKey(), logLevel, e, elapsedTime(start));
+      }
+      throw errorExecuting(request, e);
+    }
+    //下面是一些处理response的细节代码
+...................................................
+  }
+.....................
+//其实就是基于RequestTemplate，创建了一个Request出来，这个Request是基于之前的那个HardCodedTarget（包含了目标请求服务信息的一个Target），处理了RequestTemplate，生成了一个Request
+  Request targetRequest(RequestTemplate template) {
+//遍历请求拦截器，将每个请求拦截求都应用到RequestTemplate请求模板上面去，也就是让每个请求拦截器对请求进行处理
+    for (RequestInterceptor interceptor : requestInterceptors) {
+      interceptor.apply(template);
+    }
+    //这里就是拼接一个http前缀
+    return target.apply(new RequestTemplate(template));
+  }
+}
+```
+
+拦截器
+
+![image-20210727061248872](Feign.assets/image-20210727061248872.png)
+
+1 基于RequestTemplate，创建了一个Request出来的对比
+
+2 client实例，options参数(连接超时时间是10s，读超时时间是60s)
+
+![image-20210727061842685](Feign.assets/image-20210727061842685.png)
+
+基于LoadBalancerFeignClient完成了请求的处理和发送，在这个里面，就是肯定是将http请求发送到了对方的ServiceA的某个server上去
+
+```java
+public class LoadBalancerFeignClient implements Client {
+........................
+	@Override
+	public Response execute(Request request, Request.Options options) throws IOException {
+		try {
+             //获取请求url地址
+			URI asUri = URI.create(request.url());
+            //从请求url地址中，取出来了要访问的服务的名称，ServiceA
+			String clientName = asUri.getHost();
+            //然后将请求url中的服务名称给干掉了
+			URI uriWithoutHost = cleanUrl(request.url(), clientName);
+            //接下来基于去除了服务名称的uri地址，创建了一个适合ribbon请求
+			FeignLoadBalancer.RibbonRequest ribbonRequest = new FeignLoadBalancer.RibbonRequest(
+					this.delegate, request, uriWithoutHost);
+			//然后又搞了一个IClientConfig，这个东西一看就是ribbon相关的一些配置
+			IClientConfig requestConfig = getClientConfig(options, clientName);
+            //下一讲的核心方法
+			return lbClient(clientName).executeWithLoadBalancer(ribbonRequest,
+					requestConfig).toResponse();
+		}
+		catch (ClientException e) {
+			IOException io = findIOException(e);
+			if (io != null) {
+				throw io;
+			}
+			throw new RuntimeException(e);
+		}
+	}
+........................
+	private FeignLoadBalancer lbClient(String clientName) {
+		return this.lbClientFactory.create(clientName);
+	}
+........................
+}
+```
+
+execute方法 断点对应实例内容
+
+![image-20210727063057736](Feign.assets/image-20210727063057736.png)
+
+lbClient方法断点
+
+![image-20210727063448912](Feign.assets/image-20210727063448912.png)
+
+​	然后初步查看这个源码，我们其实就发现了一个问题，就是在这个源码中，我们其实是创建了一个FeignLoadBalancer，然后最最重要的一点，是在FeignLoadBalancer里封装了ribbon的ILoadBalancer 
+
+```java
+public class CachingSpringLoadBalancerFactory {
+    
+    private volatile Map<String, FeignLoadBalancer> cache = new ConcurrentReferenceHashMap<>();
+..........................
+	public FeignLoadBalancer create(String clientName) {
+    	//接着就是根据服务名称，去获取对应的FeignLoadBalancer
+		if (this.cache.containsKey(clientName)) {
+			return this.cache.get(clientName);
+		}
+    	//ribbon相关配置
+		IClientConfig config = this.factory.getClientConfig(clientName);
+         //ribbon的ILoadBalancer 
+		ILoadBalancer lb = this.factory.getLoadBalancer(clientName);
+       
+		ServerIntrospector serverIntrospector = this.factory.getInstance(clientName, ServerIntrospector.class);
+		FeignLoadBalancer client = enableRetry ? new RetryableFeignLoadBalancer(lb, config, serverIntrospector,
+			loadBalancedRetryPolicyFactory, loadBalancedBackOffPolicyFactory, loadBalancedRetryListenerFactory) : new FeignLoadBalancer(lb, config, serverIntrospector);
+		this.cache.put(clientName, client);
+		return client;
+	}
+}
+```
+
+**流程图：**
+
+https://www.processon.com/view/link/60ff4a75e401fd7e997e72a7
+
+## 5.4  feign处理请求的核心：feign又是如何与ribbon以及eureka整合起来的呢
+
+承接上一讲
+
+```java
+public class CachingSpringLoadBalancerFactory {
+    
+    private volatile Map<String, FeignLoadBalancer> cache = new ConcurrentReferenceHashMap<>();
+..........................
+	public FeignLoadBalancer create(String clientName) {
+    	//接着就是根据服务名称，去获取对应的FeignLoadBalancer
+		if (this.cache.containsKey(clientName)) {
+			return this.cache.get(clientName);
+		}
+    	//ribbon相关配置
+		IClientConfig config = this.factory.getClientConfig(clientName);
+         //这里获取的ILoadBalancer是ZoneAwareLoadBalancer
+		ILoadBalancer lb = this.factory.getLoadBalancer(clientName);
+       
+		ServerIntrospector serverIntrospector = this.factory.getInstance(clientName, ServerIntrospector.class);
+    	//enableRetry为false所以这里构造的是普通的FeignLoadBalancer
+		FeignLoadBalancer client = enableRetry ? new RetryableFeignLoadBalancer(lb, config, serverIntrospector,
+			loadBalancedRetryPolicyFactory, loadBalancedBackOffPolicyFactory, loadBalancedRetryListenerFactory) : new FeignLoadBalancer(lb, config, serverIntrospector);
+		this.cache.put(clientName, client);
+		return client;
+	}
+}
+```
+
+获取这个ZoneAwareLoadBalancer，ZoneAwareLoadBalancer内部是持有的跟eureka进行整合的DomainExtractingServerList(具体实例化见ribbon笔记)
+
+![image-20210728065506433](Feign.assets/image-20210728065506433.png)
+
+FeignLoadBalancer实例化
+
+```java
+public class FeignLoadBalancer extends
+		AbstractLoadBalancerAwareClient<FeignLoadBalancer.RibbonRequest, FeignLoadBalancer.RibbonResponse> {
+
+	protected int connectTimeout;
+	protected int readTimeout;
+	protected IClientConfig clientConfig;
+	protected ServerIntrospector serverIntrospector;
+	//调用该构造去实例化FeignLoadBalancer
+	public FeignLoadBalancer(ILoadBalancer lb, IClientConfig clientConfig,
+							 ServerIntrospector serverIntrospector) {
+		super(lb, clientConfig);
+		this.setRetryHandler(RetryHandler.DEFAULT);
+		this.clientConfig = clientConfig;
+		this.connectTimeout = clientConfig.get(CommonClientConfigKey.ConnectTimeout);
+		this.readTimeout = clientConfig.get(CommonClientConfigKey.ReadTimeout);
+		this.serverIntrospector = serverIntrospector;
+	}
+................................
+}
+```
+
+**总结：**
+
+​	1 所以说，在spring boot启动，要去获取一个ribbon的ILoadBalancer的时候，会去获取到那个服务对应的一个独立的spring容器，从这个容器里面去获取对应的独立的ZoneAwareLoadBalancer
+
+​	2 人家自己里面就有DomainExtractingServerList，DomainExtractingServerList这个东西自己会去eureka的注册表里去抓取服务对应的注册表，server list
+
+​	3 FeignLoadBalancer里面就封装了这个ZoneAwareLoadBalancer
+
+## 5.5 feign处理请求的核心：FeignLoadBalancer是如何负载均衡选择server的
+
+​	lbClient(clientName)，其实就是去看看FeignLoadBalancer里面是什么？里面包含了一个ribbon的ZoneAwareLoadBalancer，负载均衡算法、跟eureka如何整合，都清楚了
+
+```java
+public class LoadBalancerFeignClient implements Client {
+........................
+	@Override
+	public Response execute(Request request, Request.Options options) throws IOException 
+	........................
+			return lbClient(clientName).executeWithLoadBalancer(ribbonRequest,
+					requestConfig).toResponse();
+........................
+}
+```
+
+现在来探究executeWithLoadBalancer方法
+
+```java
+public abstract class AbstractLoadBalancerAwareClient<S extends ClientRequest, T extends IResponse> extends LoadBalancerContext 			implements IClient<S, T>, IClientConfigAware {
+...................................
+    public T executeWithLoadBalancer(final S request, final IClientConfig requestConfig) throws ClientException {
+    	//核心类LoadBalancerCommand，通过ribbon负载均衡选择server
+        LoadBalancerCommand<T> command = buildLoadBalancerCommand(request, requestConfig);
+
+        try {
+            //这里最终调用submit方法，并且构建实现ServerOperation的匿名内部类
+            return command.submit(
+                new ServerOperation<T>() {
+                    
+                    //回调函数
+                    @Override
+                    public Observable<T> call(Server server) {
+                        //根据已有的servr获取uri
+                        URI finalUri = reconstructURIWithServer(server, request.getUri());
+                        S requestForServer = (S) request.replaceUri(finalUri);
+                        try {
+                            //最终发送物理请求
+                            return Observable.just(AbstractLoadBalancerAwareClient.this.execute(requestForServer, requestConfig));
+                        } 
+                        catch (Exception e) {
+                            return Observable.error(e);
+                        }
+                    }
+                })
+                .toBlocking()
+                .single();
+            //调用了一个toBlocking().single()方法，看着就是阻塞式同步执行，然后获取一个响应结果的这么一个意思
+        } catch (Exception e) {
+            Throwable t = e.getCause();
+            if (t instanceof ClientException) {
+                throw (ClientException) t;
+            } else {
+                throw new ClientException(e);
+            }
+        }
+        
+    }
+...................................
+}
+```
+
+逻辑：
+
+1 是ServerOperation封装了一下，对负载均衡选择出来的这个server，然后直接基于这个server替换掉请求URL中的ServiceA，
+
+2 然后直接拼接出来最终的请求URL地址，然后基于底层的http组件发送请求
+
+3 由LoadBalancerCommand来执行这段逻辑，LoadBalancerCommand肯定是在某个地方先使用ribbon的ZoneAwareLoadBalancer负载均衡选择出来了一个server
+
+4 然后将这个server，交给SeerverOpretion中的call()方法去处理
+
+探究一下LoadBalancerCommand
+
+```java
+public class LoadBalancerCommand<T> {
+    
+    private final LoadBalancerContext loadBalancerContext;
+...........................
+    
+    //核心方法
+    //selectServer其实就是通过ribbon的LoadBalancer负载均衡选出server的
+    private Observable<Server> selectServer() {
+        return Observable.create(new OnSubscribe<Server>() {
+            @Override
+            public void call(Subscriber<? super Server> next) {
+                try {
+                    //这里LoadBalancerContext保存了ribbon的ILoadBalancer等组件
+                    //通过ILoadBalancer来负载均衡获取server
+                    Server server = loadBalancerContext.getServerFromLoadBalancer(loadBalancerURI, loadBalancerKey);   
+                    next.onNext(server);
+                    next.onCompleted();
+                } catch (Exception e) {
+                    next.onError(e);
+                }
+            }
+        });
+    }
+.................................
+    public Observable<T> submit(final ServerOperation<T> operation) {
+        final ExecutionInfoContext context = new ExecutionInfoContext();
+        
+        if (listenerInvoker != null) {
+            try {
+                listenerInvoker.onExecutionStart();
+            } catch (AbortExecutionException e) {
+                return Observable.error(e);
+            }
+        }
+
+        final int maxRetrysSame = retryHandler.getMaxRetriesOnSameServer();
+        final int maxRetrysNext = retryHandler.getMaxRetriesOnNextServer();
+
+        // Use the load balancer
+    	//这里调用了selectServer来选出一个server,如果server为空则调用（正常来说都是空，需要selectServer()来选择）
+    	//submit中调用了selectServer()方法负载均衡选择server为核心代码，其他的目前不需要关注
+    	//抓大放小
+        Observable<T> o = 
+                (server == null ? selectServer() : Observable.just(server))
+                .concatMap(new Func1<Server, Observable<T>>() {
+                    //这里面是利用RXJava这么一个编程框架实现观察者模式的细节代码，目前不需要关注
+                    @Override
+                    // Called for each server being selected
+                    public Observable<T> call(Server server) {
+                        context.setServer(server);
+                        final ServerStats stats = loadBalancerContext.getServerStats(server);
+                        
+                        // Called for each attempt and retry
+                        Observable<T> o = Observable
+                                .just(server)
+                                .concatMap(new Func1<Server, Observable<T>>() {
+                                    @Override
+                                    public Observable<T> call(final Server server) {
+                                        context.incAttemptCount();
+                                        loadBalancerContext.noteOpenConnection(stats);
+                                        
+                                        if (listenerInvoker != null) {
+                                            try {
+                                                listenerInvoker.onStartWithServer(context.toExecutionInfo());
+                                            } catch (AbortExecutionException e) {
+                                                return Observable.error(e);
+                                            }
+                                        }
+                                        
+                                        final Stopwatch tracer = loadBalancerContext.getExecuteTracer().start();
+                                        
+                                        return operation.call(server).doOnEach(new Observer<T>() {
+                                            private T entity;
+                                            @Override
+                                            public void onCompleted() {
+                                                recordStats(tracer, stats, entity, null);
+                                                // TODO: What to do if onNext or onError are never called?
+                                            }
+
+                                            @Override
+                                            public void onError(Throwable e) {
+                                                recordStats(tracer, stats, null, e);
+                                                logger.debug("Got error {} when executed on server {}", e, server);
+                                                if (listenerInvoker != null) {
+                                                    listenerInvoker.onExceptionWithServer(e, context.toExecutionInfo());
+                                                }
+                                            }
+
+                                            @Override
+                                            public void onNext(T entity) {
+                                                this.entity = entity;
+                                                if (listenerInvoker != null) {
+                                                    listenerInvoker.onExecutionSuccess(entity, context.toExecutionInfo());
+                                                }
+                                            }                            
+                                            
+                                            private void recordStats(Stopwatch tracer, ServerStats stats, Object entity, Throwable exception) {
+                                                tracer.stop();
+                                                loadBalancerContext.noteRequestCompletion(stats, entity, exception, tracer.getDuration(TimeUnit.MILLISECONDS), retryHandler);
+                                            }
+                                        });
+                                    }
+                                });
+                        
+                        if (maxRetrysSame > 0) 
+                            o = o.retry(retryPolicy(maxRetrysSame, true));
+                        return o;
+                    }
+                });
+        //这下面是利用RXJava这么一个编程框架实现观察者模式的细节代码，目前不需要关注    
+        if (maxRetrysNext > 0 && server == null) 
+            o = o.retry(retryPolicy(maxRetrysNext, false));
+        
+        return o.onErrorResumeNext(new Func1<Throwable, Observable<T>>() {
+            @Override
+            public Observable<T> call(Throwable e) {
+                if (context.getAttemptCount() > 0) {
+                    if (maxRetrysNext > 0 && context.getServerAttemptCount() == (maxRetrysNext + 1)) {
+                        e = new ClientException(ClientException.ErrorType.NUMBEROF_RETRIES_NEXTSERVER_EXCEEDED,
+                                "Number of retries on next server exceeded max " + maxRetrysNext
+                                + " retries, while making a call for: " + context.getServer(), e);
+                    }
+                    else if (maxRetrysSame > 0 && context.getAttemptCount() == (maxRetrysSame + 1)) {
+                        e = new ClientException(ClientException.ErrorType.NUMBEROF_RETRIES_EXEEDED,
+                                "Number of retries exceeded max " + maxRetrysSame
+                                + " retries, while making a call for: " + context.getServer(), e);
+                    }
+                }
+                if (listenerInvoker != null) {
+                    listenerInvoker.onExecutionFailed(e, context.toFinalExecutionInfo());
+                }
+                return Observable.error(e);
+            }
+        });
+    }
+}
+```
+
+LoadBalancerContext获取server
+
+```java
+public class LoadBalancerContext implements IClientConfigAware {
+......................
+    public Server getServerFromLoadBalancer(@Nullable URI original, @Nullable Object loadBalancerKey) throws ClientException 
+        String host = null;
+        int port = -1;
+        if (original != null) {
+            host = original.getHost();
+        }
+        if (original != null) {
+            Pair<String, Integer> schemeAndPort = deriveSchemeAndPortFromPartialUri(original);        
+            port = schemeAndPort.second();
+        }
+
+        // Various Supported Cases
+        // The loadbalancer to use and the instances it has is based on how it was registered
+        // In each of these cases, the client might come in using Full Url or Partial URL
+        ILoadBalancer lb = getLoadBalancer();
+        if (host == null) {
+            // Partial URI or no URI Case
+            // well we have to just get the right instances from lb - or we fall back
+            if (lb != null){
+                //核心代码在这里，这里就是调用了ILoadBalancer的chooseServer来选出一个server
+                Server svc = lb.chooseServer(loadBalancerKey);
+                if (svc == null){
+                    throw new ClientException(ClientException.ErrorType.GENERAL,
+                            "Load balancer does not have available server for client: "
+                                    + clientName);
+                }
+                host = svc.getHost();
+                if (host == null){
+                    throw new ClientException(ClientException.ErrorType.GENERAL,
+                            "Invalid Server for :" + svc);
+                }
+                logger.debug("{} using LB returned Server: {} for request {}", new Object[]{clientName, svc, original});
+                return svc;
+            } 
+            //下面是各种判空，条件判断等细节代码
+            ..............................................
+    }
+........................
+
+}
+```
+
+**总结：**
+
+1 LoadBalancerCommand，去执行了上面的那段selectServer()方法，在这个方法中，就是基于我们之前搞出来的那个ribbon的ZoneAwareLoadBalancer的chooseServer()方法，通过负载均衡机制选择了一个server出来
+
+2 其实我们在LoadBalancerCommand的源码中，就可以看到，在submit()方法中，就会去调用selectServer()方法，通过ribbon负载均衡选择一个server出来
+
+3 选择了一个server出来以后，才可以去调用ServerOperation.call()方法，由call()方法根据server发送http请求
+
+
+
+
 
