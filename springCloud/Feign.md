@@ -2682,7 +2682,216 @@ public class LoadBalancerContext implements IClientConfigAware {
 
 3 选择了一个server出来以后，才可以去调用ServerOperation.call()方法，由call()方法根据server发送http请求
 
+**流程图：**
+
+https://www.processon.com/view/link/60ff4a75e401fd7e997e72a7
+
+## 5.6 feign处理请求的核心：最终生成的请求如何发送
+
+LoadBalancerCommand的selectServer()方法中选择出来了一个server，然后将这个server给放到了ServerOperation.call()方法中去
+
+```java
+public abstract class AbstractLoadBalancerAwareClient<S extends ClientRequest, T extends IResponse> extends LoadBalancerContext 			implements IClient<S, T>, IClientConfigAware {
+...................................
+    public T executeWithLoadBalancer(final S request, final IClientConfig requestConfig) throws ClientException {
+    	//核心类LoadBalancerCommand，通过ribbon负载均衡选择server
+        LoadBalancerCommand<T> command = buildLoadBalancerCommand(request, requestConfig);
+
+        try {
+            //这里最终调用submit方法，并且构建实现ServerOperation的匿名内部类
+            return command.submit(
+                new ServerOperation<T>() {
+                    
+                    //回调函数
+                    @Override
+                    public Observable<T> call(Server server) {
+                        //根据已有的servr获取uri
+                        URI finalUri = reconstructURIWithServer(server, request.getUri());
+                        S requestForServer = (S) request.replaceUri(finalUri);
+                        try {
+                            //最终发送物理请求
+                            return Observable.just(AbstractLoadBalancerAwareClient.this.execute(requestForServer, requestConfig));
+                        } 
+                        catch (Exception e) {
+                            return Observable.error(e);
+                        }
+                    }
+                })
+                .toBlocking()
+                .single();
+            //调用了一个toBlocking().single()方法，看着就是阻塞式同步执行，然后获取一个响应结果的这么一个意思
+        } catch (Exception e) {
+            Throwable t = e.getCause();
+            if (t instanceof ClientException) {
+                throw (ClientException) t;
+            } else {
+                throw new ClientException(e);
+            }
+        }
+        
+    }
+...................................
+}
+```
+
+call方法断点参数
+
+![image-20210729073003885](Feign.assets/image-20210729073003885.png)
 
 
 
+1 在这个方法中，第一件事情，就是根据之前处理好的请求URL
 
+http:///user/sayHello/1?name=%E5%BC%A0%E4%B8%89&age=18
+
+2 加上我们选择出来的那个server的地址：localhost:8080，拼接在一起就ok了
+
+http://localhost:8088/user/sayHello/1?name=%E5%BC%A0%E4%B8%89&age=18，最终的请求URL地址
+
+3 接着就是调用FeignLoadBalancer的execute()方法，向上面的请求URL地址发送一个http请求
+
+4 这里有一个很关键的点,其实就是发送请求的超时时间，这个是极为关键的一个参数
+
+```java
+public class FeignLoadBalancer extends
+		AbstractLoadBalancerAwareClient<FeignLoadBalancer.RibbonRequest, FeignLoadBalancer.RibbonResponse> {
+............................
+	@Override
+	public RibbonResponse execute(RibbonRequest request, IClientConfig configOverride)
+			throws IOException {
+		Request.Options options;
+    	//configOverride配置实例默认不为空，所以进入这个if
+		if (configOverride != null) {
+            //connectTimeout连接时间
+            //readTimeout读取时间
+			options = new Request.Options(
+					configOverride.get(CommonClientConfigKey.ConnectTimeout,
+							this.connectTimeout),
+					(configOverride.get(CommonClientConfigKey.ReadTimeout,
+							this.readTimeout)));
+		}
+		else {
+			options = new Request.Options(this.connectTimeout, this.readTimeout);
+		}
+    	//这块就是在发送物理的http请求,将相应结果封装为RibbonResponse就ok了
+		Response response = request.client().execute(request.toRequest(), options);
+		return new RibbonResponse(request.getUri(), response);
+	}
+............................
+}
+```
+
+FeignLoadBalancer.execute方法断点参数
+
+![image-20210729073834785](Feign.assets/image-20210729073834785.png)
+
+结果最终的在发起实际的http请求的时候，这个超时的时间，默认发现原来都是1000毫秒，也就是1秒钟
+
+## 5.7 feign处理请求的核心：如何处理服务返回的响应结果
+
+
+
+```java
+final class SynchronousMethodHandler implements MethodHandler {
+...............................
+  Object executeAndDecode(RequestTemplate template) throws Throwable {
+    Request request = targetRequest(template);
+
+    if (logLevel != Logger.Level.NONE) {
+      logger.logRequest(metadata.configKey(), logLevel, request);
+    }
+
+    Response response;
+    long start = System.nanoTime();
+    try {
+      //获取服务返回的响应结果response
+      response = client.execute(request, options);
+      // ensure the request is set. TODO: remove in Feign 10
+      response.toBuilder().request(request).build();
+    } catch (IOException e) {
+      if (logLevel != Logger.Level.NONE) {
+        logger.logIOException(metadata.configKey(), logLevel, e, elapsedTime(start));
+      }
+      throw errorExecuting(request, e);
+    }
+    long elapsedTime = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+
+    boolean shouldClose = true;
+    try {
+       //配置了对应日志等级就打印日志
+       //样例配置了full等级，所以这里会进入if打印日志
+      if (logLevel != Logger.Level.NONE) {
+        response =
+            logger.logAndRebufferResponse(metadata.configKey(), logLevel, response, elapsedTime);
+        // ensure the request is set. TODO: remove in Feign 10
+        response.toBuilder().request(request).build();
+      }
+      if (Response.class == metadata.returnType()) {
+        if (response.body() == null) {
+          return response;
+        }
+        if (response.body().length() == null ||
+                response.body().length() > MAX_RESPONSE_BUFFER_SIZE) {
+          shouldClose = false;
+          return response;
+        }
+        // Ensure the response body is disconnected
+        byte[] bodyData = Util.toByteArray(response.body().asInputStream());
+        return response.toBuilder().body(bodyData).build();
+      }
+      //返回正常结果的时候会进入这个if
+      if (response.status() >= 200 && response.status() < 300) {
+        if (void.class == metadata.returnType()) {
+          return null;
+        } else {
+          //最终会走这个decode方法
+          //核心方法，通过feign的Decode解码组件，将response中的json字符串反序列化为对象
+          return decode(response);
+        }
+      } else if (decode404 && response.status() == 404 && void.class != metadata.returnType()) {
+        return decode(response);
+      } else {
+        throw errorDecoder.decode(metadata.configKey(), response);
+      }
+    } catch (IOException e) {
+      if (logLevel != Logger.Level.NONE) {
+        logger.logIOException(metadata.configKey(), logLevel, e, elapsedTime);
+      }
+      throw errorReading(request, response, e);
+    } finally {
+      if (shouldClose) {
+        ensureClosed(response.body());
+      }
+    }
+  }
+...............................
+  Object decode(Response response) throws Throwable {
+    try {
+      return decoder.decode(response, metadata.returnType());
+    } catch (FeignException e) {
+      throw e;
+    } catch (RuntimeException e) {
+      throw new DecodeException(e.getMessage(), e);
+    }
+  }
+....................................
+}
+```
+
+decode方法断点参数
+
+![image-20210729075259242](Feign.assets/image-20210729075259242.png)
+
+1人家服务返回的是一个json，此时这个json串肯定是在哪儿呢？Response的body属性里
+
+2 decode方法，就是会用到我们之前所说的那个Decoder组件，来对返回的json串给他反序列化为我们指定的一个类型，默认的是ResponseEntityDecoder，用他来反序列化json串为一个user
+
+```
+ return decoder.decode(response, metadata.returnType());
+```
+
+1 response里，包含了人家返回的一个json串：{'msg': 'hello, 张三'}
+
+2 metadata.returnType()：class com.zhss.demo.User
+
+3 把这两个东西交给ResponseEntityDecoder，他就会将json给转化为User对象
