@@ -2928,9 +2928,11 @@ ribbon:
   ConnectTimeout: 1000 #连接超时时间
   ReadTimeout: 1000 #读取连接超时时间
   OkToRetryOnAllOperations: true #就是无论是请求的时候有什么异常，超时、报错，都会触发重试
-  MaxAutoRetries: 1   #当前机器最大重试次数
-  MaxAutoRetriesNextServer: 3 
+  MaxAutoRetries: 1   #每台机器最大重试次数
+  MaxAutoRetriesNextServer: 3 #最多重试几台机器
 ```
+
+**PS:最大重试次数为1，最多重试3台机器，如果所有机器/接口都超时，这边最多请求6次才会报错(请求一次、重试一次，所以是3*2=6)**
 
 ## 6.3 源码分析
 
@@ -3049,7 +3051,7 @@ RequestSpecificRetryHandler构造读取重试相关参数断点，retrySameServe
 
 ![image-20210731190033458](Feign.assets/image-20210731190033458.png)
 
-
+LoadBalancerCommand重试机制的核心类
 
 ```java
 public class LoadBalancerCommand<T> {
