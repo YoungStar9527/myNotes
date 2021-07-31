@@ -2895,3 +2895,531 @@ decode方法断点参数
 2 metadata.returnType()：class com.zhss.demo.User
 
 3 把这两个东西交给ResponseEntityDecoder，他就会将json给转化为User对象
+
+## 5.8 最终feign处理请求流程图
+
+流程图：
+
+https://www.processon.com/view/link/60ff4a75e401fd7e997e72a7
+
+# 6 feign整合ribbon的连接超时以及失败重试的配置参数以及源码分析
+
+## 6.1 前言
+
+**超时**
+
+微服务架构的系统中，起码你得配置一个超时的时间，timeout，一个服务调用另外一个服务，你起码得有个超时的时间。总不能说服务B调用服务A，楞是等了5分钟还没返回？？？起码得设置一个时间，服务B调用服务A，最多等待1s，还没返回的话，直接就判定这次请求失败了。
+
+**重试**
+
+服务B，调用服务A，服务A部署了3台机器
+
+现在服务B通过负载均衡的算法，调用到了服务A的机器1，结果呢，因为服务A的机器1宕机了，请求超时了，服务B这个时候咋办？？？你可以让服务B再次尝试一下请求服务A的机器1，如果还是不行的话，那么可以让服务B去尝试服务A的机器2，如果还是不行，可以去尝试服务A的机器3
+
+超时、重试、隔离、限流、熔断、降级
+
+## 6.2 配置参数
+
+spring cloud的feign和ribbon整合的这一块儿，如果要配置超时和重试，大概是下面这样子
+
+```yaml
+
+ribbon:
+  ConnectTimeout: 1000 #连接超时时间
+  ReadTimeout: 1000 #读取连接超时时间
+  OkToRetryOnAllOperations: true #就是无论是请求的时候有什么异常，超时、报错，都会触发重试
+  MaxAutoRetries: 1   #当前机器最大重试次数
+  MaxAutoRetriesNextServer: 3 
+```
+
+## 6.3 源码分析
+
+
+
+```java
+public abstract class AbstractLoadBalancerAwareClient<S extends ClientRequest, T extends IResponse> extends LoadBalancerContext implements IClient<S, T>, IClientConfigAware {
+
+    public T executeWithLoadBalancer(final S request, final IClientConfig requestConfig) throws ClientException {
+    	//核心类LoadBalancerCommand，通过ribbon负载均衡选择server
+        //buildLoadBalancerCommand方法读取了重试相关的配置
+        LoadBalancerCommand<T> command = buildLoadBalancerCommand(request, requestConfig);
+
+        try {
+            //这里最终调用submit方法，并且构建实现ServerOperation的匿名内部类
+            return command.submit(
+                new ServerOperation<T>() {
+                    
+                    //回调函数
+                    //每次重试最后都会到这个call方法，重新发送物理请求
+                    @Override
+                    public Observable<T> call(Server server) {
+                        //根据已有的servr获取uri
+                        URI finalUri = reconstructURIWithServer(server, request.getUri());
+                        S requestForServer = (S) request.replaceUri(finalUri);
+                        try {
+                            //最终发送物理请求
+                            //this.execute为FeignLoadBalancer.execute()，发送实际的http请求的时候，就会传入你设置的超时的参数
+                            return Observable.just(AbstractLoadBalancerAwareClient.this.execute(requestForServer, requestConfig));
+                        } 
+                        catch (Exception e) {
+                            return Observable.error(e);
+                        }
+                    }
+                })
+                .toBlocking()
+                .single();
+            //调用了一个toBlocking().single()方法，看着就是阻塞式同步执行，然后获取一个响应结果的这么一个意思
+        } catch (Exception e) {
+            Throwable t = e.getCause();
+            if (t instanceof ClientException) {
+                throw (ClientException) t;
+            } else {
+                throw new ClientException(e);
+            }
+        }
+        
+    }
+    
+    public abstract RequestSpecificRetryHandler getRequestSpecificRetryHandler(S request, IClientConfig requestConfig);
+    
+    protected LoadBalancerCommand<T> buildLoadBalancerCommand(final S request, final IClientConfig config) {
+        //FeignLoadBalancer.getRequestSpecificRetryHandler()方法中，就会读取你配置的几个参数：OkToRetryOnAllOperations、MaxAutoRetries、MaxAutoRetriesNextServer(重试相关的参数)
+		RequestSpecificRetryHandler handler = getRequestSpecificRetryHandler(request, config);
+		LoadBalancerCommand.Builder<T> builder = LoadBalancerCommand.<T>builder()
+				.withLoadBalancerContext(this)
+				.withRetryHandler(handler)
+				.withLoadBalancerURI(request.getUri());
+		customizeLoadBalancerCommandBuilder(request, config, builder);
+		return builder.build();
+	}
+}
+
+public class FeignLoadBalancer extends
+		AbstractLoadBalancerAwareClient<FeignLoadBalancer.RibbonRequest, FeignLoadBalancer.RibbonResponse> {
+....................
+    //FeignLoadBalancer.execute()，发送实际的http请求的时候，就会传入你设置的超时的参数
+	@Override
+	public RibbonResponse execute(RibbonRequest request, IClientConfig configOverride)
+			throws IOException {
+		Request.Options options;
+    	//configOverride配置实例默认不为空，所以进入这个if
+		if (configOverride != null) {
+            //connectTimeout连接时间
+            //readTimeout读取时间
+			options = new Request.Options(
+					configOverride.get(CommonClientConfigKey.ConnectTimeout,
+							this.connectTimeout),
+					(configOverride.get(CommonClientConfigKey.ReadTimeout,
+							this.readTimeout)));
+		}
+		else {
+			options = new Request.Options(this.connectTimeout, this.readTimeout);
+		}
+    	//这块就是在发送物理的http请求,将相应结果封装为RibbonResponse就ok了
+		Response response = request.client().execute(request.toRequest(), options);
+		return new RibbonResponse(request.getUri(), response);
+	}
+    
+	@Override
+	public RequestSpecificRetryHandler getRequestSpecificRetryHandler(
+			RibbonRequest request, IClientConfig requestConfig) {
+    	//这里OkToRetryOnAllOperations参数在配置中为true
+    	//所以进入这个if
+		if (this.clientConfig.get(CommonClientConfigKey.OkToRetryOnAllOperations,
+				false)) {
+            //构建RequestSpecificRetryHandler，在RequestSpecificRetryHandler构造中
+            //读取了配置的几个参数：OkToRetryOnAllOperations、MaxAutoRetries、MaxAutoRetriesNextServer(重试相关的参数)
+			return new RequestSpecificRetryHandler(true, true, this.getRetryHandler(),
+					requestConfig);
+		}
+		if (!request.toRequest().method().equals("GET")) {
+			return new RequestSpecificRetryHandler(true, false, this.getRetryHandler(),
+					requestConfig);
+		}
+		else {
+			return new RequestSpecificRetryHandler(true, true, this.getRetryHandler(),
+					requestConfig);
+		}
+	}
+....................
+}
+```
+
+RequestSpecificRetryHandler构造读取重试相关参数断点，retrySameServer为1次，retryNextServer为三次
+
+![image-20210731190033458](Feign.assets/image-20210731190033458.png)
+
+
+
+```java
+public class LoadBalancerCommand<T> {
+
+............................
+    public Observable<T> submit(final ServerOperation<T> operation) {
+        final ExecutionInfoContext context = new ExecutionInfoContext();
+        
+        if (listenerInvoker != null) {
+            try {
+                listenerInvoker.onExecutionStart();
+            } catch (AbortExecutionException e) {
+                return Observable.error(e);
+            }
+        }
+
+        final int maxRetrysSame = retryHandler.getMaxRetriesOnSameServer();
+        final int maxRetrysNext = retryHandler.getMaxRetriesOnNextServer();
+
+
+    	//这里调用了selectServer来选出一个server,如果server为空则调用（正常来说都是空，需要selectServer()来选择）
+    	//submit中调用了selectServer()方法负载均衡选择server为核心代码，其他的目前不需要关注
+        Observable<T> o = 
+                (server == null ? selectServer() : Observable.just(server))
+                .concatMap(new Func1<Server, Observable<T>>() {
+                    
+                    @Override
+                    //如果重试当前机器失败，然后就会判断是否需要重试其他机器，需要的话
+                    //就进入这个call来重试其他机器 
+                    public Observable<T> call(Server server) {
+                        context.setServer(server);
+                        final ServerStats stats = loadBalancerContext.getServerStats(server);
+                        
+                        // Called for each attempt and retry
+                        Observable<T> o = Observable
+                                .just(server)
+                                .concatMap(new Func1<Server, Observable<T>>() {
+                                    
+                                    //这里的call方法主要是用于回调传进来的operation的call方法
+                                    //就是之前那个匿名类的call方法，发起最终请求的
+                                   //判断完成是否需要重试后，就是进入的是该方法 
+                                    //就是重试当前机器就是进入这个call方法
+                                    @Override
+                                    public Observable<T> call(final Server server) {
+                                        context.incAttemptCount();
+                                        loadBalancerContext.noteOpenConnection(stats);
+                                        
+                                        if (listenerInvoker != null) {
+                                            try {
+                                                listenerInvoker.onStartWithServer(context.toExecutionInfo());
+                                            } catch (AbortExecutionException e) {
+                                                return Observable.error(e);
+                                            }
+                                        }
+                                        
+                                        final Stopwatch tracer = loadBalancerContext.getExecuteTracer().start();
+                                        //这里的 operation.call(server)就是调用之前那个，匿名内部类方法，传进来的operation
+                                        return operation.call(server).doOnEach(new Observer<T>() {
+                                            private T entity;
+                                            @Override
+                                            public void onCompleted() {
+                                                recordStats(tracer, stats, entity, null);
+                                                // TODO: What to do if onNext or onError are never called?
+                                            }
+
+                                            @Override
+                                            public void onError(Throwable e) {
+                                                recordStats(tracer, stats, null, e);
+                                                logger.debug("Got error {} when executed on server {}", e, server);
+                                                if (listenerInvoker != null) {
+                                                    listenerInvoker.onExceptionWithServer(e, context.toExecutionInfo());
+                                                }
+                                            }
+
+                                            @Override
+                                            public void onNext(T entity) {
+                                                this.entity = entity;
+                                                if (listenerInvoker != null) {
+                                                    listenerInvoker.onExecutionSuccess(entity, context.toExecutionInfo());
+                                                }
+                                            }                            
+                                            
+                                            private void recordStats(Stopwatch tracer, ServerStats stats, Object entity, Throwable exception) {
+                                                tracer.stop();
+                                                loadBalancerContext.noteRequestCompletion(stats, entity, exception, tracer.getDuration(TimeUnit.MILLISECONDS), retryHandler);
+                                            }
+                                        });
+                                    }
+                                });
+                        
+                        if (maxRetrysSame > 0) 
+                             //retryPolicy(maxRetrysSame, true)，重试相关的核心方法
+                            //maxRetrysSame当前机器的重试次数,true当前机器
+                            o = o.retry(retryPolicy(maxRetrysSame, true));
+                        return o;
+                    }
+                });
+        
+    	//这里if，在请求的时候，只会调用一次，如果是重试调用上面Observable中的call方法
+        if (maxRetrysNext > 0 && server == null) 
+            //retryPolic重试相关的核心方法
+            o = o.retry(retryPolicy(maxRetrysNext, false));
+    
+    //返回
+   	return o.onErrorResumeNext(new Func1<Throwable, Observable<T>>() {
+        //这里的call是在重试失败才会调用，所有重试都失败/超时，才会进入返回错误信息
+            @Override
+            public Observable<T> call(Throwable e) {
+                if (context.getAttemptCount() > 0) {
+                    if (maxRetrysNext > 0 && context.getServerAttemptCount() == (maxRetrysNext + 1)) {
+                        e = new ClientException(ClientException.ErrorType.NUMBEROF_RETRIES_NEXTSERVER_EXCEEDED,
+                                "Number of retries on next server exceeded max " + maxRetrysNext
+                                + " retries, while making a call for: " + context.getServer(), e);
+                    }
+                    else if (maxRetrysSame > 0 && context.getAttemptCount() == (maxRetrysSame + 1)) {
+                        e = new ClientException(ClientException.ErrorType.NUMBEROF_RETRIES_EXEEDED,
+                                "Number of retries exceeded max " + maxRetrysSame
+                                + " retries, while making a call for: " + context.getServer(), e);
+                    }
+                }
+                if (listenerInvoker != null) {
+                    listenerInvoker.onExecutionFailed(e, context.toFinalExecutionInfo());
+                }
+                return Observable.error(e);
+            }
+        });
+    }
+    
+................
+    //判断是否需要重试的核心方法
+    //如果是当前机器重试次数大于当前机器最大重试次数，返回false，就会再次进入该方法进行其他机器重试次数判断
+    private Func2<Integer, Throwable, Boolean> retryPolicy(final int maxRetrys, final boolean same) {
+        return new Func2<Integer, Throwable, Boolean>() {
+            
+            //如果进入重试，首先就进入该方法，判断是否需要重试 
+            @Override
+            public Boolean call(Integer tryCount, Throwable e) {
+                if (e instanceof AbortExecutionException) {
+                    return false;
+                }
+			
+                //tryCount为重试次数
+                //tryCount当前机器或其他机器的重试次数
+                //maxRetrys为最大重试次数
+                //maxRetrys当前或其他机器的最大重试次数
+                if (tryCount > maxRetrys) {
+                    return false;
+                }
+                
+                if (e.getCause() != null && e instanceof RuntimeException) {
+                    e = e.getCause();
+                }
+        
+                //isRetriableException判断当前出现的这个问题，是否需要重试，
+                //此时只要你设置了okToRetryOnAllErrors这个参数是true，全部会认为是要进行重试的
+                return retryHandler.isRetriableException(e, same);
+            }
+        };
+    }
+}
+```
+
+**本次总结调试，启动了8087,8088,8089三台机器**
+
+**其中8087,8088两台机器接口设置了等待2000ms，所以肯定会超时,8089是正常接口不会超时**
+
+**总结：**
+
+直接请求进来
+
+（1）FeignLoadBalancer.getRequestSpecificRetryHandler()：就是在读取我们配置的重试的参数，okToRetryOnAllErrors和okToRetryOnConnectErrors设置为true生效了，retrySameServer设置为1，retryNextServer设置为3
+
+（2）LoadBalancerCommand.submit()：maxRetrysSame和maxRetrysNext都是我们之前设置的1和3
+
+（3）FeignLoadBalancer.execute()方法中，发起请求的超时时间，都是1000毫秒，就是我们设置的
+
+（5）第一次负载均衡就是请求8087端口，很明显出问题了，就是说，请求超时了，1秒钟没有返回结果直接就超时了
+
+（6）超时之后，就会跳入那个LoadBalancerCommand.retryPolicy()的一个方法中，判断是否要进行重试，重试次数是否大于设置的retrySameServer，第一次重试肯定是1=1，不是1>1，RequestSpecificRetryHandler.isRetriableException()，判断当前出现的这个问题，是否需要重试，此时只要你设置了okToRetryOnAllErrors这个参数是true，全部会认为是要进行重试的
+
+（7）发现直接LoadBalancerCommand自动给你进行重试了，自动执行ServerOperation.call()方法，重试的还是8080这台机器，发现再次超时，又开始判断是否要进行重试，但是此时tryCount是2，trySameServer是1，也就是说我们设置的是最多同一台机器重试1次，但是此时已经到第二次重试了，此时会判断不要再重试这台机器了
+
+（8）直接代码会进到LoadBalancerCommand的判断是否要重试其他机器的代码里，此时会判断是否要重试其他机器，肯定是可以重试其他机器的
+
+（9）此时又进入了ServerOption.call()方法，为是8088这台机器，此时肯定还是超时，又会去判断是否要重试，retryPolicy()方法中。
+
+**PS:当重试到其他机器的时候，这个时候的其他机器就是当前机器了，就会请求一次，重试一次(最大重试次数为1)。**
+
+（10）然后第三次重试其他机器的时候，就会去重试8089机器了，此时就ok了
+
+对应服务请求次数日志记录：
+
+8087
+
+![image-20210731203123614](Feign.assets/image-20210731203123614.png)
+
+8088
+
+![image-20210731203142164](Feign.assets/image-20210731203142164.png)
+
+8089
+
+![image-20210731203148416](Feign.assets/image-20210731203148416.png)
+
+## 6.4 feign异常后重试机制
+
+```yaml
+spring:
+  cloud:
+loadbalancer:
+  retry:
+    enabled: true
+```
+
+**很多人都会告诉你，必须得启用上面那坨东西，才可以启用feign的重试机制，其实不是，其实这玩意是spring RestTemplate相关的重试机制，和feign重试没关系**
+
+配置相关参数，使其抛出异常
+
+主要就是去除重试相关的参数，保留超时参数，超时就会抛出异常
+
+```yaml
+server:
+  port: 9090
+spring:
+  application:
+    name: ServiceB
+
+eureka:
+  instance:
+    hostname: localhost
+  client:
+    serviceUrl:
+      defaultZone: http://localhost:8761/eureka
+
+ribbon:
+  ConnectTimeout: 1000
+  ReadTimeout: 1000
+#  OkToRetryOnAllOperations: true
+#  MaxAutoRetries: 1
+#  MaxAutoRetriesNextServer: 3
+
+logging.level.com.zhss.service.impl.ServiceAClient: DEBUG
+
+
+```
+
+**PS:就算这里去掉了重试参数，其实默认也会去重试一次(LoadBalancerCommand相关重试)，也就是超时的接口，会请求一次(超时)，重试一次，会请求两次（如果是多台机器，这里重试会负载均衡/轮询调用）**
+
+```java
+final class SynchronousMethodHandler implements MethodHandler {
+
+  @Override
+  public Object invoke(Object[] argv) throws Throwable {
+    //这里template生成 
+    //GET /user/sayHello/1?name=%E5%BC%A0%E4%B8%89&age=18 HTTP/1.1
+    RequestTemplate template = buildTemplateFromArgs.create(argv);
+    //这里的Retryer是默认不重试
+    Retryer retryer = this.retryer.clone();
+    //这里是while true，如果不是抛出异常，或者return结果，会一直循环
+    while (true) {
+      try {
+        return executeAndDecode(template);
+      } catch (RetryableException e) {
+        //抛出异常后会进入Retryer重试机制，feign的Retryer是默认不重试
+        retryer.continueOrPropagate(e);
+        if (logLevel != Logger.Level.NONE) {
+          logger.logRetry(metadata.configKey(), logLevel);
+        }
+        continue;
+      }
+    }
+  }
+  
+}
+```
+
+修改feign的Retryer，在配置类添加
+
+```java
+	
+    @Bean
+    public Retryer feignRetryer() {
+        //默认重试5次
+        return new Retryer.Default();
+    }
+```
+
+Retryer.Default
+
+```java
+public interface Retryer extends Cloneable {
+.........................
+  public static class Default implements Retryer {
+
+    private final int maxAttempts;
+    private final long period;
+    private final long maxPeriod;
+    int attempt;
+    long sleptForMillis;
+
+	//设置默认参数
+    public Default() {
+      //重试等待100ms,最大重试等待时间(1000ms),最大重试次数
+      this(100, SECONDS.toMillis(1), 5);
+    }
+
+    public Default(long period, long maxPeriod, int maxAttempts) {
+      this.period = period;
+      this.maxPeriod = maxPeriod;
+      this.maxAttempts = maxAttempts;
+      this.attempt = 1;
+    }
+
+    // visible for testing;
+    protected long currentTimeMillis() {
+      return System.currentTimeMillis();
+    }
+
+    //判断是否需要重试的核心方法
+    public void continueOrPropagate(RetryableException e) {
+      //重试次数大于最大次数，直接抛出异常结束重试(结束while循环)
+      if (attempt++ >= maxAttempts) {
+        throw e;
+      }
+	//没达到最大重试次数，则进行一些重试等待时间的调整
+      long interval;
+      if (e.retryAfter() != null) {
+        interval = e.retryAfter().getTime() - currentTimeMillis();
+        if (interval > maxPeriod) {
+          interval = maxPeriod;
+        }
+        if (interval < 0) {
+          return;
+        }
+      } else {
+        interval = nextMaxInterval();
+      }
+      try {
+        //重试等待
+        Thread.sleep(interval);
+      } catch (InterruptedException ignored) {
+        Thread.currentThread().interrupt();
+      }
+       //每次重试等待时间都会更长
+      sleptForMillis += interval;
+    }
+}
+.........................
+}
+```
+
+**总结**
+
+1 启用你自定义的一个Retryer，feign的Retryer才可以，默认情况下是没有重试，NO_RETRY，直接是报错
+
+2 人家Retryer.DEFAULT，默认是自动重试5次，每次重试的时候，会停留一段时间，这里是150ms，就会重试一次
+
+3 每次重试，都会依次访问ServiceA的每台机器，每台机器都会发现是超时了，再次休眠225ms，再次重试，每次重试的时间都是不一样的，都会不断的增加
+
+4 依次循环往复，来这么个5次，休眠时间变成了337ms
+
+**PS:这里Retryer.DEFAULT，默认是自动重试5次，实际上会请求10次，这里是外层5次，外层去调用内层LoadBalancerCommand发起请求，也会去重试一次(请求一次，重试一次)**
+
+**外层的这个Retryer到底有没有必要？**
+
+**我们生产环境里面，外层的Retryer一般不用(默认不重试即可)，我们其实就是针对某个服务实例发起的请求的时候，配置超时+报错，自己配置重试的策略**
+
+
+
+
+
+
+
