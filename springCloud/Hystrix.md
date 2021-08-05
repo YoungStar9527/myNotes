@@ -42,6 +42,18 @@ Hystrix通过将依赖服务进行资源隔离，进而组织某个依赖服务�
 
 解决复杂的分布式系统架构中，高可用的问题，避免服务被拖垮。
 
+![商品服务接口导致缓存服务资源耗尽的问题](Hystrix.assets/商品服务接口导致缓存服务资源耗尽的问题.png)
+
+### 1.1.5 扩展
+
+小型电商网站的静态化方案
+
+![小型电商网站的静态化方案](Hystrix.assets/小型电商网站的静态化方案.png)
+
+大型电商网站的详情页系统的架构
+
+![大型电商网站的详情页系统的架构](Hystrix.assets/大型电商网站的详情页系统的架构.png)
+
 ## 1.2 功能概述
 
 ### 1.2.1 基本功能
@@ -87,4 +99,211 @@ Hystrix通过将依赖服务进行资源隔离，进而组织某个依赖服务�
 （7）对属性和配置的修改提供近实时的支持
 
 # 2 hystrix使用及原理
+
+## 2.1 基于hystrix的线程池隔离技术进行商品服务接口的资源隔离
+
+### 2.1.1 前言
+
+​	**hystrix进行资源隔离，其实是提供了一个抽象，叫做command，就是说，你如果要把对某一个依赖服务的所有调用请求，全部隔离在同一份资源池内**
+
+​	对这个依赖服务的所有调用请求，全部走这个资源池内的资源，不会去用其他的资源了，这个就叫做资源隔离
+
+​	hystrix最最基本的资源隔离的技术，线程池隔离技术
+
+​	对某一个依赖服务，商品服务，所有的调用请求，全部隔离到一个线程池内，对商品服务的每次调用请求都封装在一个command里面
+
+​	每个command（每次服务调用请求）都是使用线程池内的一个线程去执行的
+
+​	所以哪怕是对这个依赖服务，商品服务，现在同时发起的调用量已经到了1000了，但是线程池内就10个线程，最多就只会用这10个线程去执行
+
+![资源隔离生效的讲解](Hystrix.assets/资源隔离生效的讲解.png)
+
+### 2.1.2 示例
+
+**最基本的利用HystrixCommand进行资源隔离样例**
+
+Command
+
+```java
+public class CommandHelloWorld extends HystrixCommand<ProductInfo> {
+
+    private Long productId;
+
+    public CommandHelloWorld(Long productId) {
+        super(HystrixCommandGroupKey.Factory.asKey("ExampleGroup"));
+        this.productId = productId;
+    }
+
+    @Override
+    protected ProductInfo run() {
+        // 拿到一个商品id
+        // 调用商品服务的接口，获取商品id对应的商品的最新数据
+        // 用HttpClient去调用商品服务的http接口
+        String url = "http://127.0.0.1:8082/getProductInfo?productId=" + productId;
+        String response = HttpClientUtils.sendGetRequest(url);
+        System.out.println(response);
+        return JSONObject.parseObject(response, ProductInfo.class);
+    }
+
+    public void setProductId(Long productId) {
+        this.productId = productId;
+    }
+}
+```
+
+调用
+
+```java
+	/**
+	 * 示例情况：nginx开始各级缓存都失效了。nginx发送很多请求直接到缓存服务拉取最原始的数据
+	 * @param productId
+	 * @return
+	 */
+	@RequestMapping("/getProductInfo")
+	@ResponseBody
+	public String getProductInfo(Long productId) throws ExecutionException, InterruptedException {
+		// 拿到一个商品id
+		// 调用商品服务的接口，获取商品id对应的商品的最新数据
+		// 用HttpClient去调用商品服务的http接口	
+		//1 不进行资源隔离
+//		String url = "http://127.0.0.1:8082/getProductInfo?productId=" + productId;
+//		String response = HttpClientUtils.sendGetRequest(url);
+//		System.out.println(response);
+		// 2 常用资源隔离的调用方式
+//		HystrixCommand<ProductInfo> hystrixCommand = new CommandHelloWorld(productId);
+//		ProductInfo execute = hystrixCommand.execute();
+//		System.out.println(execute);
+		// 3 异步资源隔离的调用方式
+		Future<ProductInfo> queue = new CommandHelloWorld(productId).queue();
+		System.out.println(queue.get());
+		Thread.sleep(1000);
+		System.out.println(queue.get());
+		return "success";
+	}
+```
+
+请求多次接口，多个结果资源隔离示例
+
+ObservableCommand
+
+```java
+public class ObservableCommandHelloWorld extends HystrixObservableCommand<ProductInfo> {
+
+
+    private Long[] productIds;
+
+    public ObservableCommandHelloWorld(Long[] productIds) {
+        super(HystrixCommandGroupKey.Factory.asKey("ExampleGroup"));
+        this.productIds = productIds;
+    }
+
+    /**
+     * 多次调用接口的command
+     * @return
+     */
+    @Override
+    protected Observable<ProductInfo> construct() {
+        return Observable.create(new Observable.OnSubscribe<ProductInfo>() {
+
+            @Override
+            public void call(Subscriber<? super ProductInfo> observer) {
+                try {
+                    //if (!observer.isUnsubscribed()) {
+                    for (Long productId : productIds) {
+                        String url = "http://127.0.0.1:8082/getProductInfo?productId=" + productId;
+                        String response = HttpClientUtils.sendGetRequest(url);
+                        ProductInfo productInfo = JSONObject.parseObject(response, ProductInfo.class);
+                        observer.onNext(productInfo);
+
+                    }
+                        //observer.onNext("Hi " + name + "!");
+                        observer.onCompleted();
+                    //}
+                } catch (Exception e) {
+                    observer.onError(e);
+                }
+            }
+        } ).subscribeOn(Schedulers.io());
+    }
+}
+```
+
+调用
+
+```java
+	/**
+	 * 请求多次接口
+	 * @param productIds
+	 * @return
+	 */
+	@RequestMapping("/getProductInfoAll")
+	@ResponseBody
+	public String getProductInfoAll(String productIds) throws ExecutionException, InterruptedException {
+		Long[] collect = Arrays.asList(productIds.split(",")).stream().map(a -> Long.parseLong(a)).toArray(Long[]::new);
+		//1 常用资源隔离调用方式
+//		HystrixObservableCommand<ProductInfo> getProductInfoCommand = new ObservableCommandHelloWorld(collect);
+//		Observable<ProductInfo> observe = getProductInfoCommand.observe();
+//		observe.subscribe(new Observer<ProductInfo>() {
+//			@Override
+//			public void onCompleted() {
+//				System.out.println("获取完了所有数据");
+//			}
+//
+//			@Override
+//			public void onError(Throwable e) {
+//				e.printStackTrace();
+//			}
+//
+//			//每条返回数据的回调方法
+//			@Override
+//			public void onNext(ProductInfo productInfo) {
+//				System.out.println(productInfo);
+//			}
+//		});
+
+		//2 该使用方式只能一次onNext回调，多次则报错
+//		ProductInfo productInfo = new ObservableCommandHelloWorld(collect).toObservable().toBlocking().toFuture().get();
+//		System.out.println(productInfo);
+		//3 异步不常用资源隔离调用方式
+		Future<ProductInfo> productInfoFuture = new ObservableCommandHelloWorld(collect).toObservable().toBlocking().toFuture();
+		System.out.println(productInfoFuture.get());
+		Thread.sleep(1000);
+		System.out.println(productInfoFuture.get());
+		//toObservable延迟执行 observe立即执行
+		//延迟执行时指调用下一个subscribe方法时才执行
+		return "success";
+	}
+```
+
+**总结：**
+
+HystrixCommand：是用来获取一条数据的
+HystrixObservableCommand：是设计用来获取多个结果的
+
+**command的四种调用方式**
+
+**同步：**
+
+1 new CommandHelloWorld("World").execute()，
+
+2 new ObservableCommandHelloWorld("World").toBlocking().toFuture().get()
+
+如果你认为observable command只会返回一条数据，那么可以调用上面的模式，去同步执行，返回一条数据
+
+**异步：**
+
+3 new CommandHelloWorld("World").queue()
+
+4 new ObservableCommandHelloWorld("World").toBlocking().toFuture()
+
+对command调用queue()，仅仅将command放入线程池的一个等待队列，就立即返回，拿到一个Future对象，后面可以做一些其他的事情，然后过一段时间对future调用get()方法获取数据
+
+**立即调用/延迟调用**
+
+ observe()：hot，已经执行过了
+ toObservable(): cold，还没执行过（延迟执行时指调用下一个subscribe方法时才执行）
+
+**好处：**
+
+不让超出这个量的请求去执行了，保护说，不要因为某一个依赖服务的故障，导致耗尽了缓存服务中的所有的线程资源去执行
 
