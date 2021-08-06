@@ -237,9 +237,7 @@ public class MyPing implements IPing {
 
 ![image-20210712221121852](Ribbon.assets/image-20210712221121852.png)
 
-**扩展：**
 
-​	**ribbon比较重要的几个API，RestClient、ILoadBalancer、IRule、IPing**
 
 ## 1.5 spring cloud环境中的Ribbon使用
 
@@ -293,6 +291,10 @@ public class ServiceBConfiguration {
 ​	ILoadBalancer里面包含IRule和IPing，IRule负责从一堆server list中根据负载均衡的算法，选择出来某个server，关键是，server list从哪儿来？
 
 <img src="Ribbon.assets/image-20210713204308541.png" alt="image-20210713204308541" style="zoom: 200%;" />
+
+## 1.7 ribbon核心组件
+
+**ribbon比较重要的几个API，RestClient(spring cloud为LoadBalancerClient)、ILoadBalancer、IRule、IPing**
 
 # 2 ribbon入口源码解读
 
