@@ -12,7 +12,7 @@
 
 ![image-20210804073649054](Hystrix.assets/image-20210804073649054.png)
 
-### 1.1.2、Hystrix是什么？
+### 1.1.2 Hystrix是什么？
 
 在分布式系统中，每个服务都可能会调用很多其他服务，被调用的那些服务就是依赖服务，有的时候某些依赖服务出现故障也是很正常的。
 
@@ -38,7 +38,7 @@ Hystrix通过将依赖服务进行资源隔离，进而组织某个依赖服务�
 
 完全描述了hystrix的功能，提供整个分布式系统的高可用的架构
 
-### 1.1.4、Hystrix要解决的问题是什么？
+### 1.1.4 Hystrix要解决的问题是什么？
 
 解决复杂的分布式系统架构中，高可用的问题，避免服务被拖垮。
 
@@ -306,4 +306,528 @@ HystrixObservableCommand：是设计用来获取多个结果的
 **好处：**
 
 不让超出这个量的请求去执行了，保护说，不要因为某一个依赖服务的故障，导致耗尽了缓存服务中的所有的线程资源去执行
+
+## 2.2 线程池与信号量
+
+### 2.2.1 线程池与信号量
+
+**hystrix，资源隔离，两种技术，线程池的资源隔离，信号量的资源隔离**
+
+**线程池：**适合绝大多数的场景，99%的，线程池，对依赖服务的网络请求的调用和访问，timeout这种问题
+
+**信号量（semaphore）：**适合，你的访问不是对外部依赖的访问，而是对内部的一些比较复杂的业务逻辑的访问，但是像这种访问，系统内部的代码，其实不涉及任何的网络请求，那么只要做信号量的普通限流就可以了，因为不需要去捕获timeout类似的问题，算法+数据结构的效率不是太高，并发量突然太高，因为这里稍微耗时一些，导致很多线程卡在这里的话，不太好，所以进行一个基本的资源隔离和访问，避免内部复杂的低效率的代码，导致大量的线程被hang住
+
+**信号量跟线程池，两种资源隔离的技术，区别到底在哪儿呢？**
+
+**区别：**
+
+**1 线程池是基于web容器的线程另外开启线程来控制web容器线程执行的**
+
+**2 信号量是基于web容器的线程，不开启额外线程，就是对web容器的线程进行一些限制**
+
+### 2.2.2 信号量的使用场景
+
+在代码中加入从本地内存获取地理位置数据的逻辑
+
+业务背景里面， 比较适合信号量的是什么场景呢？
+
+比如说，我们一般来说，**缓存服务，可能会将部分量特别少，访问又特别频繁的一些数据，放在自己的纯内存中**
+
+一般我们在获取到商品数据之后，都要去获取商品是属于哪个地理位置，省，市，卖家的，可能在自己的纯内存中，比如就一个Map去获取
+
+**对于这种直接访问本地内存的逻辑，比较适合用信号量做一下简单的隔离**
+
+**优点在于，不用自己管理线程池拉，不用care timeout超时了，信号量做隔离的话，性能会相对来说高一些**
+
+### 2.2.3 代码实例
+
+​	**代码用法和线程池的基本使用无区别，区别在核心基于构造者模式的调用链中，添加ExecutionIsolationStrategy.SEMAPHORE相关的信号量配置**
+
+```java
+super(Setter.withGroupKey(HystrixCommandGroupKey.Factory.asKey("ExampleGroup"))
+        .andCommandPropertiesDefaults(HystrixCommandProperties.Setter()
+               .withExecutionIsolationStrategy(ExecutionIsolationStrategy.SEMAPHORE)));
+```
+
+### 2.2.4 核心原理图
+
+**线程池与信号量的区别及原理**
+
+![线程池隔离和信号量隔离的原理以及区别](../../架构课/课程资料/第二阶段/Spring Cloud从0基础入门到精通核心组件源码/090_基于hystrix的信号量技术对地理位置获取逻辑进行资源隔离与限流/线程池隔离和信号量隔离的原理以及区别.png)
+
+**PS:超过线程池和信号量配置的最大请求数，都会通过相关拒绝策略去拒绝(reject)并降级请求。**
+
+## 2.3 command相关配置介绍
+
+### 2.3.1 前言
+
+资源隔离，两种策略，线程池隔离，信号量隔离
+
+对资源隔离这一块东西，做稍微更加深入一些的讲解，告诉你，除了可以选择隔离策略以外，对你选择的隔离策略，可以做一定的细粒度的一些控制
+
+**PS:HystrixCommand及HystrixObservableCommand类都是没有无参构造的抽象类**
+
+**1 子类必须实现抽象方法，run方法或construct方法**
+
+**2 因为父类只有有参构造，所以必须在子类的构造中显示的调用父类的有参构造**
+
+**PS:2.3小结的配置代码都不是完整代码，仅为该配置的相关代码，都是基于父类有参构造利用构造器/建造者模式构建HystrixCommandGroupKey或HystrixCommand.Setter等相关代码**
+
+**例：**
+
+```java
+    public CommandSemaphore(Long productId) {
+        super(Setter.withGroupKey(HystrixCommandGroupKey.Factory.asKey("ExampleGroup"))
+                .andCommandPropertiesDefaults(HystrixCommandProperties.Setter()
+                .withExecutionIsolationStrategy(HystrixCommandProperties.ExecutionIsolationStrategy.SEMAPHORE)));
+        this.productId = productId;
+    }
+```
+
+
+
+### 2.3.2 线程池与信号量的配置及使用场景
+
+**配置:execution.isolation.strategy**
+
+对应代码
+
+```java
+// to use thread isolation 线程池
+HystrixCommandProperties.Setter()
+   .withExecutionIsolationStrategy(ExecutionIsolationStrategy.THREAD)
+// to use semaphore isolation 信号量
+HystrixCommandProperties.Setter()
+   .withExecutionIsolationStrategy(ExecutionIsolationStrategy.SEMAPHORE)
+```
+
+**指定了HystrixCommand.run()的资源隔离策略，THREAD或者SEMAPHORE，一种是基于线程池，一种是信号量**
+
+**线程池机制：**每个command运行在一个线程中，限流是通过线程池的大小来控制的
+
+**信号量机制：**command是运行在调用线程中，但是通过信号量的容量来进行限流
+
+**如何在线程池和信号量之间做选择？**
+
+1 **默认的策略就是线程池**
+
+2 线程池其实最大的好处就是对于网络访问请求，如果有超时的话，可以避免调用线程阻塞住
+
+3 而使用信号量的场景，通常是针对超大并发量的场景下，每个服务实例每秒都几百的QPS，那么此时你用线程池的话，线程一般不会太多，可能撑不住那么高的并发，如果要撑住，可能要耗费大量的线程资源，那么就是用信号量，来进行限流保护
+
+4 一般用信号量常见于那种基于纯内存的一些业务逻辑服务，而不涉及到任何网络访问请求
+
+**PS:netflix有多数的command运行在的线程池中，只有少数command是不运行在线程池中的，就是从纯内存中获取一些元数据，或者是对多个command包装起来的facacde command，是用信号量限流的**
+
+### 2.3.3 command名称和command组
+
+线程池隔离，依赖服务->接口->线程池
+
+**每个command，都可以设置一个自己的名称，同时可以设置一个自己的组**
+
+```java
+private static final Setter cachedSetter = 
+//设置组
+    Setter.withGroupKey(HystrixCommandGroupKey.Factory.asKey("ExampleGroup"))
+    //设置command名称
+        .andCommandKey(HystrixCommandKey.Factory.asKey("HelloWorld"));    
+```
+
+**command group，是一个非常重要的概念，默认情况下，因为就是通过command group来定义一个线程池的**，而且还会通过command group来聚合一些监控和报警信息
+
+**同一个command group中的请求，都会进入同一个线程池中**
+
+### 2.3.4 command线程池
+
+#### 2.3.4.1 线程池与command
+
+**threadpool key(线程池key)代表了一个HystrixThreadPool**，用来进行统一监控，统计，缓存
+
+**默认的threadpool key就是command group(comnand组)名称**
+
+每个command都会跟它的对应线程池key的线程池绑定在一起
+
+如果不想直接用command group，也可以手动设置thread pool name
+
+```java
+public CommandHelloWorld(String name) {
+    super(Setter.withGroupKey(HystrixCommandGroupKey.Factory.asKey("ExampleGroup"))
+            .andCommandKey(HystrixCommandKey.Factory.asKey("HelloWorld"))
+            .andThreadPoolKey(HystrixThreadPoolKey.Factory.asKey("HelloWorldPool")));
+    this.name = name;
+}
+```
+
+#### 2.3.4.2 对应服务如何合理的使用线程池
+
+##### 2.3.4.2.1 一般情况
+
+command threadpool -> command group -> command key
+
+**command key，代表了一类command，一般来说，代表了底层的依赖服务的一个接口**
+
+**command group，代表了某一个底层的依赖服务，合理，一个依赖服务可能会暴露出来多个接口，每个接口就是一个command key**
+
+command group，在逻辑上去组织起来一堆command key的调用，统计信息，成功次数，timeout超时次数，失败次数，可以看到某一个服务整体的一些访问情况
+
+command group，一般来说，推荐是根据一个服务去划分出一个线程池，command key默认都是属于同一个线程池的
+
+**场景：**
+
+比如说你以一个服务为粒度，估算出来这个服务每秒的所有接口加起来的整体QPS在100左右(能够承载)
+
+你调用那个服务的当前服务，部署了10个服务实例，每个服务实例上，其实用这个command group对应这个服务，给一个线程池，量大概在10个左右，就可以了，你对整个服务的整体的访问QPS大概在每秒100左右
+
+**(当前服务10*每个服务线程池10线程限制=100被调用服务的承载QPS)**
+
+##### 2.3.4.2.2 其他情况
+
+服务->线程池 、服务->某个功能模块->线程池、服务->某个功能模块->某个接口->线程池
+
+**服务->线程池**
+
+一般来说，command group是用来在逻辑上组合一堆command的
+
+**服务->某个功能模块->线程池**
+
+举个例子，对于一个服务中的某个功能模块来说，希望将这个功能模块内的所有command放在一个group中，那么在监控和报警的时候可以放一起看
+
+**服务->某个功能模块->某个接口->线程池**
+
+command group，对应了一个服务，但是这个服务暴露出来的几个接口，访问量很不一样，差异非常之大
+
+你可能就希望在这个服务command group内部，包含的对应多个接口的command key，做一些细粒度的资源隔离
+
+对同一个服务的不同接口，都使用不同的线程池
+
+每个command key有自己的线程池，
+
+每个接口有自己的线程池，去做资源隔离和限流
+
+##### 2.3.4.2.3 command key与command group的关系
+
+**逻辑上来说，多个command key属于一个command group，在做统计的时候，会放在一起统计**
+
+但是对于thread pool资源隔离来说，可能是希望能够拆分的更加一致一些，比如在一个功能模块内，对不同的请求可以使用不同的thread pool
+
+command group一般来说，可以是对应一个服务，多个command key对应这个服务的多个接口，多个接口的调用共享同一个线程池
+
+如果说你的command key，要用自己的线程池，可以定义自己的threadpool key，就ok了
+
+**PS:正常来说就是一个服务对应一个group(线程池)，也可以根据服务中的功能模块划分线程池，甚至根据接口划分线程池，都可以根据需求去灵活定制**
+
+### 2.3.5 coreSize(线程池大小)
+
+**设置线程池的大小，默认是10**
+
+```java
+HystrixThreadPoolProperties.Setter()
+   .withCoreSize(int value)
+```
+
+一般来说，用这个默认的10个线程大小就够了
+
+### 2.3.6 queueSizeRejectionThreshold队列大小
+
+**就是设置队列的大小**
+
+**控制queue满后reject的threshold(入口)**，因为maxQueueSize不允许热修改，因此**提供这个参数可以热修改，控制队列的最大大小**
+
+**HystrixCommand在提交到线程池之前，其实会先进入一个队列中，这个队列满了之后，才会reject**
+
+**默认值是5**
+
+```java
+HystrixThreadPoolProperties.Setter()
+   .withQueueSizeRejectionThreshold(int value)
+```
+
+### 2.3.7允许访问的最大并发量
+
+**execution.isolation.semaphore.maxConcurrentRequests**
+
+**设置使用SEMAPHORE隔离策略的时候，允许访问的最大并发量，超过这个最大并发量，请求直接被reject**
+
+这个并发量的设置，跟线程池大小的设置，应该是类似的，但是基于信号量的话，性能会好很多，而且hystrix框架本身的开销会小很多
+
+**默认值是10，建议设置的小一些**，否则因为信号量是基于调用线程去执行command的，而且不能从timeout中抽离，因此一旦设置的太大，而且有延时发生，可能瞬间导致tomcat本身的线程资源本占满
+
+```java
+HystrixCommandProperties.Setter()
+   .withExecutionIsolationSemaphoreMaxConcurrentRequests(int value)
+```
+
+### 2.3.8 线程池+queue的工作原理
+
+![线程池+queue的工作原理](Hystrix.assets/线程池+queue的工作原理.png)
+
+## 2.4 深入分析hystrix执行时的8大流程步骤以及内部原理
+
+### 2.4.1 前言
+
+画图分析整个8大步骤的流程，然后再对每个步骤进行细致的讲解
+
+![hystrix执行时的8大流程以及内部原理](../../架构课/课程资料/第二阶段/Spring Cloud从0基础入门到精通核心组件源码/092_深入分析hystrix执行时的8大流程步骤以及内部原理/hystrix执行时的8大流程以及内部原理.png)
+
+### 2.4.2 八大流程步骤
+
+#### 2.4.2.1 构建一个HystrixCommand或者HystrixObservableCommand
+
+一个HystrixCommand或一个HystrixObservableCommand对象，代表了对某个依赖服务发起的一次请求或者调用
+
+构造的时候，可以在构造函数中传入任何需要的参数
+
+**HystrixCommand主要用于仅仅会返回一个结果的调用**
+**HystrixObservableCommand主要用于可能会返回多条结果的调用**
+
+```java
+HystrixCommand command = new HystrixCommand(arg1, arg2);
+HystrixObservableCommand command = new HystrixObservableCommand(arg1, arg2);
+```
+
+#### 2.4.2.2 调用command的执行方法
+
+执行Command就可以发起一次对依赖服务的调用
+
+**要执行Command，需要在4个方法中选择其中的一个：execute()，queue()，observe()，toObservable()**
+
+其中**execute()和queue()仅仅对HystrixCommand适用**
+
+**execute()：调用后直接block住，属于同步调用**，直到依赖服务返回单条结果，或者抛出异常
+**queue()：返回一个Future，属于异步调用**，后面可以通过Future获取单条结果
+**observe()：订阅一个Observable对象**，Observable代表的是依赖服务返回的结果，获取到一个那个代表结果的Observable对象的拷贝对象
+**toObservable()：返回一个Observable对象**，如果我们订阅这个对象，就会执行command并且获取返回结果
+
+**PS:observe()为直接订阅调用，toObservable为延迟调用是返回Observable对象，直到调用对应方法订阅这个对象才会去执行。**
+
+```java
+K             value   = command.execute();
+Future<K>     fValue  = command.queue();
+Observable<K> ohValue = command.observe();         
+Observable<K> ocValue = command.toObservable();    
+```
+
+**execute()实际上会调用queue().get().queue()，接着会调用toObservable().toBlocking().toFuture()**
+
+**也就是说，无论是哪种执行command的方式，最终都是依赖toObservable()去执行的**
+
+#### 2.4.2.3 检查是否开启缓存
+
+从这一步开始，进入我们的底层的运行原理啦，了解hysrix的一些更加高级的功能和特性
+
+如果这个**command开启了请求缓存，request cache，而且这个调用的结果在缓存中存在，那么直接从缓存中返回结果**
+
+#### 2.4.2.4 检查是否开启了短路器
+
+检查这个command对应的依赖服务是否开启了短路器
+
+**如果短路器被打开了，那么hystrix就不会执行这个command，而是直接去执行fallback降级机制**
+
+#### 2.4.2.5 检查线程池/队列/semaphore是否已经满了
+
+如果command对应的线程池/队列/semaphore**已经满了，那么也不会执行command，而是直接去调用fallback降级机制**
+
+**PS:线程池满了会加入到队列中并不会直接拒绝，对应队列也会有相应的长度，队列满了才会拒绝**
+
+??信号量有没有队列的说法
+
+#### 2.4.2.6 执行command
+
+**调用HystrixObservableCommand.construct()或HystrixCommand.run()来实际执行这个command**
+
+HystrixCommand.run()是返回一个单条结果，或者抛出一个异常
+HystrixObservableCommand.construct()是返回一个Observable对象，可以获取多条结果
+
+如果**HystrixCommand.run()或HystrixObservableCommand.construct()的执行，超过了timeout时长的话，那么command所在的线程就会抛出一个TimeoutException**
+
+如果**timeout了，也会去执行fallback降级机制**，而且就不会管run()或construct()返回的值了
+
+这里要注意的一点是，我们是不可能/**不会终止掉一个调用严重延迟的依赖服务的线程的，只能说给你抛出来一个TimeoutException**，但是还是可能会因为严重延迟的调用线程占满整个线程池的
+
+即使这个时候新来的流量都被限流了。。。
+
+如果没有timeout的话，那么就会拿到一些调用依赖服务获取到的结果，然后hystrix会做一些logging记录和metric统计??
+
+#### 2.4.2.7 短路健康检查
+
+**Hystrix会将每一个依赖服务的调用成功，失败，拒绝，超时，等事件，都会发送给circuit breaker断路器**
+
+短路器就会对调用**成功/失败/拒绝/超时等事件的次数进行统计**
+
+短路器会根据这些**统计次数来决定，是否要进行短路，如果打开了短路器，那么在一段时间内就会直接短路**，然后如果在之后第一次**检查发现调用成功了，就关闭断路器**
+
+**PS:类似于eureka的自我保护机制**
+
+#### 2.4.2.8 调用fallback降级机制
+
+**在以下几种情况中，hystrix会调用fallback降级机制：run()或construct()抛出一个异常，短路器打开，线程池/队列/semaphore满了，command执行超时了**
+
+**一般在降级机制中，都建议给出一些默认的返回值，比如静态的一些代码逻辑，或者从内存中的缓存中提取一些数据，尽量在这里不要再进行网络请求了**
+
+即使在降级中，一定要进行网络调用，也应该将那个调用放在一个HystrixCommand中，进行隔离
+
+**在HystrixCommand中，上线getFallback()方法，可以提供降级机制**
+
+在**HystirxObservableCommand中，实现一个resumeWithFallback()方法，返回一个Observable对象，可以提供降级结果**
+
+**如果fallback返回了结果，那么hystrix就会返回这个结果**
+
+对于HystrixCommand，会返回一个Observable对象，其中会发返回对应的结果
+对于HystrixObservableCommand，会返回一个原始的Observable对象
+
+**如果没有实现fallback，或者是fallback抛出了异常，Hystrix会返回一个Observable，但是不会返回任何数据**
+
+不同的command执行方式，其fallback为空或者异常时的返回结果不同
+
+对于execute()，直接抛出异常
+对于queue()，返回一个Future，调用get()时抛出异常
+对于observe()，返回一个Observable对象，但是调用subscribe()方法订阅它时，理解抛出调用者的onError方法
+对于toObservable()，返回一个Observable对象，但是调用subscribe()方法订阅它时，理解抛出调用者的onError方法
+
+### 2.4.3 不同的执行方式
+
+execute()，获取一个Future.get()，然后拿到单个结果
+queue()，返回一个Future
+observer()，立即订阅Observable，然后启动8大执行步骤，返回一个拷贝的Observable，订阅时立即回调给你结果
+toObservable()，返回一个原始的Observable，必须手动订阅才会去执行8大步骤
+
+## 2.5 request cache请求缓存
+
+### 2.5.1 请求上下文
+
+首先，有一个概念，叫做reqeust context，请求上下文，一般来说，在一个web应用中，hystrix
+
+我们会在一个filter里面，对每一个请求都施加一个请求上下文，就是说，tomcat容器内，每一次请求，就是一次请求上下文
+
+然后在这次**请求上下文中，我们会去执行N多代码，调用N多依赖服务，有的依赖服务可能还会调用好几次**
+
+在一次请求上下文中，如果有多个command，参数都是一样的，调用的接口也是一样的，其实结果可以认为也是一样的
+
+那么这个时候，**我们就可以让第一次command执行，返回的结果，被缓存在内存中，然后这个请求上下文中，后续的其他对这个依赖的调用全部从内存中取用缓存结果就可以了**
+
+**不用在一次请求上下文中反复多次的执行一样的command，提升整个请求的性能**
+
+### 2.5.2 request cache使用示例
+
+HystrixCommand和HystrixObservableCommand都可以指定一个缓存key，然后hystrix会自动进行缓存，接着在同一个request context内，再次访问的时候，就会直接取用缓存
+
+用请求缓存，可以避免重复执行网络请求
+
+**多次调用一个command，那么只会执行一次，后面都是直接取缓存**
+
+对于请求缓存（request caching），请求合并（request collapsing），请求日志（request log），等等技术，都必须自己管理HystrixReuqestContext的声明周期
+
+在一个请求执行之前，都必须先初始化一个request context
+
+```java
+HystrixRequestContext context = HystrixRequestContext.initializeContext();
+```
+
+然后在请求结束之后，需要关闭request context
+
+```java
+context.shutdown();
+```
+
+**PS:结合Hystrix的请求上下文，才能使用request cache缓存**
+
+command的request cache使用示例
+
+```java
+public class CommandUsingRequestCache extends HystrixCommand<Boolean> {
+
+    private final int value;
+
+    public static final  HystrixCommandKey KEY = HystrixCommandKey.Factory.asKey("ExampleCommand");
+
+    public CommandUsingRequestCache(int value) {
+        super(Setter.withGroupKey(HystrixCommandGroupKey.Factory.asKey("ExampleGroup"))
+                .andCommandKey(KEY));
+        this.value = value;
+    }
+    @Override
+    protected Boolean run() {
+        //偶数返回true
+        return value == 0 || value % 2 == 0;
+    }
+    /**
+     * 声明使用缓存
+     * @return
+     */
+    @Override
+    protected String getCacheKey() {
+        return String.valueOf(value);
+    }
+    /**
+     * 清除 request cache
+     * @param id
+     */
+    public static void flushCache(int id) {
+        HystrixRequestCache.getInstance(KEY,
+                HystrixConcurrencyStrategyDefault.getInstance()).clear(String.valueOf(id));
+    }
+}
+
+```
+
+调用示例
+
+```java
+	@RequestMapping("/getProductInfoCache")
+	@ResponseBody
+	public String getProductInfoCache(String productIds){
+		HystrixRequestContext context = HystrixRequestContext.initializeContext();
+		try {
+			int i = 0;
+			for (String s : productIds.split(",")) {
+				CommandUsingRequestCache command2a = new CommandUsingRequestCache(Integer.parseInt(s));
+				//execute返回结果，偶数返回true
+				Boolean execute = command2a.execute();
+				System.out.println("execute"+s + execute);
+				//cache是否用了缓存，用了缓存返回true
+				System.out.println("cache"+s + command2a.isResponseFromCache());
+				System.out.println("");
+				//测试缓存清除，为偶数时则清除缓存，缓存就不生效
+				//测试仅清除一次缓存
+				if(execute&&i<1){
+					i++;
+					CommandUsingRequestCache.flushCache(Integer.parseInt(s));
+				}
+			}
+		}catch (Exception e){
+			e.printStackTrace();
+		}finally {
+			context.shutdown();
+		}
+		return "success";
+	}
+```
+
+请求及参数
+
+```
+http://localhost:8081/getProductInfoCache?productIds=1,1,1,2,2,3
+```
+
+调用日志
+
+![image-20210807171822228](Hystrix.assets/image-20210807171822228.png)
+
+**PS:两个红框分别对应两次request context(上下文)，两次请求**
+
+总结：
+
+1 如调用日志所示，第一次调用相同参数的接口时未使用缓存，第二次则使用了缓存
+
+2 第一次请求时存入了缓存，第二次就可以直接使用缓存(同一接口，相同参数)
+
+3 清除缓存后则下一次调用就没有缓存了
+
+4 清除缓存只清除当前缓存，下一次还调用，不清除缓存的话，还是会有缓存的
+
+5 request cache缓存都是在一个request context(上下文)中才能使用的，下一个request context(上下文)就和上一次的缓存没有关系了
+
+原理图：
+
+![request cache的原理](Hystrix.assets/request cache的原理.png)
 

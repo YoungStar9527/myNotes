@@ -292,6 +292,10 @@ public class ServiceBConfiguration {
 
 <img src="Ribbon.assets/image-20210713204308541.png" alt="image-20210713204308541" style="zoom: 200%;" />
 
+流程图：
+
+https://www.processon.com/view/link/610d08261e0853337b20e9f7
+
 ## 1.7 ribbon核心组件
 
 **ribbon比较重要的几个API，RestClient(spring cloud为LoadBalancerClient)、ILoadBalancer、IRule、IPing**
