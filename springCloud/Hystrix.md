@@ -559,6 +559,8 @@ HystrixCommandProperties.Setter()
 
 ### 2.3.8 线程池+queue的工作原理
 
+先进入线程池，线程池满了再进入队列
+
 ![线程池+queue的工作原理](Hystrix.assets/线程池+queue的工作原理.png)
 
 ## 2.4 深入分析hystrix执行时的8大流程步骤以及内部原理
@@ -830,4 +832,280 @@ http://localhost:8081/getProductInfoCache?productIds=1,1,1,2,2,3
 原理图：
 
 ![request cache的原理](Hystrix.assets/request cache的原理.png)
+
+## 2.6 fallback降级机制
+
+### 2.6.1 几种会导致降级的情况
+
+1 hystrix调用各种接口，或者访问外部依赖，mysql，redis，zookeeper，kafka，等等，如果出现了任何异常的情况
+
+比如说报错了，访问mysql报错，redis报错，zookeeper报错，kafka报错，error**(就是抛出异常了)**
+
+2 对每个外部依赖，无论是服务接口，中间件，资源隔离，对外部依赖只能用一定量的资源去访问，线程池/信号量，如果资源池已满，reject**(就是请求数超出线程池/信号量长度限制了)**
+
+3 访问外部依赖的时候，访问时间过长，可能就会导致超时，报一个TimeoutException异常，timeout**(就是访问超时了)**
+
+上述三种情况，都是我们说的异常情况，对外部依赖的东西访问的时候出现了异常，发送异常事件到短路器中去进行统计
+
+4 **如果短路器发现异常事件的占比达到了一定的比例，直接开启短路**，circuit breaker
+
+上述四种情况，都会去调用fallback降级机制
+
+**PS:总结就是,run()抛出异常，超时，线程池或信号量满了，或短路了，都会调用fallback机制**
+
+### 2.6.2 降级机制的示例
+
+command降级示例
+
+```java
+public class CommandHelloFailure extends HystrixCommand<String> {
+
+    private final String name;
+
+    public CommandHelloFailure(String name) {
+        super(HystrixCommandGroupKey.Factory.asKey("ExampleGroup"));
+        this.name = name;
+    }
+
+    /**
+     * run直接抛出异常，就会触发降级，返回fallback内容
+     * @return
+     */
+    @Override
+    protected String run() {
+        throw new RuntimeException("this command always fails");
+    }
+
+    /**
+     * 重写getFallback，定义fallback返回值
+     * @return
+     */
+    @Override
+    protected String getFallback() {
+        return "Hello Failure " + name + "!";
+    }
+
+}
+```
+
+HystrixObservableCommand，是实现resumeWithFallback方法，这里就不示例了
+
+### 2.6.3 降级相关设置
+
+```
+fallback.isolation.semaphore.maxConcurrentRequests
+```
+
+这个参数设置了HystrixCommand.getFallback()最大允许的并发请求数量，默认值是10，也是通过semaphore信号量的机制去限流
+
+如果超出了这个最大值，那么直接被reject(拒绝)
+
+**PS:这个参数就是限制同时触发降级方法的请求数量(限流)，避免降级方法也被大量请求访问，导致(堵住/hang住/卡死)**
+
+```java
+HystrixCommandProperties.Setter()
+   .withFallbackIsolationSemaphoreMaxConcurrentRequests(int value)
+```
+
+### 2.6.4 fallback常用方式及场景
+
+两种最经典的降级机制：纯内存数据，默认值
+
+**内存数据：**
+
+1 fallback，降级机制，你之前都是必须去调用外部的依赖接口，或者从mysql中去查询数据的，但是为了避免说可能外部依赖会有故障
+
+2 比如，你可以**在内存中维护一个ehcache，作为一个纯内存的基于LRU自动清理的缓存，数据也可以放入缓存内**
+
+**3 如果说外部依赖有异常，fallback这里，直接尝试从ehcache中获取数据**
+
+**PS:EhCache 是一个纯Java的进程内缓存框架**
+
+**默认值：**
+
+比如说，本来你是从mysql，redis，或者其他任何地方去获取数据的，获取调用其他服务的接口的，结果人家故障了，人家挂了，fallback，可以返回一个默认值
+
+**场景：**
+
+给大家举个例子，比如说我们现在有个商品数据，brandId，品牌，一般来说，假设，正常的逻辑，拿到了一个商品数据以后，用brandId再调用一次请求，到其他的服务去获取品牌的最新名称
+
+**假如说，那个品牌服务挂掉了，那么我们可以尝试本地内存中，会保留一份时间比较过期的一份品牌数据**，有些品牌没有，有些品牌的名称过期了，Nike++，Nike
+
+**调用品牌服务失败了，fallback降级就从本地内存中获取一份过期的数据，先凑合着用着**
+
+## 2.7 hystrix短路器原理
+
+### 2.7.1 短路器工作原理
+
+1、**如果经过短路器的流量超过了一定的阈值**，HystrixCommandProperties.circuitBreakerRequestVolumeThreshold()
+
+举个例子，可能看起来是这样子的，**要求在10s内(时间窗口)，经过短路器的流量必须达到20个(默认20)；在10s内，经过短路器的流量才10个，那么根本不会去判断要不要短路**
+
+2、**如果断路器统计到的异常调用的占比超过了一定的阈值**，HystrixCommandProperties.circuitBreakerErrorThresholdPercentage()
+
+如果达到了上面的要求，比如说在10s内，经过短路器的流量（你，只要执行一个command，这个请求就一定会经过短路器），达到了30个；同时其中异常的访问数量，占到了一定的比例，比**如说60%(默认超过50%)的请求都是异常（报错，timeout，reject）**，**会开启短路**
+
+3、然后**短路器从close状态转换到open状态**
+
+4、**短路器打开的时候，所有经过该断路器的请求全部被短路，不调用后端服务，直接走fallback降级**
+
+5、**经过了一段时间之后(默认5秒)，HystrixCommandProperties.circuitBreakerSleepWindowInMilliseconds()，会half-open(半开状态)，让一条请求经过短路器，看能不能正常调用。如果调用成功了，那么就自动恢复，转到close状态**
+
+短路器，会自动恢复的，half-open，半开状态
+
+### 2.7.2 circuit breaker短路器配置
+
+**（1）circuitBreaker.enabled(是否开启短路器，默认true)**
+
+控制短路器是否允许工作，包括跟踪依赖服务调用的健康状况，以及对异常情况过多时是否允许触发短路，默认是true
+
+```java
+HystrixCommandProperties.Setter()
+   .withCircuitBreakerEnabled(boolean value)
+```
+
+**（2）circuitBreaker.requestVolumeThreshold(短路器触发请求阈值)**
+
+设置一个rolling window，滑动窗口中，最少要有多少个请求时，才触发开启短路
+
+举例来说，如果设置为20（默认值），那么在一个10秒的滑动窗口内，如果只有19个请求，即使这19个请求都是异常的，也是不会触发开启短路器的
+
+```java
+HystrixCommandProperties.Setter()
+   .withCircuitBreakerRequestVolumeThreshold(int value)
+```
+
+**（3）circuitBreaker.sleepWindowInMilliseconds(短路至半开状态等待时长)**
+
+设置在短路之后，需要在多长时间内直接reject请求，然后在这段时间之后，再重新导holf-open状态，尝试允许请求通过以及自动恢复，默认值是5000毫秒
+
+```java
+HystrixCommandProperties.Setter()
+   .withCircuitBreakerSleepWindowInMilliseconds(int value)
+```
+
+**（4）circuitBreaker.errorThresholdPercentage(开启短路的异常请求百分比)**
+
+设置异常请求量的百分比，当异常请求达到这个百分比时，就触发打开短路器，默认是50，也就是50%
+
+```java
+HystrixCommandProperties.Setter()
+   .withCircuitBreakerErrorThresholdPercentage(int value)
+```
+
+**（5）circuitBreaker.forceOpen(强制打开短路器)**
+
+如果设置为true的话，直接强迫打开短路器，相当于是手动短路了，手动降级，默认false
+
+```java
+HystrixCommandProperties.Setter()
+   .withCircuitBreakerForceOpen(boolean value)
+```
+
+**（6）circuitBreaker.forceClosed(强制停止/关闭短路器)**
+
+如果设置为ture的话，直接强迫关闭短路器，相当于是手动停止短路了，手动升级，默认false
+
+```java
+HystrixCommandProperties.Setter()
+   .withCircuitBreakerForceClosed(boolean value)
+```
+
+### 2.7.3 触发短路器示例
+
+测试command
+
+```java
+public class CommandCircuitBreaker extends HystrixCommand<ProductInfo> {
+
+    private Long productId;
+
+    public CommandCircuitBreaker(Long productId) {
+        super(HystrixCommandGroupKey.Factory.asKey("ExampleGroup"));
+        this.productId = productId;
+    }
+
+    @Override
+    protected ProductInfo run() throws Exception {
+        //当参数为-1时则抛出异常，测试短路
+        if(productId==-1){
+            throw new Exception();
+        }
+        String url = "http://127.0.0.1:8082/getProductInfo?productId=" + productId;
+        String response = HttpClientUtils.sendGetRequest(url);
+        System.out.println(response);
+        return JSONObject.parseObject(response, ProductInfo.class);
+    }
+
+    /**
+     * 服务降级返回默认值
+     * @return
+     */
+    @Override
+    protected ProductInfo getFallback() {
+        ProductInfo productInfo = new ProductInfo();
+        productInfo.setId(productId);
+        productInfo.setName("默认");
+        return productInfo;
+    }
+}
+```
+
+调用
+
+```java
+   public static void main(String[] args) throws InterruptedException {
+        //前10次正常请求
+        for(int i = 0;i < 10;i++){
+            HystrixCommand<ProductInfo> command = new CommandCircuitBreaker(1L);
+            ProductInfo execute = command.execute();
+            System.out.println("第"+i+"次请求，结果为:"+execute);
+        }
+        System.out.println("第一次正常请求测试结束");
+        //10-25次会抛出异常，降级
+        for(int i = 10;i < 25;i++){
+            HystrixCommand<ProductInfo> command = new CommandCircuitBreaker(-1L);
+            ProductInfo execute = command.execute();
+            System.out.println("第"+i+"次请求，结果为:"+execute);
+        }
+        System.out.println("第二次异常请求测试结束");
+        //这里等待5秒的原因是，统计单位有个时间窗口，需要在时间窗口后，才会说hystrix去看下最近的这个时间窗口
+        //比如说最近的0秒内有多少条数据，其中异常的数据有没有到一定的比例，如果到了一定的比例，那么才会去短路
+        //等待5秒，后续请求会进入进入短路器，直接短路，不会再调用run方法了，直接降级fallback
+        Thread.sleep(5000);
+        //25-35次的正常请求也会被短路，降级fallback
+        for(int i = 25;i < 35;i++){
+            HystrixCommand<ProductInfo> command = new CommandCircuitBreaker(1L);
+            ProductInfo execute = command.execute();
+            System.out.println("第"+i+"次请求，结果为:"+execute);
+        }
+        System.out.println("第三次正常请求测试结束，会短路");
+        //这里等待5秒是，在进入短路状态后，默认经过5秒后，才会进入半开状态，尝试恢复
+        //再等待5秒，短路器会进入半开状态，尝试恢复
+        Thread.sleep(5000);
+        //已经进入半开状态，第35次尝试请求，成功后则关闭短路器，恢复正常执行
+        for(int i = 35;i < 45;i++){
+            HystrixCommand<ProductInfo> command = new CommandCircuitBreaker(1L);
+            ProductInfo execute = command.execute();
+            System.out.println("第"+i+"次请求，结果为:"+execute);
+        }
+        System.out.println("第四次正常请求测试结束，恢复短路状态");
+    }
+```
+
+测试结果：
+
+![image-20210807231151154](Hystrix.assets/image-20210807231151154.png)
+
+10-25次会抛出异常，降级
+
+实际结果，到第24次时候就开启了短路器机制，没有再调用方法抛出异常了
+
+25-35次的正常请求也会被短路，降级fallback
+
+已经进入半开状态，第35次尝试请求，成功后则关闭短路器，恢复正常执行
+
+![image-20210807231543162](Hystrix.assets/image-20210807231543162.png)
+
+
 

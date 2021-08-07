@@ -292,9 +292,13 @@ public class ServiceBConfiguration {
 
 <img src="Ribbon.assets/image-20210713204308541.png" alt="image-20210713204308541" style="zoom: 200%;" />
 
-流程图：
+**流程图：**
 
 https://www.processon.com/view/link/610d08261e0853337b20e9f7
+
+**思维导图：**
+
+https://www.processon.com/view/link/610e6e306376891eb94c6d6b
 
 ## 1.7 ribbon核心组件
 
@@ -500,7 +504,7 @@ restTemplate.getForObject("http://ServiceA/sayHello/leo", String.class);
 
 2 这个内部就干一件事儿，就是从你的url地址里获取hostname作为服务名称，就是你要请求的服务的名称，
 
-3 就是找LoadBalancerClient去执行	对应的负载均衡的请求，将解析出来的服务名称穿进去，
+3 就是找LoadBalancerClient去执行	对应的负载均衡的请求，将解析出来的服务名称传进去，
 
 4 还有就是基于RequestFactory创建出来的一个request
 
