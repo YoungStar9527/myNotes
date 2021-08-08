@@ -731,7 +731,31 @@ HystrixRequestContext context = HystrixRequestContext.initializeContext();
 context.shutdown();
 ```
 
-**PS:结合Hystrix的请求上下文，才能使用request cache缓存**
+**PS:结合Hystrix的请求上下文，才能使用request cache缓存,一般来说，在java web来的应用中，都是通过filter过滤器来实现的**
+
+```java
+//实现filter
+public class HystrixRequestContextServletFilter implements Filter {
+
+    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain) 
+     throws IOException, ServletException {
+        HystrixRequestContext context = HystrixRequestContext.initializeContext();
+        try {
+            chain.doFilter(request, response);
+        } finally {
+            context.shutdown();
+        }
+    }
+}
+
+//bean注册到spring容器中
+@Bean
+public FilterRegistrationBean indexFilterRegistration() {
+    FilterRegistrationBean registration = new FilterRegistrationBean(new IndexFilter());
+    registration.addUrlPatterns("/");
+    return registration;
+}
+```
 
 command的request cache使用示例
 
@@ -778,8 +802,9 @@ public class CommandUsingRequestCache extends HystrixCommand<Boolean> {
 	@RequestMapping("/getProductInfoCache")
 	@ResponseBody
 	public String getProductInfoCache(String productIds){
-		HystrixRequestContext context = HystrixRequestContext.initializeContext();
-		try {
+		//这里通过filter已经开启了hystrix上下文，所以不用额外再开启一次
+		//HystrixRequestContext context = HystrixRequestContext.initializeContext();
+//		try {
 			int i = 0;
 			for (String s : productIds.split(",")) {
 				CommandUsingRequestCache command2a = new CommandUsingRequestCache(Integer.parseInt(s));
@@ -796,11 +821,11 @@ public class CommandUsingRequestCache extends HystrixCommand<Boolean> {
 					CommandUsingRequestCache.flushCache(Integer.parseInt(s));
 				}
 			}
-		}catch (Exception e){
-			e.printStackTrace();
-		}finally {
-			context.shutdown();
-		}
+//		}catch (Exception e){
+//			e.printStackTrace();
+//		}finally {
+//			context.shutdown();
+//		}
 		return "success";
 	}
 ```
@@ -900,7 +925,7 @@ fallback.isolation.semaphore.maxConcurrentRequests
 
 如果超出了这个最大值，那么直接被reject(拒绝)
 
-**PS:这个参数就是限制同时触发降级方法的请求数量(限流)，避免降级方法也被大量请求访问，导致(堵住/hang住/卡死)**
+**PS:降级的调用是使用信号量去做限流的，默认是10。这个参数就是限制同时触发降级方法的请求数量(限流)，避免降级方法也被大量请求访问，导致(堵住/hang住/卡死)**
 
 ```java
 HystrixCommandProperties.Setter()
@@ -1107,5 +1132,556 @@ public class CommandCircuitBreaker extends HystrixCommand<ProductInfo> {
 
 ![image-20210807231543162](Hystrix.assets/image-20210807231543162.png)
 
+## 2.8 hystrix线程隔离及限流
 
+### 2.8.1 线程池隔离技术的设计原则
+
+**Hystrix采取了bulkhead舱壁隔离技术，来将外部依赖进行资源隔离，进而避免任何外部依赖的故障导致本服务崩溃**
+
+**线程池隔离，学术名称：bulkhead，舱壁隔离**
+
+外部依赖的调用在单独的线程中执行，这样就能跟调用线程隔离开来，避免外部依赖调用timeout耗时过长，导致调用线程被卡死
+
+Hystrix对每个外部依赖用一个单独的线程池，这样的话，如果对那个外部依赖调用延迟很严重，最多就是耗尽那个依赖自己的线程池而已，不会影响其他的依赖调用
+
+Hystrix选择用线程池机制来进行资源隔离，要面对的场景如下：
+
+（1）每个服务都会调用几十个后端依赖服务，那些后端依赖服务通常是由很多不同的团队开发的
+（2）每个后端依赖服务都会提供它自己的client调用库，比如说用thrift的话，就会提供对应的thrift依赖
+（3）client调用库随时会变更
+（4）client调用库随时可能会增加新的网络请求的逻辑
+（5）client调用库可能会包含诸如自动重试，数据解析，内存中缓存等逻辑
+（6）client调用库一般都对调用者来说是个黑盒，包括实现细节，网络访问，默认配置，等等
+（7）在真实的生产环境中，经常会出现调用者，突然间惊讶的发现，client调用库发生了某些变化
+（8）即使client调用库没有改变，依赖服务本身可能有会发生逻辑上的变化
+（9）有些依赖的client调用库可能还会拉取其他的依赖库，而且可能那些依赖库配置的不正确
+（10）大多数网络请求都是同步调用的
+（11）调用失败和延迟，也有可能会发生在client调用库本身的代码中，不一定就是发生在网络请求中
+
+**简单来说，就是你必须默认client调用库就很不靠谱，而且随时可能各种变化，所以就要用强制隔离的方式来确保任何服务的故障不能影响当前服务**
+
+### 2.8.2 线程池优缺点
+
+线程池机制的优点如下：
+
+（1）任何一个依赖服务都可以被隔离在自己的线程池内，即使自己的线程池资源填满了，也不会影响任何其他的服务调用
+（2）服务可以随时引入一个新的依赖服务，因为即使这个新的依赖服务有问题，也不会影响其他任何服务的调用
+（3）当一个故障的依赖服务重新变好的时候，可以通过清理掉线程池，瞬间恢复该服务的调用，而如果是tomcat线程池被占满，再恢复就很麻烦
+（4）如果一个client调用库配置有问题，线程池的健康状况随时会报告，比如成功/失败/拒绝/超时的次数统计，然后可以近实时热修改依赖服务的调用配置，而不用停机
+（5）如果一个服务本身发生了修改，需要重新调整配置，此时线程池的健康状况也可以随时发现，比如成功/失败/拒绝/超时的次数统计，然后可以近实时热修改依赖服务的调用配置，而不用停机
+（6）基于线程池的异步本质，可以在同步的调用之上，构建一层异步调用层
+
+**简单来说，最大的好处，就是资源隔离，确保说，任何一个依赖服务故障，不会拖垮当前的这个服务**
+
+线程池机制的缺点：
+
+**（1）线程池机制最大的缺点就是增加了cpu的开销**
+
+除了tomcat本身的调用线程之外，还有hystrix自己管理的线程池
+
+（2）每个command的执行都依托一个独立的线程，会进行排队，调度，还有上下文切换
+（3）**Hystrix官方自己做了一个多线程异步带来的额外开销**，通过对比多线程异步调用+同步调用得出，Netflix API每天通过hystrix执行10亿次调用，每个服务实例有40个以上的线程池，每个线程池有10个左右的线程
+（4）**最后发现说，用hystrix的额外开销，就是给请求带来了3ms左右的延时，最多延时在10ms以内，相比于可用性和稳定性的提升，这是可以接受的**
+
+### 2.8.3 限流
+
+#### 2.8.3.1 限流的意义
+
+把一个分布式系统中的某一个服务，打造成一个高可用的服务
+
+资源隔离，优雅降级，熔断
+
+判断，线程池或者信号量的容量是否已满，reject，限流
+
+限流，限制对后端的服务的访问量，比如说你对mysql，redis，zookeeper，各种后端的中间件的资源，访问，其实为了避免过大的流浪打死后端的服务，线程池，信号量，限流
+
+限制服务对后端的资源的访问
+
+#### 2.8.3.2 semaphore(信号量)限流的特点
+
+我们可以用hystrix semaphore技术来实现对某个依赖服务的并发访问量的限制，而不是通过线程池/队列的大小来限制流量
+
+sempahore技术可以用来限流和削峰，但是不能用来对调研延迟的服务进行timeout和隔离
+
+execution.isolation.strategy，设置为SEMAPHORE，那么hystrix就会用semaphore机制来替代线程池机制，来对依赖服务的访问进行限流
+
+如果通过semaphore调用的时候，底层的网络调用延迟很严重，那么是无法timeout的，只能一直block住
+
+一旦请求数量超过了semephore限定的数量之后，就会立即开启限流
+
+### 2.8.4 限流实验 
+
+command示例
+
+```java
+public class CommandReject extends HystrixCommand<ProductInfo> {
+
+    private Long productId;
+
+    public CommandReject(Long productId) {
+        super(Setter.withGroupKey(HystrixCommandGroupKey.Factory.asKey("ExampleGroup"))
+                .andCommandKey(HystrixCommandKey.Factory.asKey("ExampleCommand"))
+                .andThreadPoolKey(HystrixThreadPoolKey.Factory.asKey("ExampleThreadPool"))
+                .andThreadPoolPropertiesDefaults(HystrixThreadPoolProperties.Setter()
+                        //设置线程池大小
+                        .withCoreSize(10)
+                        //设置队列大小，如果不设置，默认不开启队列
+                        .withMaxQueueSize(12)
+                        //withQueueSizeRejectionThreshold这个参数未起到作用，未解之谜??
+                        //如果有用的话
+                        //这个参数主要是因为队列长度不能修改，设置该参数来动态限制队列大小
+                        //小于队列长度则队列长度相当于该参数，如果大于队列长度则该参数不生效，还是队列长度
+                        .withQueueSizeRejectionThreshold(8)
+                    )
+                .andCommandPropertiesDefaults(HystrixCommandProperties.Setter()
+                        .withCircuitBreakerRequestVolumeThreshold(30)
+                        .withCircuitBreakerErrorThresholdPercentage(40)
+                        .withCircuitBreakerSleepWindowInMilliseconds(3000)
+                        //timeout也设置大一些，否则如果请求放等待队列中时间太长了，直接就会timeout，等不到去线程池里执行了
+                        .withExecutionTimeoutInMilliseconds(20000)
+                    //fallback，semaphore限流，30个，避免太多的请求同时调用fallback被拒绝访问
+                    .withFallbackIsolationSemaphoreMaxConcurrentRequests(30)));
+        this.productId = productId;
+    }
+
+    @Override
+    protected ProductInfo run() throws Exception {
+        //当参数为-1时则等待，超时
+        if(productId==-1){
+            //等待两秒
+            Thread.sleep(2000);
+        }
+        String url = "http://127.0.0.1:8082/getProductInfo?productId=" + productId;
+        String response = HttpClientUtils.sendGetRequest(url);
+        System.out.println(response);
+        return JSONObject.parseObject(response, ProductInfo.class);
+    }
+
+    /**
+     * 服务降级返回默认值
+     * @return
+     */
+    @Override
+    protected ProductInfo getFallback() {
+        ProductInfo productInfo = new ProductInfo();
+        productInfo.setId(productId);
+        productInfo.setName("默认");
+        return productInfo;
+    }
+}
+```
+
+对应接口
+
+```java
+	@RequestMapping("/getProductInfoReject")
+	@ResponseBody
+	public ProductInfo getProductInfoReject(Long productId){
+		HystrixCommand<ProductInfo> hystrixCommand = new CommandReject(productId);
+		ProductInfo execute = hystrixCommand.execute();
+		return execute;
+	}
+```
+
+调用示例
+
+```java
+public class RejectTest {
+
+    public static void main(String[] args) {
+        for(long i = 0; i < 30; i++){
+            new Thread(new ThreadTest(i)).start();
+        }
+    }
+
+    private static class ThreadTest implements Runnable{
+
+        private Long productId;
+
+        public ThreadTest(Long productId) {
+            this.productId = productId;
+        }
+
+        @Override
+        public void run() {
+            String url = "http://127.0.0.1:8081/getProductInfoReject?productId=" + -1;
+            String response = HttpClientUtils.sendGetRequest(url);
+            System.out.println("第"+productId+"次执行，"+"结果为:"+response);
+        }
+    }
+}
+```
+
+调用结果：
+
+多线程同时访问30次，22次正常返回结果，8次请求被降级
+
+对应线程池10+队列12=22次，剩下8次请求被降级了
+
+**但是withQueueSizeRejectionThreshold这个参数未起到作用，未解之谜??**
+
+### 2.8.5 隔离/限流场景
+
+**简单来说，就是你必须默认client调用库就很不靠谱，而且随时可能各种变化，所以就要用强制隔离的方式来确保任何服务的故障不能影响当前服务**
+
+在一些大公司里，做一些复杂的项目的话，广告计费系统，特别复杂，可能涉及多个团队，总共三四十个人，五六十个人，一起去开发一个系统，每个团队负责一块儿
+
+每个团队里的每个人，负责一个服务，或者几个服务，比较常见的大公司的复杂分布式系统项目的分工合作的一个流程，**其他团队的服务是不靠谱的，需要避免其他服务的问题影响到自己的服务**
+
+## 2.9 timeout超时机制
+
+### 2.9.1 需要超时机制的场景
+
+一般来说，在调用依赖服务的接口的时候，比较常见的一个问题，就是超时
+
+**超时是在一个复杂的分布式系统中，导致不稳定，或者系统抖动，或者出现说大量超时，线程资源hang死，吞吐量大幅度下降，甚至服务崩溃**
+
+超时最大的一个问题
+
+你去调用各种各样的依赖服务，特别是在大公司，你甚至都不认识开发一个服务的人，你都不知道那个人的水平怎么样，不了解
+
+比尔盖茨说过一句话，在互联网的另外一头，你都不知道甚至坐着一条狗
+
+分布式系统，大公司，多个团队，大型协作，服务是谁的，不了解，很可能说那个哥儿们，实习生都有可能
+
+**在一个复杂的系统里，可能你的依赖接口的性能很不稳定，有时候2ms，200ms，2s**
+
+**如果你不对各种依赖接口的调用，做超时的控制，来给你的服务提供安全保护措施，那么很可能你的服务就被各种垃圾的依赖服务的性能给拖死了**
+
+大量的接口调用很慢，大量线程就卡死了，资源隔离，线程池的线程卡死了，超时的控制
+
+### 2.9.2 超时的参数配置
+
+（1）execution.isolation.thread.timeoutInMilliseconds
+
+手动设置timeout时长，一个command运行超出这个时间，就被认为是timeout，然后将hystrix command标识为timeout，同时执行fallback降级逻辑
+
+默认是1000，也就是1000毫秒
+
+```java
+HystrixCommandProperties.Setter()
+   .withExecutionTimeoutInMilliseconds(int value)
+```
+
+（2）execution.timeout.enabled
+
+控制是否要打开timeout机制，默认是true
+
+```java
+HystrixCommandProperties.Setter()
+   .withExecutionTimeoutEnabled(boolean value)
+```
+
+让一个command执行timeout，然后看是否会调用fallback降级
+
+### 2.9.2 超时示例
+
+超时command
+
+```java
+public class CommandTimeOut extends HystrixCommand<ProductInfo> {
+
+    private Long productId;
+
+    public CommandTimeOut(Long productId) {
+        //超时时间默认是1秒这里就不设置了
+        super(HystrixCommandGroupKey.Factory.asKey("ExampleGroup"));
+        this.productId = productId;
+    }
+
+    @Override
+    protected ProductInfo run() throws InterruptedException {
+        if(productId==-1){
+            //等待1秒
+            Thread.sleep(1000);
+        }
+        String url = "http://127.0.0.1:8082/getProductInfo?productId=" + productId;
+        String response = HttpClientUtils.sendGetRequest(url);
+        System.out.println(response);
+        return JSONObject.parseObject(response, ProductInfo.class);
+    }
+
+    /**
+     * 服务降级返回默认值
+     * @return
+     */
+    @Override
+    protected ProductInfo getFallback() {
+        ProductInfo productInfo = new ProductInfo();
+        productInfo.setId(productId);
+        productInfo.setName("默认");
+        return productInfo;
+    }
+
+}
+```
+
+调用
+
+```java
+	@RequestMapping("/getProductInfoTimeOut")
+	@ResponseBody
+	public ProductInfo getProductInfoTimeOut(Long productId){
+		HystrixCommand<ProductInfo> hystrixCommand = new CommandTimeOut(productId);
+		ProductInfo execute = hystrixCommand.execute();
+		return execute;
+	}
+```
+
+## 2.10 hystrix核心知识总结
+
+### 2.10.1 hystrix的核心知识
+
+1、hystrix内部工作原理：8大执行步骤和流程
+2、资源隔离：你如果有很多个依赖服务，高可用性，先做资源隔离，任何一个依赖服务的故障不会导致你的服务的资源耗尽，不会崩溃
+3、请求缓存：对于一个request context内的多个相同command，使用request cache，提升性能
+4、熔断：基于短路器，采集各种异常事件，报错，超时，reject，短路，熔断，一定时间范围内就不允许访问了，直接降级，自动恢复的机制
+5、降级：报错，超时，reject，熔断，降级，服务提供容错的机制
+6、限流：在你的服务里面，通过线程池，或者信号量，限制对某个后端的服务或资源的访问量，避免从你的服务这里过去太多的流量，打死某个资源
+7、超时：避免某个依赖服务性能过差，导致大量的线程hang住去调用那个服务，会导致你的服务本身性能也比较差
+
+已经可以快速利用hystrix给自己开发的服务增加各种高可用的保障措施了，避免你的系统因为各种各样的异常情况导致崩溃，不可用
+
+### 2.10.2 hystrix的高阶知识
+
+1、request collapser，请求合并技术
+2、fail-fast和fail-slient，高阶容错模式
+3、static fallback和stubbed fallback，高阶降级模式
+4、嵌套command实现的发送网络请求的降级模式
+5、基于facade command的多级降级模式
+6、request cache的手动清理
+7、生产环境中的线程池大小以及timeout配置优化经验
+8、线程池的自动化动态扩容与缩容技术
+9、hystrix的metric高阶配置
+10、基于hystrix dashboard的可视化分布式系统监控
+11、生产环境中的hystrix工程运维经验
+
+# 3 hystrix的高阶知识
+
+## 3.1 request collapser请求合并
+
+### 3.1.1 请求合并的意义
+
+hystrix，高级的技术，request collapser，请求合并技术，collapser折叠
+
+优化过一个批量查询的接口了，request cache来做优化，可能有相同的商品就可以直接取用缓存了
+
+多个商品，需要发送多次网络请求，调用多次接口，才能拿到结果
+
+**可以使用HystrixCollapser将多个HystrixCommand合并到一起，多个command放在一个command里面去执行，发送一次网络请求，就拉取到多条数据**
+
+**用请求合并技术，将多个请求合并起来，可以减少高并发访问下需要使用的线程数量以及网络连接数量，这都是hystrix自动进行的**
+
+其实对于高并发的访问来说，是可以提升性能的
+
+### 3.1.2 请求合并的适用场景
+
+请求合并技术的开销有多大
+
+**使用请求合并技术的开销就是导致延迟大幅度增加，因为需要一定的时间将多个请求合并起来**
+
+发送过来10个请求，每个请求本来大概是2ms可以返回，要把10个请求合并在一个command内，统一一起执行，先后等待一下，5ms
+
+所以说，要考量一下，使用请求合并技术是否合适，如果一个请求本来耗费的时间就比较长，那么进行请求合并，增加一些延迟影响并不大
+
+**请求合并技术，不是针对那种访问延时特别低的请求的，比如说你的访问延时本身就比较高，20ms，10个请求合并在一起，25ms，这种情况下就还好**
+
+**好处在哪里**，大幅度削减你的线程池的资源耗费，线程池，10个线程，一秒钟可以执行10个请求，合并在一起，1个线程执行10个请求，10个线程就可以执行100个请求
+
+**增加你的吞吐量**
+
+减少你对后端服务访问时的网络资源的开销，10个请求，10个command，10次网络请求的开销，1次网络请求的开销了
+
+
+每个请求就2ms，batch，8~10ms，延迟增加了4~5倍
+
+每个请求本来就30ms~50ms，batch，35ms~55ms，延迟增加不太明显
+
+### 3.1.3 请求合并的配置
+
+请求合并有很多种级别
+
+（1）global context，tomcat所有调用线程，对一个依赖服务的任何一个command调用都可以被合并在一起，hystrix就传递一个HystrixRequestContext
+
+**（2）user request context，tomcat内某一个调用线程，将某一个tomcat线程对某个依赖服务的多个command调用合并在一起(常用)**
+
+（3）object modeling，基于对象的请求合并，如果有几百个对象，遍历后依次调用每个对象的某个方法，可能导致发起几百次网络请求，基于hystrix可以自动将对多个对象模型的调用合并到一起**(基本不用)**
+
+**（1）maxRequestsInBatch**
+
+控制一个Batch中最多允许多少个request被合并，然后才会触发一个batch的执行
+
+**默认值是无限大，就是不依靠这个数量来触发执行，而是依靠时间**
+
+```java
+HystrixCollapserProperties.Setter()
+   .withMaxRequestsInBatch(int value)
+```
+
+**（2）timerDelayInMilliseconds**
+
+**控制一个batch创建之后，多长时间以后就自动触发batch的执行，默认是10毫秒**
+
+```java
+HystrixCollapserProperties.Setter()
+   .withTimerDelayInMilliseconds(int value)
+
+super(Setter.withCollapserKey(HystrixCollapserKey.Factory.asKey("GetProductInfosCollapser"))
+				.andCollapserPropertiesDefaults(HystrixCollapserProperties.Setter()
+						   .withMaxRequestsInBatch(100)
+						   .withTimerDelayInMilliseconds(20))); 
+```
+
+
+
+### 3.1.4 请求合并示例
+
+将多个command请求合并到一个command中执行
+
+请求合并时，可以设置一个batch size，以及elapsed time（控制什么时候触发合并后的command执行）
+
+有两种合并模式，一种是request scope，另一种是global scope，默认是rquest scope，在collapser构造的时候指定scope模式
+
+request scope的batch收集是建立在一个request context内的，而global scope的batch收集是横跨多个request context的
+
+所以对于global context来说，必须确保能在一个command内处理多个requeset context的请求
+
+在netflix，是只用request scope请求合并的，因为默认是用唯一一个request context包含所有的command，所以要做合并，肯定就是request scope
+
+一般请求合并技术，对于那种访问同一个资源的command，但是参数不同，是很有效的
+
+
+批量查询，HystrixObservableCommand，HystrixCommand+request cache，都是每个商品发起一次网络请求
+
+一个批量的商品过来以后，我们还是多个command的方式去执行，request collapser+request cache，相同的商品还是就查询一次，不同的商品合并到一起通过一个网络请求得到结果
+
+command示例
+
+```java
+public class GetProductInfosCollapser extends HystrixCollapser<List<ProductInfo>, ProductInfo, Long> {
+
+	private Long productId;
+	
+	public GetProductInfosCollapser(Long productId) {
+		this.productId = productId;
+	}
+	
+	@Override
+	public Long getRequestArgument() {
+		return productId;
+	}
+
+	/**
+	 * 该方法主要就是指定对应command
+	 * 指定合并批量请求/命令后的具体实现command
+	 * @param requests
+	 * @return
+	 */
+	@Override
+	protected HystrixCommand<List<ProductInfo>> createCommand(
+			Collection<CollapsedRequest<ProductInfo, Long>> requests) {
+		//中间一段代码仅为输出个参数
+		StringBuilder paramsBuilder = new StringBuilder(""); 
+		for(CollapsedRequest<ProductInfo, Long> request : requests) {
+			paramsBuilder.append(request.getArgument()).append(","); 
+		}
+		String params = paramsBuilder.toString();
+		//这里处理字符串是为了去除最后的,号
+		params = params.substring(0, params.length() - 1);
+		
+		System.out.println("createCommand方法执行，params=" + params);
+		//重点是这里，指定command，并将requests传入对应command
+		return new BatchCommand(requests);
+	}
+
+	/**
+	 * 批量命令/请求 结果返回后的处理: 将批量结果和对应request命令合并
+	 * @param batchResponse
+	 * @param requests
+	 */
+	@Override
+	protected void mapResponseToRequests(
+			List<ProductInfo> batchResponse,
+			Collection<CollapsedRequest<ProductInfo, Long>> requests) {
+		int count = 0;
+		for(CollapsedRequest<ProductInfo, Long> request : requests) {
+			request.setResponse(batchResponse.get(count++));  
+		}
+	}
+	
+	@Override
+	protected String getCacheKey() {
+		return "product_info_" + productId;
+	}
+	
+	private static final class BatchCommand extends HystrixCommand<List<ProductInfo>> {
+
+		public final Collection<CollapsedRequest<ProductInfo, Long>> requests;
+		
+		public BatchCommand(Collection<CollapsedRequest<ProductInfo, Long>> requests) {
+			super(Setter.withGroupKey(HystrixCommandGroupKey.Factory.asKey("ProductInfoService"))
+	                .andCommandKey(HystrixCommandKey.Factory.asKey("GetProductInfosCollapserBatchCommand")));
+			this.requests = requests;
+		}
+
+		/**
+		 * 批量/合并情况后，传进来的批量参数
+		 * 然后处理批量参数，一次请求即可完成
+		 * @return
+		 * @throws Exception
+		 */
+		@Override
+		protected List<ProductInfo> run() throws Exception {
+			// 将一个批次内的商品id给拼接在了一起
+			StringBuilder paramsBuilder = new StringBuilder(""); 
+			for(CollapsedRequest<ProductInfo, Long> request : requests) {
+				paramsBuilder.append(request.getArgument()).append(","); 
+			}
+			String params = paramsBuilder.toString();
+			//这里处理字符串是为了去除最后的,号
+			params = params.substring(0, params.length() - 1);
+			// 在这里，我们可以做到什么呢，将多个商品id合并在一个batch内，直接发送一次网络请求，获取到所有的结果
+			String url = "http://localhost:8082/getProductInfos?productIds=" + params;
+			String response = HttpClientUtils.sendGetRequest(url);
+			
+			List<ProductInfo> productInfos = JSONArray.parseArray(response, ProductInfo.class);
+			for(ProductInfo productInfo : productInfos) {
+				System.out.println("BatchCommand内部，productInfo=" + productInfo); 
+			}
+			
+			return productInfos;
+		}
+		
+	}
+
+}
+```
+
+调用
+
+```java
+	@RequestMapping("/getProductInfoCollapser")
+	@ResponseBody
+	public String getProductInfoCollapser(String productIds) {
+
+		List<Future<ProductInfo>> futures = new ArrayList<Future<ProductInfo>>();
+		//将参数分割，多个command加入
+		for(String productId : productIds.split(",")) {
+			GetProductInfosCollapser getProductInfosCollapser =
+					new GetProductInfosCollapser(Long.valueOf(productId));
+			futures.add(getProductInfosCollapser.queue());
+		}
+
+		try {
+			//输出所有的结果
+			for(Future<ProductInfo> future : futures) {
+				System.out.println("CacheController的结果：" + future.get());
+			}
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
+
+		return "success";
+	}
+```
 
