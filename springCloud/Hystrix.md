@@ -1685,3 +1685,474 @@ public class GetProductInfosCollapser extends HystrixCollapser<List<ProductInfo>
 	}
 ```
 
+## 3.2 hystirx的fail-fast与fail-silient两种最基础的容错模式
+
+### 3.2.1 概念
+
+fail-fast，就是不给fallback降级逻辑，HystrixCommand.run()，直接报错，直接会把这个报错抛出来，给你的tomcat调用线程
+
+fail-silent，给一个fallback降级逻辑，如果HystrixCommand.run()，报错了，会走fallback降级，直接返回一个空值，HystrixCommand，就给一个null
+
+HystrixObservableCommand，Observable.empty()
+
+很少会用fail-fast模式，比较常用的可能还是fail-silent，特别常用，既然都到了fallback里面，肯定要做点降级的事情
+
+### 3.2.2 示例
+
+fail-fast 不重写fallback，直接抛出异常
+
+```java
+public class FailureModeCommand extends HystrixCommand<Boolean> {
+
+	private boolean failure;
+	
+	public FailureModeCommand(boolean failure) {
+		super(HystrixCommandGroupKey.Factory.asKey("FailureModeGroup"));
+		this.failure = failure;
+	}
+	
+	@Override
+	protected Boolean run() throws Exception {
+		if(failure) {
+			throw new Exception();
+		}
+		return true;
+	}
+	
+	
+}
+```
+
+fail-silent，fallback返回空
+
+```java
+public class FailureModeCommand extends HystrixCommand<Boolean> {
+
+	private boolean failure;
+	
+	public FailureModeCommand(boolean failure) {
+		super(HystrixCommandGroupKey.Factory.asKey("FailureModeGroup"));
+		this.failure = failure;
+	}
+	
+	@Override
+	protected Boolean run() throws Exception {
+		if(failure) {
+			throw new Exception();
+		}
+		return true;
+	}
+	
+	@Override
+	protected Boolean getFallback() {
+		return null;
+	}
+	
+}
+```
+
+## 3.3 stubbed fallback降级机制
+
+### 3.3.1 概念
+
+**stubbed fallback，残缺的降级**
+
+**用请求中的部分数据拼装成结果，然后再填充一些默认值，返回**
+
+比如说你发起了一个请求，然后请求中可能本身就附带了一些信息，如果主请求失败了，走到降级逻辑
+
+在降级逻辑里面，可以将这个请求中的数据，以及部分本地缓存有的数据拼装在一起，再给数据填充一些简单的默认值
+
+然后尽可能将自己有的数据返回到请求方
+
+stubbed，残缺了，比如说应该查询到一个商品信息，里面包含20个字段
+
+请求参数搂出来一两个字段，从本地的少量缓存中比如说，可以搂出来那么两三个字段，最终的话返回的字段可能就五六个，其他的字段都是填充的默认值
+
+**场景**
+
+在自己的项目里去用的话，你就必须结合你自己的业务场景，去思考，stubbed fallback，从请求参数里尽可能提取一些数据，请求参数多给一些
+
+你要考虑到可以将哪些量比较少的数据保存在内存中，提取部分数据
+
+默认的值怎么设置，看起来能稍微靠谱一些
+
+### 3.3.2 示例
+
+command stubbed fallback示例
+
+```java
+public class GetProductInfoCommand extends HystrixCommand<ProductInfo> {
+
+	public static final HystrixCommandKey KEY = HystrixCommandKey.Factory.asKey("GetProductInfoCommand");
+	
+	private Long productId;
+	
+	public GetProductInfoCommand(Long productId) {
+		super(HystrixCommandGroupKey.Factory.asKey("ProductInfoServiceGroup"));
+		this.productId = productId;
+	}
+	
+	@Override
+	protected ProductInfo run() throws Exception {
+		if(productId.equals(-1L)) {
+			throw new Exception();
+		}
+		String url = "http://127.0.0.1:8082/getProductInfo?productId=" + productId;
+		String response = HttpClientUtils.sendGetRequest(url);
+		return JSONObject.parseObject(response, ProductInfo.class);  
+	}
+
+	@Override
+	protected ProductInfo getFallback() {
+		ProductInfo productInfo = new ProductInfo();
+		// 从请求参数中获取到的唯一条数据
+		productInfo.setId(productId); 
+		// 从本地缓存中获取一些数据
+		productInfo.setBrandId(BrandCache.getBrandId(productId));
+		productInfo.setBrandName(BrandCache.getBrandName(productInfo.getBrandId()));  
+		productInfo.setCityId(LocationCache.getCityId(productId)); 
+		productInfo.setCityName(LocationCache.getCityName(productInfo.getCityId()));  
+		// 手动填充一些默认的数据
+		productInfo.setColor("默认颜色");  
+		productInfo.setModifiedTime(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
+		productInfo.setName("默认商品");  
+		productInfo.setPictureList("default.jpg");  
+		productInfo.setPrice(0.0);  
+		productInfo.setService("默认售后服务");  
+		productInfo.setShopId(-1L);  
+		productInfo.setSize("默认大小");  
+		productInfo.setSpecification("默认规格");   
+		return productInfo;
+	}
+	
+}
+```
+
+## 3.4 多级降级机制
+
+### 3.4.1 概念
+
+**多级降级**
+
+**先降一级，尝试用一个备用方案去执行，如果备用方案失败了，再用最后下一个备用方案去执行**
+
+**command嵌套command**
+
+尝试从备用服务器接口去拉取结果
+
+### 3.4.2 场景
+
+**(1) 场景1**
+
+
+给大家科普一下，常见的多级降级的做法，有一个操作，要访问MySQL数据库
+
+mysql数据库访问报错，降级，去redis中获取数据
+
+如果说redis又挂了，然后就去从本地ehcache缓存中获取数据
+
+hystrix command fallback语义，很容易就可以实现多级降级的策略
+
+**(2) 场景2**
+
+
+商品服务接口，多级降级的策略
+
+command，fallback，又套了一个command，第二个command其实是第一级降级策略
+
+第二个command的fallback是第二级降级策略
+
+
+第一级降级策略，可以是
+
+storm，我们之前做storm这块，第一级降级，一般是搞一个storm的备用机房，部署了一套一模一样的拓扑，如果主机房中的storm拓扑挂掉了，备用机房的storm拓扑定顶上
+
+如果备用机房的storm拓扑也挂了
+
+第二级降级，可能就降级成用mysql/hbase/redis/es，手工封装的一套，按分钟粒度去统计数据的系统
+
+第三级降级，离线批处理去做，hdfs+spark，每个小时执行一次数据统计，去降级
+
+**(3) 场景3**
+
+特别复杂，重要的系统，肯定是要搞好几套备用方案的，一个方案死了，立即上第二个方案，而且要尽量做到是自动化的
+
+
+商品接口拉取
+
+主流程，访问的商品服务，是从主机房去访问的，服务，如果主机房的服务出现了故障，机房断电，机房的网络负载过高，机器硬件出了故障
+
+第一级降级策略，去访问备用机房的服务
+
+第二级降级策略，用stubbed fallback降级策略，比较常用的，返回一些残缺的数据回去
+
+### 3.4.3 示例
+
+command示例
+
+```java
+public class GetProductInfoCommand extends HystrixCommand<ProductInfo> {
+
+	public static final HystrixCommandKey KEY = HystrixCommandKey.Factory.asKey("GetProductInfoCommand");
+	
+	private Long productId;
+	
+	public GetProductInfoCommand(Long productId) {
+		super(HystrixCommandGroupKey.Factory.asKey("ProductInfoService"));
+		this.productId = productId;
+	}
+	
+	@Override
+	protected ProductInfo run() throws Exception {
+		if(productId.equals(-1L)) {
+			throw new Exception();
+		}
+		if(productId.equals(-2L)) {
+			throw new Exception();
+		}
+		String url = "http://127.0.0.1:8082/getProductInfo?productId=" + productId;
+		String response = HttpClientUtils.sendGetRequest(url);
+		return JSONObject.parseObject(response, ProductInfo.class);  
+	}
+	
+	@Override
+	protected ProductInfo getFallback() {
+		return new FirstLevelFallbackCommand(productId).execute();
+	}
+	
+	private static class FirstLevelFallbackCommand extends HystrixCommand<ProductInfo> {
+        
+		private Long productId;
+
+		public FirstLevelFallbackCommand(Long productId) {
+			// 第一级的降级策略，因为这个command是运行在fallback中的
+			// 所以至关重要的一点是，在做多级降级的时候，要将降级command的线程池单独做一个出来
+			// 如果主流程的command都失败了，可能线程池都已经被占满了
+			// 降级command必须用自己的独立的线程池
+			super(Setter.withGroupKey(HystrixCommandGroupKey.Factory.asKey("ProductInfoService"))
+						.andCommandKey(HystrixCommandKey.Factory.asKey("FirstLevelFallbackCommand"))
+						.andThreadPoolKey(HystrixThreadPoolKey.Factory.asKey("FirstLevelFallbackPool"))
+			);  
+			this.productId = productId;
+		}
+		
+		@Override
+		protected ProductInfo run() throws Exception {
+			// 这里，因为是第一级降级的策略，所以说呢，其实是要从备用机房的机器去调用接口
+			// 但是，我们这里没有所谓的备用机房，所以说还是调用同一个服务来模拟
+			if(productId.equals(-2L)) {
+				throw new Exception();
+			}
+			String url = "http://127.0.0.1:8082/getProductInfo?productId=" + productId;
+			String response = HttpClientUtils.sendGetRequest(url);
+			return JSONObject.parseObject(response, ProductInfo.class);  
+		}
+		
+		@Override
+		protected ProductInfo getFallback() {
+			// 第二级降级策略，第一级降级策略，都失败了
+			ProductInfo productInfo = new ProductInfo();
+			// 从请求参数中获取到的唯一条数据
+			productInfo.setId(productId); 
+			// 从本地缓存中获取一些数据
+			productInfo.setBrandId(BrandCache.getBrandId(productId));
+			productInfo.setBrandName(BrandCache.getBrandName(productInfo.getBrandId()));  
+			productInfo.setCityId(LocationCache.getCityId(productId)); 
+			productInfo.setCityName(LocationCache.getCityName(productInfo.getCityId()));  
+			// 手动填充一些默认的数据
+			productInfo.setColor("默认颜色");  
+			productInfo.setModifiedTime(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
+			productInfo.setName("默认商品");  
+			productInfo.setPictureList("default.jpg");  
+			productInfo.setPrice(0.0);  
+			productInfo.setService("默认售后服务");  
+			productInfo.setShopId(-1L);  
+			productInfo.setSize("默认大小");  
+			productInfo.setSpecification("默认规格");   
+			return productInfo;
+		}
+		
+	}
+}
+```
+
+调用示例
+
+```java
+	public static void main(String[] args) throws Exception {
+		GetProductInfoCommand getProductInfoCommand1 = new GetProductInfoCommand(-1L);
+		System.out.println(getProductInfoCommand1.execute());  
+		GetProductInfoCommand getProductInfoCommand2 = new GetProductInfoCommand(-2L);
+		System.out.println(getProductInfoCommand2.execute());  
+	}
+```
+
+## 3.5 facade command手动降级机制
+
+### 3.5.1 概念
+
+**手动降级**
+
+**你写一个command，在这个command它的主流程中，根据一个标识位，判断要执行哪个流程**
+
+**可以执行主流程**，command，**也可以执行一个备用降级的command**
+
+一般来说，都是去执行一个主流程的command，如果说你现在知道有问题了，希望能够**手动降级的话，动态给服务发送个请求**
+
+**在请求中修改标识位，自动就让command以后都直接过来执行备用command**
+
+3个command，套在最外面的command，是用semaphore信号量做限流和资源隔离的，因为这个command不用去care timeout的问题，嵌套调用的command会自己去管理timeout超时的
+
+### 3.5.2 场景
+
+
+商品服务接口的手动降级的方案
+
+主流程还是去走GetProductInfoCommand，手动降级的方案，比如说是从某一个数据源，自己去简单的获取一些数据，尝试封装一下返回
+
+手动降级的策略，就比较low了，调用别人的接口去获取数据的，业务逻辑的封装
+
+主流程有问题，那么可能你就需要立即自己写一些逻辑发布上去，从mysql数据库的表中获取一些数据去返回，手动调整一下降级标识，做一下手动降级
+
+### 3.5.3 示例
+
+command示例
+
+```java
+public class GetProductInfoFacadeCommand extends HystrixCommand<ProductInfo> {
+	
+	private Long productId;
+	
+	public GetProductInfoFacadeCommand(Long productId) {
+		super(Setter.withGroupKey(HystrixCommandGroupKey.Factory.asKey("ProductInfoService"))
+				.andCommandKey(HystrixCommandKey.Factory.asKey("GetProductInfoFacadeCommand"))
+		        .andCommandPropertiesDefaults(HystrixCommandProperties.Setter()
+		        		.withExecutionIsolationStrategy(ExecutionIsolationStrategy.SEMAPHORE)
+		        		.withExecutionIsolationSemaphoreMaxConcurrentRequests(15)));
+		this.productId = productId;
+	}
+	
+	@Override
+	protected ProductInfo run() throws Exception {
+        //根据状态灵活判断是否采取降级策略
+		if(!IsDegrade.isDegrade()) {
+			return new GetProductInfoCommand(productId).execute();
+		} else {
+			return new GetProductInfoFromMySQLCommand(productId).execute();
+		}
+	}
+	
+	@Override
+	protected ProductInfo getFallback() {
+		return new ProductInfo();
+	}
+}
+
+//可以手动修改状态
+public class IsDegrade {
+	
+	private static boolean degrade = false;
+
+	public static boolean isDegrade() {
+		return degrade;
+	}
+
+	public static void setDegrade(boolean degrade) {
+		IsDegrade.degrade = degrade;
+	}
+	
+}
+```
+
+## 3.6 生产环境中的线程池大小以及timeout超时时长优化经验总结
+
+### 3.6.1 经验总结
+
+生产环境里面，一个是线程池的大小怎么设置，timeout时长怎么
+
+不合理的话，问题还是很大的
+
+
+在生产环境中部署一个短路器，一开始需要将一些关键配置设置的大一些，比如timeout超时时长，线程池大小，或信号量容量
+
+然后逐渐优化这些配置，直到在一个生产系统中运作良好
+
+（1）一开始先不要设置timeout超时时长，默认就是1000ms，也就是1s
+（2）一开始也不要设置线程池大小，默认就是10
+（3）直接部署hystrix到生产环境，如果运行的很良好，那么就让它这样运行好了
+（4）让hystrix应用，24小时运行在生产环境中
+（5）依赖标准的监控和报警机制来捕获到系统的异常运行情况
+（6）在24小时之后，看一下调用延迟的占比，以及流量，来计算出让短路器生效的最小的配置数字
+（7）直接对hystrix配置进行热修改，然后继续在hystrix dashboard上监控
+（8）看看修改配置后的系统表现有没有改善
+
+### 3.6.2 各种场景及经验
+
+下面是根据系统表现优化和调整线程池大小，队列大小，信号量容量，以及timeout超时时间的经验
+
+假设对一个依赖服务的高峰调用QPS是每秒30次
+
+一开始如果默认的线程池大小是10
+
+我们想的是，理想情况下**，每秒的高峰访问次数 * 99%的访问延时 + buffer = 30 * 0.2 + 4 = 10线程，10个线程每秒处理30次访问应该足够了**，每个线程处理3次访问
+
+**PS: 30(每秒30次请求) * 0.2(默认超时200ms,200/1000=0.2) + 4(buffer缓冲，就是多加几个) =10(建议采用的线程池数量)**
+
+此时，我们合理的timeout设置应该为300ms，也就是99.5%的访问延时，计算方法是，因为判断每次访问延时最多在250ms（TP99如果是200ms的话），再加一次重试时间50ms，就是300ms，感觉也应该足够了
+
+因为如果timeout设置的太多了，比如400ms，比如如果实际上，在高峰期，还有网络情况较差的时候，可能每次调用要耗费350ms，也就是达到了最长的访问时长
+
+那么每个线程处理2个请求，就会执行700ms，然后处理第三个请求的时候，就超过1秒钟了，此时会导致线程池全部被占满，都在处理请求
+
+这个时候下一秒的30个请求再进来了，那么就会导致线程池已满，拒绝请求的情况，就会调用fallback降级机制
+
+因此对于短路器来说，timeout超时一般应该设置成TP99.5，比如设置成300ms，那么可以确保说，10个线程，每个线程处理3个访问，每个访问最多就允许执行300ms，过时就timeout了
+
+这样才能保证说每个线程都在1s内执行完，才不会导致线程池被占满，然后后续的请求过来大量的reject
+
+**对于线程池大小来说，一般应该控制在10个左右，20个以内，最少5个，不要太多，也不要太少**
+
+
+大家可能会想，**每秒的高峰访问次数是30次，如果是300次，甚至是3000次，30000次呢**？？？
+
+30000 * 0.2 = 6000 + buffer = 6100，一个服务器内一个线程池给6000个线程把
+
+**如果你一个依赖服务占据的线程数量太多的话，会导致其他的依赖服务对应的线程池里没有资源可以用了，这时候就扩大物理机/虚拟机的数量**
+
+**6000 / 20 = 300台虚拟机也是ok的**
+
+虚拟机，4个cpu core，4G内存，虚拟机，300台
+
+物理机，十几个cpu core，几十个G的内存，5~8个虚拟机，300个虚拟机 = 50台物理机
+
+**你要真的说是，你的公司服务的用户量，或者数据量，或者请求量，真要是到了每秒几万的QPS，**
+
+3万QPS，60 * 3 = 180万访问量，1800，1亿8千，1亿，10个小时，10亿的访问量，app，系统
+
+**几十台服务器去支撑，我觉得很正常**
+
+QPS每秒在几千都算多的了
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
