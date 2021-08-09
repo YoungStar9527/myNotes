@@ -2134,25 +2134,348 @@ public class IsDegrade {
 
 QPS每秒在几千都算多的了
 
+## 3.7 线程池自动扩容与缩容的动态资源分配
+
+### 3.7.1 场景
+
+**(1) 场景1**
+
+可能会出现一种情况，比如说我们的某个依赖，在高峰期，需要耗费100个线程，但是在那个时间段，刚好其他的依赖的线程池其实就维持一两个就可以了
+
+但是，如果我们都是设置死的，每个服务就给10个线程，那就很坑，可能就导致有的服务在高峰期需要更多的资源，但是没资源了，导致很多的reject
+
+但是其他的服务，每秒钟就易一两个请求，结果也占用了10个线程，占着茅坑不拉屎
+
+**做成弹性的线程资源调度的模式**
+
+**刚开始的时候，每个依赖服务都是给1个线程，3个线程，但是我们允许说，如果你的某个线程池突然需要大量的线程，最多可以到100个线程**
+
+**如果你使用了100个线程，高峰期过去了，自动将空闲的线程给释放掉**
+
+**(2) 场景2**
+
+生产环境中，这块怎么玩儿的
+
+**也是根据你的服务的实际的运行的情况切看的，比如说你发现某个服务，平时3个并发QPS就够了，高峰期可能要到30个**
+
+**那么你就可以给设置弹性的资源调度**
+
+
+因为你可能一个服务会有多个线程池，你要计算好，每个线程池的最大的大小加起来不能过大，30个依赖，30个线程池，每个线程池最大给到30,900个线程，很坑的
+
+
+**还有一种模式，就是说让多个依赖服务共享一个线程池，我们不推荐，多个依赖服务就做不到资源隔离，互相之间会影响的**
+
+### 3.7.2 配置
+
+（1）coreSize
+
+设置线程池的大小，默认是10
+
+```java
+HystrixThreadPoolProperties.Setter()
+   .withCoreSize(int value)
+```
+
+（2）maximumSize
+
+设置线程池的最大大小，只有在设置allowMaximumSizeToDivergeFromCoreSize的时候才能生效
+
+默认是10
+
+```java
+HystrixThreadPoolProperties.Setter()
+   .withMaximumSize(int value)
+```
+
+（5）keepAliveTimeMinutes
+
+设置保持存活的时间，单位是分钟，默认是1
+
+如果设置allowMaximumSizeToDivergeFromCoreSize为true，那么coreSize就不等于maxSize，此时线程池大小是可以动态调整的，可以获取新的线程，也可以释放一些线程
+
+如果coreSize < maxSize，那么这个参数就设置了一个线程多长时间空闲之后，就会被释放掉
+
+```java
+HystrixThreadPoolProperties.Setter()
+   .withKeepAliveTimeMinutes(int value)
+```
+
+（6）allowMaximumSizeToDivergeFromCoreSize
+
+允许线程池大小自动动态调整，设置为true之后，maxSize就生效了，此时如果一开始是coreSize个线程，随着并发量上来，那么就会自动获取新的线程，但是如果线程在keepAliveTimeMinutes内空闲，就会被自动释放掉
+
+默认是false
+
+```java
+HystrixThreadPoolProperties.Setter()
+   .withAllowMaximumSizeToDivergeFromCoreSize(boolean value)
+```
+
+### 3.7.3 示例
+
+```java
+	public GetProductInfoCommand(Long productId) {
+		super(Setter.withGroupKey(HystrixCommandGroupKey.Factory.asKey("ProductInfoService"))
+				.andCommandKey(KEY)
+				.andThreadPoolKey(HystrixThreadPoolKey.Factory.asKey("GetProductInfoPool"))
+				.andThreadPoolPropertiesDefaults(HystrixThreadPoolProperties.Setter()
+                          //线程默认3                       
+						.withCoreSize(3)
+                           //最大可扩展到30                      
+						.withMaximumSize(30) 
+                           //允许动态扩展线程                      
+						.withAllowMaximumSizeToDivergeFromCoreSize(true)
+                           //如果>3的线程一分钟后为空闲状态则回收
+                           //单位分钟，默认1
+                           //空闲线程存活时间                      
+						.withKeepAliveTimeMinutes(1) 
+						.withMaxQueueSize(12)
+						.withQueueSizeRejectionThreshold(15)) 
+				.andCommandPropertiesDefaults(HystrixCommandProperties.Setter()
+						.withCircuitBreakerRequestVolumeThreshold(30)
+						.withCircuitBreakerErrorThresholdPercentage(40)
+						.withCircuitBreakerSleepWindowInMilliseconds(3000)
+						.withExecutionTimeoutInMilliseconds(500)
+						.withFallbackIsolationSemaphoreMaxConcurrentRequests(30))
+				);  
+//		super(HystrixCommandGroupKey.Factory.asKey("ProductInfoService"));
+		this.productId = productId;
+	}
+```
+
+## 3.8 线程监控与统计
+
+### 3.8.1 hystrix的metric统计相关的各种高阶配置
+
+#### 3.8.1.1 为什么需要监控与报警/场景
+
+HystrixCommand执行的时候，会生成一些执行耗时等方面的统计信息。这些信息对于系统的运维来说，是很有帮助的，因为我们通过这些统计信息可以看到整个系统是怎么运行的。hystrix对每个command key都会提供一份metric，而且是秒级统计粒度的。
+
+这些统计信息，无论是单独看，还是聚合起来看，都是很有用的。如果将一个请求中的多个command的统计信息拿出来单独查看，包括耗时的统计，对debug系统是很有帮助的。聚合起来的metric对于系统层面的行为来说，是很有帮助的，很适合做报警或者报表。hystrix dashboard就很适合。
+
+#### 3.8.1.1.2 hystrix的事件类型
+
+对于hystrix command来说，只会返回一个值，execute只有一个event type，fallback也只有一个event type，那么返回一个SUCCESS就代表着命令执行的结束
+
+对于hystrix observable command来说，多个值可能被返回，所以emit event代表一个value被返回，success代表成功，failure代表异常
+
+（1）execute event type
+
+EMIT					observable command返回一个value
+SUCCESS 				完成执行，并且没有报错
+FAILURE					执行时抛出了一个异常，会触发fallback
+TIMEOUT					开始执行了，但是在指定时间内没有完成执行，会触发fallback
+BAD_REQUEST				执行的时候抛出了一个HystrixBadRequestException
+SHORT_CIRCUITED			短路器打开了，触发fallback
+THREAD_POOL_REJECTED	线程成的容量满了，被reject，触发fallback
+SEMAPHORE_REJECTED		信号量的容量满了，被reject，触发fallback
+
+（2）fallback event type
+
+FALLBACK_EMIT			observable command，fallback value被返回了
+FALLBACK_SUCCESS		fallback逻辑执行没有报错
+FALLBACK_FAILURE		fallback逻辑抛出了异常，会报错
+FALLBACK_REJECTION		fallback的信号量容量满了，fallback不执行，报错
+FALLBACK_MISSING		fallback没有实现，会报错
+
+（3）其他的event type
+
+EXCEPTION_THROWN		command生命自周期是否抛出了异常
+RESPONSE_FROM_CACHE		command是否在cache中查找到了结果
+COLLAPSED				command是否是一个合并batch中的一个
+
+（4）thread pool event type
+
+EXECUTED				线程池有空间，允许command去执行了
+REJECTED 				线程池没有空间，不允许command执行，reject掉了
+
+（5）collapser event type
+
+BATCH_EXECUTED			collapser合并了一个batch，并且执行了其中的command
+ADDED_TO_BATCH			command加入了一个collapser batch
+RESPONSE_FROM_CACHE		没有加入batch，而是直接取了request cache中的数据
+
+#### 3.8.1.1.3 metric storage
+
+**metric被生成之后，就会按照一段时间来存储，存储了一段时间的数据才会推送到其他系统中，比如hystrix dashboard**
+
+另外一种方式，就是每次生成metric就实时推送metric流到其他地方，但是这样的话，会给系统带来很大的压力
+
+hystrix的方式是将metric写入一个内存中的数据结构中，在一段时间之后就可以查询到
+
+**hystrix 1.5x之后，采取的是为每个command key都生成一个start event和completion event流，而且可以订阅这个流。每个thread pool key也是一样的，包括每个collapser key也是一样的。**
+
+每个command的event是发送给一个线程安全的RxJava中的rx.Subject，因为是线程安全的，所以不需要进行线程同步
+
+因此每个command级别的，threadpool级别的，每个collapser级别的，event都会发送到对应的RxJava的rx.Subject对象中。这些rx.Subject对象接着就会被暴露出Observable接口，可以被订阅。
+
+#### 3.8.1.1.4 metric统计相关的配置
+
+**PS:这些统计配置项正常来说默认的就行，只需要了解一下，不需要做太多配置**
+
+（1）metrics.rollingStats.timeInMilliseconds
+
+设置统计的rolling window，单位是毫秒，hystrix只会维持这段时间内的metric供短路器统计使用
+
+这个属性是不允许热修改的，默认值是10000，就是10秒钟
+
+HystrixCommandProperties.Setter()
+   .withMetricsRollingStatisticalWindowInMilliseconds(int value)
+
+（2）metrics.rollingStats.numBuckets
+
+该属性设置每个滑动窗口被拆分成多少个bucket，而且滑动窗口对这个参数必须可以整除，同样不允许热修改
+
+默认值是10，也就是说，每秒钟是一个bucket
+
+随着时间的滚动，比如又过了一秒钟，那么最久的一秒钟的bucket就会被丢弃，然后新的一秒的bucket会被创建
+
+HystrixCommandProperties.Setter()
+   .withMetricsRollingStatisticalWindowBuckets(int value)
+
+（3）metrics.rollingPercentile.enabled
+
+控制是否追踪请求耗时，以及通过百分比方式来统计，默认是true
+
+HystrixCommandProperties.Setter()
+   .withMetricsRollingPercentileEnabled(boolean value)
+
+（4）metrics.rollingPercentile.timeInMilliseconds
+
+设置rolling window被持久化保存的时间，这样才能计算一些请求耗时的百分比，默认是60000，60s，不允许热修改
+
+相当于是一个大的rolling window，专门用于计算请求执行耗时的百分比
+
+HystrixCommandProperties.Setter()
+   .withMetricsRollingPercentileWindowInMilliseconds(int value)
+
+（5）metrics.rollingPercentile.numBuckets
+
+设置rolling percentile window被拆分成的bucket数量，上面那个参数除以这个参数必须能够整除，不允许热修改
+
+默认值是6，也就是每10s被拆分成一个bucket
+
+HystrixCommandProperties.Setter()
+   .withMetricsRollingPercentileWindowBuckets(int value)
+
+（6）metrics.rollingPercentile.bucketSize
+
+设置每个bucket的请求执行次数被保存的最大数量，如果再一个bucket内，执行次数超过了这个值，那么就会重新覆盖从bucket的开始再写
+
+举例来说，如果bucket size设置为100，而且每个bucket代表一个10秒钟的窗口，但是在这个bucket内发生了500次请求执行，那么这个bucket内仅仅会保留100次执行
+
+如果调大这个参数，就会提升需要耗费的内存，来存储相关的统计值，不允许热修改
+
+默认值是100
+
+HystrixCommandProperties.Setter()
+   .withMetricsRollingPercentileBucketSize(int value)
+
+（7）metrics.healthSnapshot.intervalInMilliseconds
+
+控制成功和失败的百分比计算，与影响短路器之间的等待时间，默认值是500毫秒
+
+HystrixCommandProperties.Setter()
+   .withMetricsHealthSnapshotIntervalInMilliseconds(int value)
+
+### 3.8.2 hystrix dashboard可视化分布式系统监控环境部署
+
+### 3.8.2.3 运行及部署监控
+
+**1、对应需要metrics stream监控项目加入**
+
+<dependency>
+    <groupId>com.netflix.hystrix</groupId>
+    <artifactId>hystrix-metrics-event-stream</artifactId>
+    <version>1.4.10</version>
+</dependency>
+
+@Bean
+public ServletRegistrationBean indexServletRegistration() {
+    ServletRegistrationBean registration = new ServletRegistrationBean(new HystrixMetricsStreamServlet());
+    registration.addUrlMappings("/hystrix.stream");
+    return registration;
+}
+
+**2、下载hystrix-dashboard的war包**
+
+自行百度
+
+**3、下载turbin**
+
+自行百度
+
+在/WEB-INF/classes下放置配置文件
+
+config.properties
+
+turbine.ConfigPropertyBasedDiscovery.default.instances=localhost
+turbine.instanceUrlSuffix=:8081/hystrix.stream
+
+**PS:这里加入的配置是本地单机，集群可以添加多台机器配置,localhost后面,号分割添加机器即可**
+
+**turbin是用来监控一个集群的，可以将一个集群的所有机器都配置在这里**
+
+**4、启动我们的服务**
+
+**5、启动tomcat中的hystrix dashboard和turbin**
+
+localhost:8080/hystrix-dashboard
+
+http://localhost:8081/hystrix.stream，监控单个机器
+http://localhost:8080/turbine/turbine.stream，监控整个集群
+
+![image-20210809211604231](Hystrix.assets/image-20210809211604231.png)
 
 
 
+**6、hystrix dashboard用法概述**
 
+hystrix的dashboard可以支持实时监控metric
 
+netflix开始用这个dashboard的时候，大幅度优化了工程运维的操作，帮助节约了恢复系统的时间。大多数生产系统的故障持续时间变得很短，而且影响幅度小了很多，主要是因为hystrix dashborad提供了可视化的监控。
 
+截图说明，dashboard上的指标都是什么？
 
+圆圈的颜色和大小代表了健康状况以及流量，折线代表了最近2分钟的请求流量
 
+集群中的机器数量，请求延时的中位数以及平均值
 
+最近10秒内的异常请求比例，请求QPS，每台机器的QPS，以及整个集群的QPS
 
+断路器的状态
 
+最近一分钟的请求延时百分比，TP90，TP99，TP99.5
 
+几个有颜色的数字，代表了最近10秒钟的统计，以1秒钟为粒度
 
+成功的请求数量，绿颜色的数字; 短路的请求数量，蓝色的数字; timeout超时的请求数量，黄色的数字; 线程池reject的请求数量，紫色的数字; 请求失败，抛出异常的请求数量，红色的数字
 
+## 3.9 生产环境中的hystrix分布式系统的工程运维经验
 
+**如果发现了严重的依赖调用延时，先不用急着去修改配置，如果一个command被限流了，可能本来就应该限流**
 
+在netflix早期的时候，经常会有人在发现短路器因为访问延时发生的时候，去热修改一些皮遏制，比如线程池大小，队列大小，超时时长，等等，给更多的资源，但是这其实是不对的
 
+**如果我们之前对系统进行了良好的配置，然后现在在高峰期，系统在进行线程池reject，超时，短路，那么此时我们应该集中精力去看底层根本的原因，而不是调整配置**
 
+为什么在高峰期，一个10个线程的线程池，搞不定这些流量呢？？？代码写的太烂了，异步，更好的算法
 
+千万不要急于给你的依赖调用过多的资源，比如线程池大小，队列大小，超时时长，信号量容量，等等，因为这可能导致我们自己对自己的系统进行DDOS攻击
 
+疯狂的大量的访问你的机器，最后给打垮
 
+举例来说，想象一下，我们现在有100台服务器组成的集群，每台机器有10个线程大小的线程池去访问一个服务，那么我们对那个服务就有1000个线程资源去访问了
 
+在正常情况下，可能只会用到其中200~300个线程去访问那个后端服务
+
+但是如果再高峰期出现了访问延时，可能导致1000个线程全部被调用去访问那个后端服务，如果我们调整到每台服务器20个线程呢？
+
+如果因为你的代码等问题导致访问延时，即使有20个线程可能还是会导致线程池资源被占满，此时就有2000个线程去访问后端服务，可能对后端服务就是一场灾难
+
+这就是断路器的作用了，如果我们把后端服务打死了，或者产生了大量的压力，有大量的timeout和reject，那么就自动短路，一段时间后，等流量洪峰过去了，再重启访问
+
+**简单来说，让系统自己去限流，短路，超时，以及reject，直到系统重新变得正常了**
+
+**就是不要随便乱改资源配置，不要随便乱增加线程池大小，等待队列大小，异常情况是正常的**
