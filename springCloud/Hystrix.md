@@ -2442,13 +2442,13 @@ netflix开始用这个dashboard的时候，大幅度优化了工程运维的操�
 
 集群中的机器数量，请求延时的中位数以及平均值
 
-最近10秒内的异常请求比例，请求QPS，每台机器的QPS，以及整个集群的QPS
+**最近10秒内的异常请求比例，请求QPS，每台机器的QPS，以及整个集群的QPS**
 
 断路器的状态
 
-最近一分钟的请求延时百分比，TP90，TP99，TP99.5
+**最近一分钟的请求延时百分比，TP90，TP99，TP99.5**
 
-几个有颜色的数字，代表了最近10秒钟的统计，以1秒钟为粒度
+**几个有颜色的数字，代表了最近10秒钟的统计，以1秒钟为粒度**
 
 成功的请求数量，绿颜色的数字; 短路的请求数量，蓝色的数字; timeout超时的请求数量，黄色的数字; 线程池reject的请求数量，紫色的数字; 请求失败，抛出异常的请求数量，红色的数字
 
@@ -2479,3 +2479,350 @@ netflix开始用这个dashboard的时候，大幅度优化了工程运维的操�
 **简单来说，让系统自己去限流，短路，超时，以及reject，直到系统重新变得正常了**
 
 **就是不要随便乱改资源配置，不要随便乱增加线程池大小，等待队列大小，异常情况是正常的**
+
+# 4 spring cloud环境中使用hystrix的demo
+
+## 4.1 hystrix在spring cloud相关使用及配置
+
+### 4.1.2 配置
+
+我们其实在spring cloud的环境中，肯定是结合feign来使用hystrix的，我们肯定不会直接自己手动去创建一个HystrixCommand
+
+pom
+
+```xml
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-hystrix</artifactId>
+</dependency>
+```
+
+application.yml
+
+```yaml
+#feign开启hystrix
+feign:
+  hystrix:
+    enabled: true
+ 
+#hystrix的一些基本配置 
+hystrix:
+  command:
+    default:
+      execution:
+        isolation:
+          thread:
+            timeoutInMilliseconds: 1000
+      circuitBreaker:
+        requestVolumeThreshold: 4
+```
+
+Application启动类
+
+@EnableCircuitBreaker
+
+```java
+@SpringBootApplication
+@EnableEurekaClient
+@EnableFeignClients
+@EnableCircuitBreaker
+public class ServiceBApplication {
+
+	public static void main(String[] args) {
+		SpringApplication.run(ServiceBApplication.class, args);
+	}
+
+}
+```
+
+对应feign的接口中加入降级机制
+
+```java
+@FeignClient(name = "ServiceA", fallbackFactory = ServiceAClient.ServiceAClientFallbackFactory.class,configuration = MyConfiguration.class)
+public interface ServiceAClient extends ServiceAInterface {
+
+//	@RequestMapping(value = "/user/sayHello/{id}", method = RequestMethod.GET)
+//	String sayHello(@PathVariable("id") Long id,
+//			@RequestParam("name") String name,
+//			@RequestParam("age") Integer age);
+//
+//	@RequestMapping(value = "/user/", method = RequestMethod.POST)
+//	String createUser(@RequestBody User user);
+//
+//	@RequestMapping(value = "/user/{id}", method = RequestMethod.PUT)
+//	String updateUser(@PathVariable("id") Long id, @RequestBody User user);
+//
+//	@RequestMapping(value = "/user/{id}", method = RequestMethod.DELETE)
+//	String deleteUser(@PathVariable("id") Long id);
+//
+//	@RequestMapping(value = "/user/{id}", method = RequestMethod.GET)
+//	User getById(@PathVariable("id") Long id);
+
+	//对应ServiceAInterface中就是这些注释的接口
+    @Component
+    static class ServiceAClientFallbackFactory implements FallbackFactory<ServiceAClient> {
+
+
+        @Override
+        public ServiceAClient create(Throwable cause) {
+            //每次降级的时候，就会从这个factory工厂类中获取一个降级类
+            //它会传递过来一个异常
+            //这里就会知道，到底是发生了什么问题导致了这次的降级
+            //比如说在这里就可以区别对待，超时、熔断、线程池满、接口异常、各种问题在这里都可以看到
+            //然后可以选择不同的降级策略
+            return new ServiceAClient() {
+                @Override
+                public String sayHello(Long aLong, String s, Integer integer) {
+                    System.out.println("服务降级了");
+                    return null;
+                }
+
+                @Override
+                public String createUser(User user) {
+                    System.out.println("服务降级了");
+                    return null;
+                }
+
+                @Override
+                public String updateUser(Long aLong, User user) {
+                    System.out.println("服务降级了");
+                    return null;
+                }
+
+                @Override
+                public String deleteUser(Long aLong) {
+                    System.out.println("服务降级了");
+                    return null;
+                }
+
+                @Override
+                public User getById(Long aLong) {
+                    System.out.println("服务降级了");
+                    return null;
+                }
+            };
+        }
+    }
+}
+```
+
+### 4.1.2 总结
+
+**默认情况下，hystrix的group name就是ServiceA这种服务名称，也就是说你要调用一个服务的话，那么针对每个服务就是一个线程池**
+
+**然后针对每个接口方法，对应都会有一个自动生成的Command，CommandKey是接口名称#接口方法名称**
+
+**整合了feign和hystrix**
+
+hystrix，隔离、熔断、降级
+
+超时 -> 降级
+
+隔离 -> **你每次调用一个接口，其实都是走的那个接口的一个自己的线程池，是根据什么的来的呢？@FeignClient里的value默认就是hystrix的groupName，就控制一个服务接口就会生成一个线程池，对那个服务里所有接口的调用，全部都是走这个服务自己的线程池的**
+
+**通过线程池就完成了隔离**
+
+### 4.1.2 demo实例测试 
+
+测试必定会超时的接口
+
+![image-20210810210030997](Hystrix.assets/image-20210810210030997.png)
+
+访问接口超时降级
+
+## 4.2 hystrix相关监控配置
+
+首先在需要被监控的项目加入对应依赖(ServiceB)
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-actuator</artifactId>
+    <version>1.5.13.RELEASE</version>
+</dependency>
+```
+
+### 4.2.1 配置hystrix-dashboard监控项目
+
+我们希望能够有一个界面，可以看到你的hystrix相关的监控统计，比如请求数量、异常数量、每秒的请求数量
+
+pom
+
+```xml
+  	<dependencyManagement>
+	    <dependencies>
+	        <dependency>
+	            <groupId>org.springframework.cloud</groupId>
+	            <artifactId>spring-cloud-dependencies</artifactId>
+	            <version>Edgware.SR3</version>
+	            <type>pom</type>
+	            <scope>import</scope>
+	        </dependency>
+		</dependencies>
+	</dependencyManagement>
+
+  	<dependencies>
+		<dependency>
+			<groupId>org.springframework.cloud</groupId>
+			<artifactId>spring-cloud-starter-hystrix-dashboard</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>org.springframework.cloud</groupId>
+			<artifactId>spring-cloud-starter-hystrix</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-actuator</artifactId>
+			<version>1.5.13.RELEASE</version>
+		</dependency>
+  	</dependencies>
+```
+
+yml
+
+```yaml
+server:
+  port: 8082
+```
+
+application启动类
+
+```java
+@SpringBootApplication
+@EnableHystrixDashboard
+public class Application {
+
+	public static void main(String[] args) {
+		SpringApplication.run(Application.class, args); 
+	}
+	
+}
+```
+
+配置好以上3个步骤后，访问：
+
+http://localhost:8082/hystrix 默认地址即可
+
+然后可以选择 添加ServiceB的监控：http://localhost:9090/hystrix.stream
+
+![image-20210810205256486](Hystrix.assets/image-20210810205256486.png)
+
+访问几次ServiceB的接口就能看到对应监控信息了
+
+![image-20210810205322654](Hystrix.assets/image-20210810205322654.png)
+
+
+
+### 4.2.2 配置基于turbin来监控服务集群
+
+pom
+
+```xml
+  	<dependencyManagement>
+	    <dependencies>
+	        <dependency>
+	            <groupId>org.springframework.cloud</groupId>
+	            <artifactId>spring-cloud-dependencies</artifactId>
+	            <version>Edgware.SR3</version>
+	            <type>pom</type>
+	            <scope>import</scope>
+	        </dependency>
+		</dependencies>
+	</dependencyManagement>
+
+	<dependencies>
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-actuator</artifactId>
+			<version>1.5.13.RELEASE</version>
+		</dependency>
+		<dependency>
+			<groupId>org.springframework.cloud</groupId>
+			<artifactId>spring-cloud-starter-turbine</artifactId>
+		</dependency>
+	</dependencies>
+```
+
+yml
+
+```yaml
+spring:
+  application:
+    name: hystrix-turbine
+
+server:
+  port: 2002
+
+management:
+  port: 2003
+
+eureka:
+  instance:
+    hostname: localhost
+  client:
+    serviceUrl:
+      defaultZone: http://localhost:8761/eureka
+      
+turbine:
+  appConfig: ServiceB
+  clusterNameExpression: "'default'"
+```
+
+application启动类
+
+```java
+@SpringBootApplication
+@EnableEurekaClient
+@EnableTurbine
+public class Application {
+	
+	public static void main(String[] args) {
+		SpringApplication.run(Application.class, args);  
+	}
+	
+}
+```
+
+​	如果你的服务B搞了一个集群的话，服务B部署多台机器的话，就会组成一个集群，直接用hystrix dashboard只能监控一台机器，如果一次性要监控一个集群的话，引入一个单独的聚合一个服务的集群中各个机器的统计信息的turbine服务
+
+​	打开hystrix监控的面板：输入这个turbine的地址
+
+```
+http://localhost:2002/turbine.stream
+```
+
+就是这个turbine服务，肯定是从eureka中加载注册表，然后的话呢，就可以根据我们配置的要监控的服务，对服务的各个机器的hystrix统计进行一个聚合
+
+![image-20210810205608056](Hystrix.assets/image-20210810205608056.png)
+
+访问几次ServertB就能看到对应信息了
+
+![image-20210810205643288](Hystrix.assets/image-20210810205643288.png)
+
+### 4.2.3 对应监控信息仪表盘的说明
+
+解释一下这个仪表盘的意思：
+
+有个圆圈，那个是代表了服务的流量，如果圆圈越大，就代表了流量越大
+
+圆圈下面有一条线，**是最近2分钟内的流量变化情况**
+
+bad request，你要发送请求的时候，你发送的请求本身都是坏的，都是有问题的，就比如说你发送的请求的请求方法（PUT），人家接口接收的是GET
+
+有两排数字，左边一排，从上到下依次是：成功的请求数量、熔断的请求数量。右边一排，从上到小，依次是：超时请求数量、线程池拒绝的请求数量、异常的请求数量
+
+**然后有一个百分比数字，那个是最近10秒钟的失败的请求所占的百分比**
+
+Host：这个是服务实例的每秒的请求数量，也就是所谓的QPS了
+
+Cluster：这个是服务的（包含所有服务实例的）的每秒的请求数量，看的是服务整体的QPS
+
+Circuit：这个是断路器的状态，打开或者关闭
+
+Hosts：这个是说一个服务有多少个服务实例
+
+Median（请求延时的中位数，请求的中位数延时是100ms）、Mean（请求延时的平均数，150ms）、90th（TP90，90%的请求都是50ms）、99th（TP99，99%的请求，190ms）、99.5th（TP99.5，99.5%的请求，300ms）
+
+Threadpool：这个是记录线程池内部的一些情况，服务B调用服务A的专用的线程池的一些配置和情况，这里就可以让我们去看到服务与服务之间的调用的很多关键的统计信息
+
+请求次数（流量大小）、QPS、请求时延、对其他服务的调用QPS
