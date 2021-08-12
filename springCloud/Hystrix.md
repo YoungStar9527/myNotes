@@ -2826,3 +2826,146 @@ Median（请求延时的中位数，请求的中位数延时是100ms）、Mean�
 Threadpool：这个是记录线程池内部的一些情况，服务B调用服务A的专用的线程池的一些配置和情况，这里就可以让我们去看到服务与服务之间的调用的很多关键的统计信息
 
 请求次数（流量大小）、QPS、请求时延、对其他服务的调用QPS
+
+## 4.3 feign与hystrix整合的时候各种参数配置
+
+```yaml
+hystrix:
+  command:
+  #这种形式是对应方法的配置,default就是全局配置,ServiceA就是该服务配置
+    ServiceAClient#sayHello(Long,String,Integer):
+      execution:
+        isolation:
+          thread:
+            timeoutInMilliseconds: 100
+        circuitBreaker:
+          requestVolumeThreshold: 4
+
+```
+
+之前netflix hystrix的原生的相关的参数
+
+```yaml
+hystrix:
+  command:
+    default:
+      execution:
+        isolation:
+          strategy: THREAD
+          thread:
+            timeoutInMilliseconds: 1000
+            interruptOnTimeout: true
+        semaphore:
+          maxConcurrentRequests: 10
+        timeout: 
+          enabled: true
+      circuitBreaker:
+        enabled: true
+        requestVolumeThreshold: 20
+        sleepWindowInMilliseconds: 5000
+        errorThresholdPercentage: 50
+
+```
+
+​	一般来说，hystrix的默认配置可以不用去修改，上生产环境，能不改就不改，最好是在线上跑一端时间之后，根据线上系统具体的负载去修改相关的配置
+
+相关参数及说明
+
+```properties
+hystrix.threadpool.default.coreSize
+#：线程池大小，默认10
+hystrix.threadpool.default.maximumSize
+#：线程池最大大小，默认10
+hystrix.threadpool.default.allowMaximumSizeToDivergeFromCoreSize
+#：是否允许动态调整线程数量，默认false，只有设置为true了，上面的maximumSize才有效
+hystrix.threadpool.default.keepAliveTimeMinutes
+#：默认是1，超出coreSize的线程，空闲1分钟后释放掉
+
+hystrix.threadpool.default.maxQueueSize
+#默认－1，不能动态修改
+hystrix.threadpool.default.queueSizeRejectionThreshold
+#可以动态修改，默认是5，先进入请求队列，然后再由线程池执行
+
+执行相关的属性：
+
+hystrix.command.default.execution.isolation.strategy
+#：隔离策略，默认Thread，可以选择Semaphore信号量
+
+hystrix.command.default.execution.isolation.thread.timeoutInMilliseconds
+#：超时时间，默认1000ms
+hystrix.command.default.execution.timeout.enabled
+#：是否启用超时，默认ture
+hystrix.command.default.execution.isolation.thread.interruptOnTimeout
+#：超时的时候是否中断执行，默认true 
+
+hystrix.command.default.execution.isolation.semaphore.maxConcurrentRequests
+#：信号量隔离策略下，允许的最大并发请求数量，默认10
+
+降级相关的属性
+
+hystrix.command.default.fallback.enabled
+#默认true
+
+熔断相关的属性
+
+hystrix.command.default.circuitBreaker.enabled
+#：是否启用熔断器默认true
+hystrix.command.default.circuitBreaker.requestVolumeThreshold
+#：10秒钟内，请求数量达到多少才能去尝试触发熔断，默认20
+hystrix.command.default.circuitBreaker.errorThresholdPercentage
+#：10秒钟内，请求数量达到20，同时异常比例达到50%，就会触发熔断，默认50
+hystrix.command.default.circuitBreaker.sleepWindowInMilliseconds
+#：触发熔断之后，5s内直接拒绝请求，走降级逻辑，5s后尝试half-open放过少量流量试着恢复，默认5000
+hystrix.command.default.circuitBreaker.forceOpen
+#：强制打开熔断器
+hystrix.command.default.circuitBreaker.forceClosed
+#：强制关闭熔断器
+
+metric相关的属性
+
+hystrix.threadpool.default.metrics.rollingStats.timeInMillisecond
+#：线程池统计指标的时间，默认10000，就是10s
+hystrix.threadpool.default.metrics.rollingStats.numBuckets
+#：将rolling window划分为n个buckets，默认10
+hystrix.command.default.metrics.rollingStats.timeInMilliseconds
+#：command的统计时间，熔断器是否打开会根据1个rolling window的统计来计算。若rolling window被设为10000毫秒，则rolling window会被分成n个buckets，每个bucket包含success，failure，timeout，rejection的次数的统计信息。默认10000
+hystrix.command.default.metrics.rollingStats.numBuckets
+#设置一个rolling window被划分的数量，若numBuckets＝10，rolling window＝10000，那么一个bucket的时间即1秒。必须符合rolling window % numberBuckets == 0。默认10
+hystrix.command.default.metrics.rollingPercentile.enabled
+#执行时是否enable指标的计算和跟踪，默认true
+hystrix.command.default.metrics.rollingPercentile.timeInMilliseconds
+#设置rolling percentile window的时间，默认60000
+hystrix.command.default.metrics.rollingPercentile.numBuckets
+#设置rolling percentile window的numberBuckets。逻辑同上。默认6
+hystrix.command.default.metrics.rollingPercentile.bucketSize
+#如果bucket size＝100，window＝10s，若这10s里有500次执行，只有最后100次执行会被统计到bucket里去。增加该值会增加内存开销以及排序的开销。默认100
+hystrix.command.default.metrics.healthSnapshot.intervalInMilliseconds 
+#记录health 快照（用来统计成功和错误绿）的间隔，默认500ms
+
+
+高阶特性相关的参数
+
+hystrix.command.default.requestCache.enabled
+#默true
+
+hystrix.command.default.requestLog.enabled 
+#记录日志到HystrixRequestLog，默认true
+
+hystrix.collapser.default.maxRequestsInBatch 
+#单次批处理的最大请求数，达到该数量触发批处理，默认Integer.MAX_VALUE
+hystrix.collapser.default.timerDelayInMilliseconds
+#触发批处理的延迟，也可以为创建批处理的时间＋该值，默认10
+hystrix.collapser.default.requestCache.enabled
+#是否对HystrixCollapser.execute() and HystrixCollapser.queue()的cache，默认true
+
+
+```
+
+4.4 
+
+
+
+
+
+
+
