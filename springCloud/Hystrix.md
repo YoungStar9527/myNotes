@@ -2940,7 +2940,7 @@ hystrix.command.default.metrics.rollingPercentile.numBuckets
 hystrix.command.default.metrics.rollingPercentile.bucketSize
 #如果bucket size＝100，window＝10s，若这10s里有500次执行，只有最后100次执行会被统计到bucket里去。增加该值会增加内存开销以及排序的开销。默认100
 hystrix.command.default.metrics.healthSnapshot.intervalInMilliseconds 
-#记录health 快照（用来统计成功和错误绿）的间隔，默认500ms
+#记录health 快照（用来统计成功和错误率）的间隔，默认500ms
 
 
 高阶特性相关的参数
@@ -2961,7 +2961,606 @@ hystrix.collapser.default.requestCache.enabled
 
 ```
 
-4.4 
+
+
+# 5 spring cloud环境下的feign与hystrix整合源码
+
+## 5.1 spring cloud环境下的feign与hystrix整合的核心原理图
+
+### 5.1.1 一句话总结目前为止的spring cloud netflix框架的核心原理
+
+eureka + ribbon + feign
+
+**eureka + ribbon：**ribbon的ILoadBalancer里的ServerList会自动每隔30秒从eureka client里去获取本地的最新的注册表，根据注册表里的服务的server list，来进行负载均衡
+
+**ribbon + feign：**feign在发起一个请求之前，一定会使用ribbon的ILoadBalancer去进行负载均衡，从一堆server list中获取一个server，然后再针对哪个server发起请求
+
+**feign + hystrix：**feign发起请求的时候，会基于hystrix来进行各个服务的隔离、超时、异常、限流、降级、熔断
+
+**hystrix + turbine + dashboard：**来看到一个最最基础的微服务架构的仪表盘，请求次数、请求延时 
+
+**feign的核心原理是什么？？**
+
+@EnableFeignClients注解 -> 扫描 -> @FeignClient注解 -> 针对接口生成动态代理 -> 基于Contract解析spring mvc的注解 -> 请求都是基于feign动态代理 -> 使用ribbon进行负载均衡 -> 根据之前解析出来的spring mvc注解里的信息生成已给请求url -> 针对负载均衡选择出来的server发出一个http请求
+
+**hystrix跟feign整合以后**
+
+短路，熔断，circuit breaker
+
+大胆的猜测一下，feign和hystirx整合，feign动态代理里面一定是有一些hystrix相关的代码，然后请求走feign动态代理的时候，就会基于hystrix command发送请求，实现服务间调用的隔离、限流、超时、异常、降级、熔断、统计。
+
+hystirx的服务间调用的统计 -> dashboard进行可视化的监控
+
+### 5.1.2 feign与hystrix整合的核心原理图
+
+![image-20210814104640151](Hystrix.assets/image-20210814104640151.png)
+
+
+
+## 5.2 启用hystrix之后feign的动态代理创建的过程
+
+​	**我们来找一个生成feign动态代理的关键地方(HystrixTargeter)**，打入断点，启动服务B，来观察，**如果你启用hystrix之后，生成动态代理的时候有什么区别**
+
+**PS:对应feign流程图：**https://www.processon.com/view/link/60fd1fd3f346fb1b4f5fdd3f
+
+```java
+class HystrixTargeter implements Targeter {
+
+	@Override
+	public <T> T target(FeignClientFactoryBean factory, Feign.Builder feign, FeignContext context,
+						Target.HardCodedTarget<T> target) {
+        //如果没有启用hystrix
+        //如果没有启用hystirx的话，那么默认的Builder是原生的Feign.Builder
+        //则会进入这个if
+		if (!(feign instanceof feign.hystrix.HystrixFeign.Builder)) {
+			return feign.target(target);
+		}
+        //启用了hystrix则会继续往下走
+        //启用了hystrix的feign.hystrix.HystrixFeign，Builder就是HystrixFeign.Builder了
+		feign.hystrix.HystrixFeign.Builder builder = (feign.hystrix.HystrixFeign.Builder) feign;
+		SetterFactory setterFactory = getOptional(factory.getName(), context,
+			SetterFactory.class);
+		if (setterFactory != null) {
+			builder.setterFactory(setterFactory);
+		}
+        //fallback，我们之前其实没有设置，所以在这里的fallback就是一个空
+		Class<?> fallback = factory.getFallback();
+		if (fallback != void.class) {
+			return targetWithFallback(factory.getName(), context, target, builder, fallback);
+		}
+        //我们设置的那个FallbackFactory，负责在每次超时、拒绝（线程池满）、异常的时候，create()方法返回一个降级机制的对象
+		Class<?> fallbackFactory = factory.getFallbackFactory();
+        //因为设置的是FallbackFactory，所以进入这个if
+		if (fallbackFactory != void.class) {
+            //进入这个if
+			return targetWithFallbackFactory(factory.getName(), context, target, builder, fallbackFactory);
+		}
+
+		return feign.target(target);
+	}
+    
+    
+	private <T> T targetWithFallbackFactory(String feignClientName, FeignContext context,
+											Target.HardCodedTarget<T> target,
+											HystrixFeign.Builder builder,
+											Class<?> fallbackFactoryClass) {
+        //从服务（ServiceA）的独立的spring容器中取出来一个独立的FallbackFactory，调用每个服务的时候，他对应的FallbackFactory都是存在于那个服务关联的独立的spring容器中的
+		FallbackFactory<? extends T> fallbackFactory = (FallbackFactory<? extends T>)
+			getFromContext("fallbackFactory", feignClientName, context, fallbackFactoryClass, FallbackFactory.class);
+		/* We take a sample fallback from the fallback factory to check if it returns a fallback
+		that is compatible with the annotated feign interface. */
+        //就是用你的FallbackFactory去创建一个Fallback对象出来
+		Object exampleFallback = fallbackFactory.create(new RuntimeException());
+        //用来检查你自己定义的那个Fallback工厂是否ok，你的Fallback工厂是否返回了一个Fallback对象
+        //不能为空的
+		Assert.notNull(exampleFallback,
+			String.format(
+			"Incompatible fallbackFactory instance for feign client %s. Factory may not produce null!",
+				feignClientName));
+        //你定义的Fallback对象必须是实现了ServiceAClient接口的，检查你的Fallback对象的类型
+		if (!target.type().isAssignableFrom(exampleFallback.getClass())) {
+			throw new IllegalStateException(
+				String.format(
+					"Incompatible fallbackFactory instance for feign client %s. Factory produces instances of '%s', but should produce instances of '%s'",
+					feignClientName, exampleFallback.getClass(), target.type()));
+		}
+        //生成动态代理，Builder的target()方法，传入进去fallbackFactory
+		return builder.target(target, fallbackFactory);
+	}
+
+}
+```
+
+对应HystrixTargeter.target最后return的断点
+
+![image-20210814120615584](Hystrix.assets/image-20210814120615584.png)
+
+
+
+```java
+public final class HystrixFeign {
+................
+  public static final class Builder extends Feign.Builder {
+...............
+	//首先进入这里
+    public <T> T target(Target<T> target, FallbackFactory<? extends T> fallbackFactory) {
+    //主要逻辑都在build，包括newInstance中create方法创建的InvocationHandler
+    //也是在build中的匿名内部类返回的HystrixInvocationHandler对象实例
+      return build(fallbackFactory).newInstance(target);
+    }
+...............
+    Feign build(final FallbackFactory<?> nullableFallbackFactory) {
+      super.invocationHandlerFactory(new InvocationHandlerFactory() {
+        @Override public InvocationHandler create(Target target,
+            Map<Method, MethodHandler> dispatch) {
+            //最终实际用来去处理这个请求的，其实是InvocationHandler，他是JDK动态代理的核心，基于JDK动态代理机制，生成一个动态代理的对象之后，对这个对象所有的方法调用，都会走关联的那个InvocationHandler
+          return new HystrixInvocationHandler(target, dispatch, setterFactory, nullableFallbackFactory);
+        }
+      });
+    //也很关键，Contract，解析第三方注解的组件，设置为了HystrixDelegatingContract，顾名思义，就是说，设置了这个组件之后，后面就可以解析你在各个接口上打的这个@HystirxCommand以及其他的一些注解，hystrix相关的一些注解
+      super.contract(new HystrixDelegatingContract(contract));
+    //接着就调用了super.build()，HystrixFeign.Builder的父类，就是Feign.Builder，后面的构造动态代理的逻辑，几乎都是一样了
+      return super.build();
+    }
+...............
+  }
+...............
+}
+
+public class ReflectiveFeign extends Feign {
+    
+  @Override
+  public <T> T newInstance(Target<T> target) {
+    Map<String, MethodHandler> nameToHandler = targetToHandlersByName.apply(target);
+    Map<Method, MethodHandler> methodToHandler = new LinkedHashMap<Method, MethodHandler>();
+    List<DefaultMethodHandler> defaultMethodHandlers = new LinkedList<DefaultMethodHandler>();
+
+    for (Method method : target.type().getMethods()) {
+      if (method.getDeclaringClass() == Object.class) {
+        continue;
+      } else if(Util.isDefault(method)) {
+        DefaultMethodHandler handler = new DefaultMethodHandler(method);
+        defaultMethodHandlers.add(handler);
+        methodToHandler.put(method, handler);
+      } else {
+        methodToHandler.put(method, nameToHandler.get(Feign.configKey(target.type(), method)));
+      }
+    }
+    //核心在这里，创建InvocationHandler动态代理的拦截器发生了变化
+    //和hystrix结合后InvocationHandler的实例为，之前build方法中匿名内部类返回的HystrixInvocationHandler实例对象
+    InvocationHandler handler = factory.create(target, methodToHandler);
+    
+    T proxy = (T) Proxy.newProxyInstance(target.type().getClassLoader(), new Class<?>[]{target.type()}, handler);
+
+    for(DefaultMethodHandler defaultMethodHandler : defaultMethodHandlers) {
+      defaultMethodHandler.bindTo(proxy);
+    }
+    return proxy;
+  }  
+    
+}
+```
+
+**HystrixInvocationHandler中相关参数说明**
+
+target：你要调用的服务
+
+dispatch：map，接口的每个方法的Method对象 -> SynchronousMethodHandler
+
+setterFactory：空
+
+nullableFallbackFactory：我们给的那个降级对象的工程，fallback工程
+
+HystrixInvocationHandler -> 包含了上面的4样东西
+
+![image-20210814142126536](Hystrix.assets/image-20210814142126536.png)
+
+**总结：**
+
+1 这里就是说核心的一点，就是先生成dispatch map，名字也叫做methodToHandler
+
+2 基于这个dispatch创建出来了一个HystrixInvocationHandler，feign-hystrix-9.5.0.jar里面，有这个类，是feign和hystirx整合专用的
+
+3 就会将动态代理，注入给ServiceBController
+
+ **流程图：**
+
+https://www.processon.com/view/link/61175a9ae0b34d0b1a574a87
+
+## 5.3 HystrixInvocationHandler的请求入口
+
+### 5.3.1 服务接口Setter的构造逻辑
+
+```java
+final class HystrixInvocationHandler implements InvocationHandler {
+
+  private final Target<?> target;
+  private final Map<Method, MethodHandler> dispatch;
+  private final FallbackFactory<?> fallbackFactory; // Nullable
+  private final Map<Method, Method> fallbackMethodMap;
+  private final Map<Method, Setter> setterMethodMap;
+
+  HystrixInvocationHandler(Target<?> target, Map<Method, MethodHandler> dispatch,
+                           SetterFactory setterFactory, FallbackFactory<?> fallbackFactory) {
+    this.target = checkNotNull(target, "target");
+    this.dispatch = checkNotNull(dispatch, "dispatch");
+    this.fallbackFactory = fallbackFactory;
+    this.fallbackMethodMap = toFallbackMethod(dispatch);
+    this.setterMethodMap = toSetters(setterFactory, target, dispatch.keySet());
+  }
+  
+  //构建setterMethodMap
+  static Map<Method, Setter> toSetters(SetterFactory setterFactory, Target<?> target,
+                                       Set<Method> methods) {
+    Map<Method, Setter> result = new LinkedHashMap<Method, Setter>();
+    for (Method method : methods) {
+      method.setAccessible(true);
+      //通过setterFactory.create构建Setter对象
+      result.put(method, setterFactory.create(target, method));
+    }
+    return result;
+  }
+    
+//InvocationHandler.invoke()方法是动态代理中最最核心的，相当于是T proxy注入ServiceBController，调用T proxy的时候，所有方法的调用，全部会走InvocationHandler.invoke()方法
+  @Override
+  public Object invoke(final Object proxy, final Method method, final Object[] args)
+      throws Throwable {
+    // early exit if the invoked method is from java.lang.Object
+    // code is the same as ReflectiveFeign.FeignInvocationHandler
+    if ("equals".equals(method.getName())) {
+      try {
+        Object otherHandler =
+            args.length > 0 && args[0] != null ? Proxy.getInvocationHandler(args[0]) : null;
+        return equals(otherHandler);
+      } catch (IllegalArgumentException e) {
+        return false;
+      }
+    } else if ("hashCode".equals(method.getName())) {
+      return hashCode();
+    } else if ("toString".equals(method.getName())) {
+      return toString();
+    }
+	//构造了一个HystrixCommand
+    //传进去了setterMethodMap.get(method)，5.3.1本小节主要分析setterMethodMap
+    //setterMethodMap.get(method) -> 获取到那个接口方法 -> Setter(groupKey, commandKey) -> 构造了一个HystrixCommand
+    HystrixCommand<Object> hystrixCommand = new HystrixCommand<Object>(setterMethodMap.get(method)) {
+................................................
+    };
+.........................
+    return hystrixCommand.execute();
+  }
+
+}
+
+```
+
+​	feign整合hystrix的时候，一个@FeignClient标注一个服务，这个服务的名称就会作为这个服务的每个接口的groupKey，一个服务对应一个groupKey，对应一个线程池，在这个服务中所有接口的调用，都走这个服务对应的线程池
+
+```java
+public interface SetterFactory {
+
+  /**
+   * Returns a hystrix setter appropriate for the given target and method
+   */
+  HystrixCommand.Setter create(Target<?> target, Method method);
+
+  /**
+   * Default behavior is to derive the group key from {@link Target#name()} and the command key from
+   * {@link Feign#configKey(Class, Method)}.
+   */
+  final class Default implements SetterFactory {
+
+    //hystrix原生构建command的核心类，HystrixCommand.Setter
+    @Override
+    public HystrixCommand.Setter create(Target<?> target, Method method) {
+      String groupKey = target.name();
+      //Feign.configKey()，静态方法，工具方法的意思，根据服务对应的Interface的类名 + Interface中的方法名，拼接成这个接口对应的commanKey -> ServiceAClient#sayHello(String,Integer,Long) -> commandKey
+      String commandKey = Feign.configKey(target.type(), method);
+     //构建command的最为关键的两个值
+     //groupKey->服务名ServiceA
+     //commandKey->服务-方法 ServiceAClient#getById(Long)
+      return HystrixCommand.Setter
+          .withGroupKey(HystrixCommandGroupKey.Factory.asKey(groupKey))
+          .andCommandKey(HystrixCommandKey.Factory.asKey(commandKey));
+    }
+  }
+}
+```
+
+**总结：**
+
+如果你要是去用**hystrix command构造的时候，务必传入进去两个东西**
+
+**第一个东西，就是至关重要的groupKey，一般来说就是一个服务对应一个groupKey，服务名称就是一个groupKey，groupKey就对应着一个线程池**
+
+**第二个东西，就是commandKey，一个commandKey对应服务的一个接口**
+
+也就是说，一个服务对应一个groupKey，一个服务对应多个HystrixCommand，每个HystrixCommand对应一个commandKey，每个commandKey代表一个接口，但是多个接口属于同一个服务，也就是对应同一个groupKey
+
+**一个groupKey对应一个线程池**，一个服务对应一个线程池，比如就10个线程
+
+那么这个服务可能会有比如28个接口，就对应着28个HystrixCommand，28个commandKey，getById、createUser，但是这个服务的28个接口的28个HystrixCommand请求执行，全部都是基于一个服务的线程池，也就是只有10个线程来处理这个服务的所有28个接口的调用。。。。
+
+**在HystrixInvocationHandler构造**的时候，就会去根据**dispatch包含了所有的接口的方法，对每个接口方法，都会生成一个Setter，这个Setter里面就包含了这个服务接口对应的groupKey和commandKey**
+
+所以我们来简单的看一下这个Setter map的生成的过程，就可以从源码级别了解到feign整合hystrix的时候，**对每个接口的调用，groupKey和commandKey分别是什么**
+
+**如断点所示：**
+
+![image-20210814174023452](Hystrix.assets/image-20210814174023452.png)
+
+
+
+**流程图：**https://www.processon.com/view/link/61179941f346fb06e5cb5aa7
+
+### 5.3.2 执行请求的HystrixCommand的构建过程以及组成结构
+
+
+
+```java
+final class HystrixInvocationHandler implements InvocationHandler {
+
+  private final Target<?> target;
+  private final Map<Method, MethodHandler> dispatch;
+  private final FallbackFactory<?> fallbackFactory; // Nullable
+  private final Map<Method, Method> fallbackMethodMap;
+  private final Map<Method, Setter> setterMethodMap;
+
+//InvocationHandler.invoke()方法是动态代理中最最核心的，相当于是T proxy注入ServiceBController，调用T proxy的时候，所有方法的调用，全部会走InvocationHandler.invoke()方法
+  @Override
+  public Object invoke(final Object proxy, final Method method, final Object[] args)
+      throws Throwable {
+    // early exit if the invoked method is from java.lang.Object
+    // code is the same as ReflectiveFeign.FeignInvocationHandler
+    if ("equals".equals(method.getName())) {
+      try {
+        Object otherHandler =
+            args.length > 0 && args[0] != null ? Proxy.getInvocationHandler(args[0]) : null;
+        return equals(otherHandler);
+      } catch (IllegalArgumentException e) {
+        return false;
+      }
+    } else if ("hashCode".equals(method.getName())) {
+      return hashCode();
+    } else if ("toString".equals(method.getName())) {
+      return toString();
+    }
+	//构造了一个HystrixCommand
+    //传进去了setterMethodMap.get(method)，5.3.1本小节主要分析setterMethodMap
+    //setterMethodMap.get(method) -> 获取到那个接口方法 -> Setter(groupKey, commandKey) -> 构造了一个HystrixCommand
+    HystrixCommand<Object> hystrixCommand = new HystrixCommand<Object>(setterMethodMap.get(method)) {
+      @Override
+      protected Object run() throws Exception {
+        try {
+         //对于我们来说，每个command的执行业务逻辑，就是根据ribbon进行负载均衡，选择一个server，生成针对那个server的http请求，发起一个http请求
+         //这个dispatch中的SynchronousMethodHandler实际上就是feign请求的那套逻辑
+          return HystrixInvocationHandler.this.dispatch.get(method).invoke(args);
+        } catch (Exception e) {
+          throw e;
+        } catch (Throwable t) {
+          throw (Error) t;
+        }
+      }
+
+     //在你的hystrix command执行发生问题的时候，会调用这个command的fallback逻辑，降级机制：熔断（断路器打开了，直接就会fallback）、拒绝（线程池满了，信号量满了）、超时（核心逻辑执行超时）、异常（如果核心逻辑执行报错，比如说远程接口报错，往外面抛异常）
+	//上述的情况下，会直接执行getFallback()方法，去获取一个Fallback object，降级对象，然后会调用这个fallback对象中的降级方法，来实现降级逻辑
+      @Override
+      protected Object getFallback() {
+        //这个fallbackFactory实际上就是自己实现的fallback逻辑，无论是fallback/fallbackFactory方式自定义实现了fallback逻辑
+        //自定义了则fallbackFactory不为空，没有自定义实现，则fallbackFactory为空
+        if (fallbackFactory == null) {
+          //如果fallbackFactory是null的话，直接会报错，就说你没有fallback降级逻辑，结果你的command还执行失败了，此时就会直接给你报错
+          return super.getFallback();
+        }
+        try {
+          //fallbackFactory去创建一个fallback对象出来
+          //getExecutionException是什么东西？获取command执行的异常，熔断、拒绝、超时、报错，都会给你，你自己来决定，根据各种不同的异常，如何实现降级
+          //fallbackFactory.create调用的就是demo中的fallbackFactory的create方法
+          //Object fallback：我们自己定义的实现ServiceAClient接口的匿名类的对象，里面包含了降级的逻辑
+          Object fallback = fallbackFactory.create(getExecutionException());
+          //fallbackMethodMap一看就是包含了接口的各种方法，根据你要调用的这个方法，获取一个方法对应的Method对象，然后对fallback object调用那个Method方法，传入args参数(就是找到当前降级的方法对应的自定义fallback方法，传递对应参数并调用)
+          Object result = fallbackMethodMap.get(method).invoke(fallback, args);
+          //后面一连串的if判断是判断返回值类型，如果返回值类型为HystrixCommand、Observable等类型，则交给对应的HystrixCommand、Observable去执行逻辑
+          if (isReturnsHystrixCommand(method)) {
+            return ((HystrixCommand) result).execute();
+          } else if (isReturnsObservable(method)) {
+            // Create a cold Observable
+            return ((Observable) result).toBlocking().first();
+          } else if (isReturnsSingle(method)) {
+            // Create a cold Observable as a Single
+            return ((Single) result).toObservable().toBlocking().first();
+          } else if (isReturnsCompletable(method)) {
+            ((Completable) result).await();
+            return null;
+          } else {
+            return result;
+          }
+        } catch (IllegalAccessException e) {
+          // shouldn't happen as method is public due to being an interface
+          throw new AssertionError(e);
+        } catch (InvocationTargetException e) {
+          // Exceptions on fallback are tossed by Hystrix
+          throw new AssertionError(e.getCause());
+        }
+      }
+    };
+	//这里一连串的if判断是判断返回值类型，如果返回值类型为HystrixCommand、Observable等类型，则交给对应的HystrixCommand、Observable去执行逻辑
+    //sayHello()方法的返回类型是HystrixCommand的话，那么在这里，针对这个方法的调用，构造好了HystrixCommand之后，就不会去执行这个command，而是将这个command作为你的sayHello()方法的返回值，返回给你让你来决定，如何使用这个command
+    if (isReturnsHystrixCommand(method)) {
+      return hystrixCommand;
+    } else if (isReturnsObservable(method)) {
+      // Create a cold Observable
+      return hystrixCommand.toObservable();
+    } else if (isReturnsSingle(method)) {
+      // Create a cold Observable as a Single
+      return hystrixCommand.toObservable().toSingle();
+    } else if (isReturnsCompletable(method)) {
+      return hystrixCommand.toObservable().toCompletable();
+    }
+    //如果不是上面if相关的类型的话，直接执行execute
+    //下一节 5.3.3 
+    return hystrixCommand.execute();
+  }
+
+}
+
+```
+
+**总结：**
+
+run()，getFallback()
+
+run()：就是使用SynchronousMethodHandler来处理请求，逻辑跟之前是一模一样了
+
+getFallback()：就是如果command执行有任何的问题的话，就会直接获取一个fallback object，然后执行fallback object的降级逻辑
+
+### 5.3.3 HystrixCommand的执行入口进行源码探秘
+
+​	从这个queue()方法开始，我们就要研究netflix hystrix的源码了
+
+​	**queue()方法，是用来异步执行command业务逻辑的，他会将command扔到线程池里去执行，但是这个方法是不会等待这个线程执行完毕command的，他会拿到一个Future对象，通过Future对象去获取command执行完毕的响应结果**
+
+```java
+public abstract class HystrixCommand<R> extends AbstractCommand<R> implements HystrixExecutable<R>, HystrixInvokableInfo<R>, HystrixObservable<R> {
+
+    public R execute() {
+        try {
+            //Future的get方法返回结果，会阻塞，直到任务结束返回结果为止
+            //尝试去通过future获取对应的thread对command执行后返回的结果，这里会卡住
+            return queue().get();
+        } catch (Exception e) {
+            throw Exceptions.sneakyThrow(decomposeException(e));
+        }
+    }
+
+
+    public Future<R> queue() {
+
+        //toObservable()：Observable对象
+        //此时这个command已经被扔到了线程池里去执行了，获取了一个线程池里执行线程对应的一个Future对象
+        //下一讲 3.3.4 这行代码，才是重中之重，这行代码底层实现了hystirx几乎所有的核心逻辑，请求缓存、熔断、队列+线程池、超时检测、异常、等核心逻辑
+        final Future<R> delegate = toObservable().toBlocking().toFuture();
+    	
+        //这里你获取到的这个Future对象，是不具备，因为一些异常的原因，中断这个线程执行的能力的，比如超时、异常，你没办法在异常情况下，终止future对应的线程的执行，所以说要对这里返回的delegate future进行包装
+        final Future<R> f = new Future<R>() {
+		
+            @Override
+            public boolean cancel(boolean mayInterruptIfRunning) {
+                //如果线程已经被取消了，则返回false
+                if (delegate.isCancelled()) {
+                    return false;
+                }
+				
+                if (HystrixCommand.this.getProperties().executionIsolationThreadInterruptOnFutureCancel().get()) {
+
+                    interruptOnFutureCancel.compareAndSet(false, mayInterruptIfRunning);
+        		}
+			  //调用第一个Future delegate的线程取消方法
+                final boolean res = delegate.cancel(interruptOnFutureCancel.get());
+
+                if (!isExecutionComplete() && interruptOnFutureCancel.get()) {
+                    final Thread t = executionThread.get();
+                    if (t != null && !t.equals(Thread.currentThread())) {
+                        //终止当前线程
+                        t.interrupt();
+                    }
+                }
+
+                return res;
+			}
+
+            @Override
+            public boolean isCancelled() {
+                return delegate.isCancelled();
+			}
+
+            @Override
+            public boolean isDone() {
+                return delegate.isDone();
+			}
+
+            @Override
+            public R get() throws InterruptedException, ExecutionException {
+                return delegate.get();
+            }
+
+            @Override
+            public R get(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
+                return delegate.get(timeout, unit);
+            }
+        	
+        };
+		//f.isDone()，就是通过future判断对应的那个线程，是否完成了command的执行
+        //isDone方法不会阻塞，所以正常来说不会进入这个if
+        if (f.isDone()) {
+            try {
+                //Future.get()
+                f.get();
+                return f;
+            } catch (Exception e) {
+                Throwable t = decomposeException(e);
+                if (t instanceof HystrixBadRequestException) {
+                    return f;
+                } else if (t instanceof HystrixRuntimeException) {
+                    HystrixRuntimeException hre = (HystrixRuntimeException) t;
+                    switch (hre.getFailureType()) {
+					case COMMAND_EXCEPTION:
+					case TIMEOUT:
+						return f;
+					default:
+						throw hre;
+					}
+                } else {
+                    throw Exceptions.sneakyThrow(t);
+                }
+            }
+        }
+		//直接返回Future
+        return f;
+    }    
+
+}
+```
+
+**Future接口说明**
+
+ 　在Future接口中声明了5个方法，下面依次解释每个方法的作用：
+
+- cancel方法用来取消任务，如果取消任务成功则返回true，如果取消任务失败则返回false。参数mayInterruptIfRunning表示是否允许取消正在执行却没有执行完毕的任务，如果设置true，则表示可以取消正在执行过程中的任务。如果任务已经完成，则无论mayInterruptIfRunning为true还是false，此方法肯定返回false，即如果取消已经完成的任务会返回false；如果任务正在执行，若mayInterruptIfRunning设置为true，则返回true，若mayInterruptIfRunning设置为false，则返回false；如果任务还没有执行，则无论mayInterruptIfRunning为true还是false，肯定返回true。
+
+  
+
+- isCancelled方法表示任务是否被取消成功，如果在任务正常完成前被取消成功，则返回 true。
+
+  
+
+- isDone方法表示任务是否已经完成，若任务完成，则返回true；
+
+  
+
+- get()方法用来获取执行结果，这个方法会产生阻塞，会一直等到任务执行完毕才返回；
+
+  
+
+- get(long timeout, TimeUnit unit)用来获取执行结果，如果在指定时间内，还没获取到结果，就直接返回null。
+
+**总结：**
+
+1 所以说这个新创建的future对象，其实包装了上面的原生的delegate future对象，这里的cancel()方法，就是说，可以支持将delegate future对象对应的thread线程interrupt中止掉，封装了一些isCanceled()、isDone()、get()等future相关的代码
+
+2 他搞两个future，最主要的是用第二个future，去包装第一个future，第一个future，原生的情况下，是不支持cancel()方法中止自己对应的那个在执行的线程的，所以搞第二个future包装一下，可以支持cancel()中止线程(说白了就是再包装一层future,支持中断当前调用线程的相关操作)
+
+3 hystrix command对应着一个服务接口，属于一个服务，服务就是对应@FeignClient里的服务名称，ServiceA，一个服务是一个groupKey，对应一个线程池，一定是要基于服务的线程池来进行执行的
+
+4 queue()了以后，就会通过线程池去执行command，然后在queue()方法中，会等待线程执行结束，如果线程执行结束了，就会返回future；即使执行失败了，也会根据情况，返回future，要不就是抛异常
+
+5 在execute()方法中，一定会拿到future，然后直接调用future.get()方法，尝试去获取futrue对应的thread执行command的一个结果
+
+6 execute()方法和queue()方法，主要的执行逻辑和流程
+
+**流程图：**
+
+https://www.processon.com/view/link/6118c9286376893a9f002f50
 
 
 
