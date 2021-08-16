@@ -2963,7 +2963,7 @@ hystrix.collapser.default.requestCache.enabled
 
 
 
-# 5 spring cloud环境下的feign与hystrix整合源码
+# 5 spring cloud环境下的feign与hystrix整合时源码
 
 ## 5.1 spring cloud环境下的feign与hystrix整合的核心原理图
 
@@ -3416,7 +3416,7 @@ getFallback()：就是如果command执行有任何的问题的话，就会直接
 
 ### 5.3.3 HystrixCommand的执行入口进行源码探秘
 
-​	从这个queue()方法开始，我们就要研究netflix hystrix的源码了
+​	**从这个queue()方法开始，我们就要研究netflix hystrix的源码了**
 
 ​	**queue()方法，是用来异步执行command业务逻辑的，他会将command扔到线程池里去执行，但是这个方法是不会等待这个线程执行完毕command的，他会拿到一个Future对象，通过Future对象去获取command执行完毕的响应结果**
 
@@ -3438,7 +3438,7 @@ public abstract class HystrixCommand<R> extends AbstractCommand<R> implements Hy
 
         //toObservable()：Observable对象
         //此时这个command已经被扔到了线程池里去执行了，获取了一个线程池里执行线程对应的一个Future对象
-        //下一讲 3.3.4 这行代码，才是重中之重，这行代码底层实现了hystirx几乎所有的核心逻辑，请求缓存、熔断、队列+线程池、超时检测、异常、等核心逻辑
+        //下一讲 6 这行代码，才是重中之重，这行代码底层实现了hystirx几乎所有的核心逻辑，请求缓存、熔断、队列+线程池、超时检测、异常、等核心逻辑
         final Future<R> delegate = toObservable().toBlocking().toFuture();
     	
         //这里你获取到的这个Future对象，是不具备，因为一些异常的原因，中断这个线程执行的能力的，比如超时、异常，你没办法在异常情况下，终止future对应的线程的执行，所以说要对这里返回的delegate future进行包装
@@ -3562,9 +3562,721 @@ public abstract class HystrixCommand<R> extends AbstractCommand<R> implements Hy
 
 https://www.processon.com/view/link/6118c9286376893a9f002f50
 
+# 6  toObservable()内的复杂代码
+
+## 6.1 toObservable初探
+
+hystrix的源码，真正核心的机制和逻辑都在：toObservable().toBlocking().toFuture()
+
+第6节,就是来研究这个toObservable()的方法
+
+toObservable()，其实是HystrixCommand的父类，AbstractCommand的方法。hystrix几乎所有的核心逻辑，请求缓存、线程池、超时检测、异常检测、熔断触发，都几乎在这个方法里作为入口
+
+```java
+/* package */abstract class AbstractCommand<R> implements HystrixInvokableInfo<R>, HystrixObservable<R> {
+........................
+    
+    /**
+     * Used for asynchronous execution of command with a callback by subscribing to the {@link Observable}.
+     1 这句话的意思，就是在这里，会将comand使用异步的方式来执行，怎么异步呢？肯定是扔到一个线程池里异步去跑。扔comand到线程池异步去执行之后，在这里你肯定是可以拿到一个Observable对象，拿到这个对象之后，你如果要看这个command执行的一些状态和结果，你需要去订阅这个Observable对象
+     2 你呢，类似于要提供一个回调接口，订阅Observable对象
+如果你command执行成功了、执行中断了、执行失败了，都会回过头来回调你提供的那些回调接口
+     * <p>
+     * This lazily starts execution of the command once the {@link Observable} is subscribed to.
+	1 这句话的意思是说，如果你获取了一个Observable对象之后，此时command其实还没立即开始执行的，这个时候仅仅就是将command封装在Observable对象里面，什么都没干，返回给你一个Observable对象
+	2 如果你订阅了那个Observable对象，提供了回调接口，才会触发Observable内部关联的comand会去执行，根据command执行的结果会去回调你提供的接口
+     * <p>
+     * An eager {@link Observable} can be obtained from {@link #observe()}.
+     1 这句话的意思，如果你希望一旦获取到Observable对象，就立即让他去执行内部的command，那么不要调用toObservable()方法，你可以去调用observe()方法
+     * <p>
+     * See https://github.com/ReactiveX/RxJava/wiki for more information.
+     * 
+     * @return {@code Observable<R>} that executes and calls back with the result of command execution or a fallback if the command fails for any reason.
+     * @throws HystrixRuntimeException
+     *             if a fallback does not exist
+     *             <p>
+     *             <ul>
+     *             <li>via {@code Observer#onError} if a failure occurs</li>
+     *             <li>or immediately if the command can not be queued (such as short-circuited, thread-pool/semaphore rejected)</li>
+     *             </ul>
+     * @throws HystrixBadRequestException
+     *             via {@code Observer#onError} if invalid arguments or state were used representing a user failure, not a system failure
+     * @throws IllegalStateException
+     *             if invoked more than once
+     */
+    public Observable<R> toObservable() {
+    	//_cmd就是当前command对象
+    	//其实就是之前在HystrixInvocationHandler里面创建出来的那个HystrixCommand（run()、getFallback()），就是那个匿名内部类的实例对象
+        final AbstractCommand<R> _cmd = this;
+
+        //doOnCompleted handler already did all of the SUCCESS work(doOnCompleted handler)
+        //doOnError handler already did all of the FAILURE/TIMEOUT/REJECTION/BAD_REQUEST work(异常执行就是doOnError handler)
+    	//FAILURE（异常、报错）、TIMEOUT（超时）、REJECTION（线程池满，被拒绝）、BAT_REQUEST（错误的请求）
+    	//doOnCompleted doOnError和rxjava框架相关，无须过多关注
+        final Action0 terminateCommandCleanup = new Action0() {
+		//应该是在HystrixCommand.run()尝试执行过后，执行完了以后来执行这个东西的(回调call)，分两个情况，要不是HystrixCommand.run()执行成功了，要不是执行失败了
+            @Override
+            public void call() {
+                if (_cmd.commandState.compareAndSet(CommandState.OBSERVABLE_CHAIN_CREATED, CommandState.TERMINAL)) {
+                    //如果command的状态是OBSERVABLE_CHAIN_CREATED，就将状态设置为TERMINAL，同时执行handleCommandEnd(false)，如果是这种情况，说明之前user code，用户的代码，从来没有运行过，HystrixCommand.run()
+                    handleCommandEnd(false); //user code never ran
+                } else if (_cmd.commandState.compareAndSet(CommandState.USER_CODE_EXECUTED, CommandState.TERMINAL)) {
+                    //如果command的状态是EXECUTED，就将状态设置为TERMINAL，同时执行handleCommandEnd(true)，这种情况，就是说user code已经运行过了，HystrixCommand.run()方法已经执行过了
+                    handleCommandEnd(true); //user code did run
+                }
+            }
+        };
+
+        //mark the command as CANCELLED and store the latency (in addition to standard cleanup)
+    //我们发现说，他在这里创建了一大堆很明显是用来被回调的接口的匿名内部类的对象
+        final Action0 unsubscribeCommandCleanup = new Action0() {
+            @Override
+            public void call() {
+                if (_cmd.commandState.compareAndSet(CommandState.OBSERVABLE_CHAIN_CREATED, CommandState.UNSUBSCRIBED)) {
+                    if (!_cmd.executionResult.containsTerminalEvent()) {
+                        _cmd.eventNotifier.markEvent(HystrixEventType.CANCELLED, _cmd.commandKey);
+                        try {
+                            executionHook.onUnsubscribe(_cmd);
+                        } catch (Throwable hookEx) {
+                            logger.warn("Error calling HystrixCommandExecutionHook.onUnsubscribe", hookEx);
+                        }
+                        _cmd.executionResultAtTimeOfCancellation = _cmd.executionResult
+                                .addEvent((int) (System.currentTimeMillis() - _cmd.commandStartTimestamp), HystrixEventType.CANCELLED);
+                    }
+                    handleCommandEnd(false); //user code never ran
+                } else if (_cmd.commandState.compareAndSet(CommandState.USER_CODE_EXECUTED, CommandState.UNSUBSCRIBED)) {
+                    if (!_cmd.executionResult.containsTerminalEvent()) {
+                        _cmd.eventNotifier.markEvent(HystrixEventType.CANCELLED, _cmd.commandKey);
+                        try {
+                            executionHook.onUnsubscribe(_cmd);
+                        } catch (Throwable hookEx) {
+                            logger.warn("Error calling HystrixCommandExecutionHook.onUnsubscribe", hookEx);
+                        }
+                        _cmd.executionResultAtTimeOfCancellation = _cmd.executionResult
+                                .addEvent((int) (System.currentTimeMillis() - _cmd.commandStartTimestamp), HystrixEventType.CANCELLED);
+                    }
+                    handleCommandEnd(true); //user code did run
+                }
+            }
+        };
+
+        final Func0<Observable<R>> applyHystrixSemantics = new Func0<Observable<R>>() {
+            @Override
+            public Observable<R> call() {
+                if (commandState.get().equals(CommandState.UNSUBSCRIBED)) {
+                    return Observable.never();
+                }
+                return applyHystrixSemantics(_cmd);
+            }
+        };
+
+        final Func1<R, R> wrapWithAllOnNextHooks = new Func1<R, R>() {
+            @Override
+            public R call(R r) {
+                R afterFirstApplication = r;
+
+                try {
+                    afterFirstApplication = executionHook.onComplete(_cmd, r);
+                } catch (Throwable hookEx) {
+                    logger.warn("Error calling HystrixCommandExecutionHook.onComplete", hookEx);
+                }
+
+                try {
+                    return executionHook.onEmit(_cmd, afterFirstApplication);
+                } catch (Throwable hookEx) {
+                    logger.warn("Error calling HystrixCommandExecutionHook.onEmit", hookEx);
+                    return afterFirstApplication;
+                }
+            }
+        };
+
+        final Action0 fireOnCompletedHook = new Action0() {
+            @Override
+            public void call() {
+                try {
+                    executionHook.onSuccess(_cmd);
+                } catch (Throwable hookEx) {
+                    logger.warn("Error calling HystrixCommandExecutionHook.onSuccess", hookEx);
+                }
+            }
+        };
+
+    //上面那一大坨，明显就是说创建了一个Observable对象，上面5个东西，之前创建好的，一些回调的接口，然后明显基于这5个回调的接口，然后创建了新的逻辑，Fun0，call()方法的实现逻辑，就是基于这5个回调接口来的
+        return Observable.defer(new Func0<Observable<R>>() {
+            @Override
+            public Observable<R> call() {
+                 /* this is a stateful object so can only be used once */
+                if (!commandState.compareAndSet(CommandState.NOT_STARTED, CommandState.OBSERVABLE_CHAIN_CREATED)) {
+                    IllegalStateException ex = new IllegalStateException("This instance can only be executed once. Please instantiate a new instance.");
+                    //TODO make a new error type for this
+                    throw new HystrixRuntimeException(FailureType.BAD_REQUEST_EXCEPTION, _cmd.getClass(), getLogMessagePrefix() + " command executed multiple times - this is not permitted.", ex, null);
+                }
+
+                commandStartTimestamp = System.currentTimeMillis();
+
+                if (properties.requestLogEnabled().get()) {
+                    // log this command execution regardless of what happened
+                    if (currentRequestLog != null) {
+                        currentRequestLog.addExecutedCommand(_cmd);
+                    }
+                }
+
+                final boolean requestCacheEnabled = isRequestCachingEnabled();
+                final String cacheKey = getCacheKey();
+
+                /* try from cache first */
+                if (requestCacheEnabled) {
+                    HystrixCommandResponseFromCache<R> fromCache = (HystrixCommandResponseFromCache<R>) requestCache.get(cacheKey);
+                    if (fromCache != null) {
+                        isResponseFromCache = true;
+                        return handleRequestCacheHitAndEmitValues(fromCache, _cmd);
+                    }
+                }
+
+                Observable<R> hystrixObservable =
+                        Observable.defer(applyHystrixSemantics)
+                                .map(wrapWithAllOnNextHooks);
+
+                Observable<R> afterCache;
+
+                // put in cache
+                if (requestCacheEnabled && cacheKey != null) {
+                    // wrap it for caching
+                    HystrixCachedObservable<R> toCache = HystrixCachedObservable.from(hystrixObservable, _cmd);
+                    HystrixCommandResponseFromCache<R> fromCache = (HystrixCommandResponseFromCache<R>) requestCache.putIfAbsent(cacheKey, toCache);
+                    if (fromCache != null) {
+                        // another thread beat us so we'll use the cached value instead
+                        toCache.unsubscribe();
+                        isResponseFromCache = true;
+                        return handleRequestCacheHitAndEmitValues(fromCache, _cmd);
+                    } else {
+                        // we just created an ObservableCommand so we cast and return it
+                        afterCache = toCache.toObservable();
+                    }
+                } else {
+                    afterCache = hystrixObservable;
+                }
+			//基于上面相关的回调对象，最后就直接返回一个Observable对象了
+                return afterCache
+                        .doOnTerminate(terminateCommandCleanup)     // perform cleanup once (either on normal terminal state (this line), or unsubscribe (next line))
+                        .doOnUnsubscribe(unsubscribeCommandCleanup) // perform cleanup once
+                        .doOnCompleted(fireOnCompletedHook);
+            }
+        });
+    }
+    
+
+......................
+}
+```
+
+**总结1**
+
+1 **我们发现说，他在这里创建了一大堆很明显是用来被回调的接口的匿名内部类的对象**
+
+Action0 terminateCommandCleanup 
+
+Action0 unsubscribeCommandCleanup
+
+Func0<Observable<R>> applyHystrixSemantics
+
+Func1<R, R> wrapWithAllOnNextHooks
+
+Action0 fireOnCompletedHook
+
+ **2 然后基于这些回调对象返回了一个Observable**
+
+**总结2**
+
+1 **toObservable()：并没有真正的去执行我们的command，他其实就是基于command封装出来了一个Observable对象，然后直接返回这个Observable对象，command还没执行呢，除非你后面比如说去订阅Observable，才能出发他里面去执行command**
+
+2 我们可以揣测，其实真正出发Observable里面的command的执行，肯定是这个toBlocking()方法里面去触发的，如果我们去看toBlocking()方法的源码，你觉得靠谱吗？我觉得不太靠谱，因为rxjava项目的源码
+
+3 我给大家说一个思路，类似于rxjava这种项目的源码，你不看也没关系，**因为toBlocking()一旦调用之后，一定会触发Observable内部的一些执行的流程和逻辑，这些流程和逻辑，一定会依次的去调用之前的那5个东西提供的回调方法，call()方法**
+
+4 我们不如不要跟进去看这个toBlocking()方法的源码，直接就全速前进，让源码在我们直接打的那5个东西的call()方法的断点里如果能进断点，我们来观察，那5个东西，在Observable执行的过程中，是怎么玩儿的
+
+5 toBlocking()方法一旦调用，一定会触发hystrix相关的所有核心逻辑的执行
+
+6 我们就去看一下，**toBlocking()方法的源码我们不去看，rxjava的源码**，我们直接点击全部前进，看看之前在那5个东东的call()方法里面打的断点，按照什么样的先后顺序会进去，如何执行，hystrix所有的核心逻辑，都集中在那5个东东的call()方法里了
+
+7 一旦全速前进之后，就会发现，果然开始进入到相关的call()方法里去了
+
+8 t**oBlocking()方法，首先触发的就是Func0的call()方法（return Observable.defer(new Func0<Observable<R>>() { 最后返回的Func0的call方法）**
+
+## 6.2  Observable回调时的源码逻辑在干些什么
+
+**toObservable()方法的逻辑，这里面搞了5个东西，搞了一个Observable对象出来**
+
+这一步，绝对是没有去执行command的
+
+**Observable.toBlocking()方法的逻辑，其实就会开始去执行Observable里面的逻辑，按照顺序去执行之前搞的5个东西**
+
+**Func0.call()，这个是Observable执行command的源码逻辑的入口(第一个回调的方法)**
+
+```java
+/* package */abstract class AbstractCommand<R> implements HystrixInvokableInfo<R>, HystrixObservable<R> {
+........................
+
+    public Observable<R> toObservable() 
+..................................
+
+        final Func0<Observable<R>> applyHystrixSemantics = new Func0<Observable<R>>() {
+            @Override
+            public Observable<R> call() {
+                //-----------------第二个回调的方法
+                if (commandState.get().equals(CommandState.UNSUBSCRIBED)) {
+                    return Observable.never();
+                }
+                return applyHystrixSemantics(_cmd);
+            }
+        };
+..................................
+
+    //上面那一大坨，明显就是说创建了一个Observable对象，上面5个东西，之前创建好的，一些回调的接口，然后明显基于这5个回调的接口，然后创建了新的逻辑，Fun0，call()方法的实现逻辑，就是基于这5个回调接口来的
+        return Observable.defer(new Func0<Observable<R>>() {
+            //看到这里就明白了，Func0.call()，说白了，就是执行command的入口，Observable.toBlocking()方法触发的
+            @Override
+            public Observable<R> call() {
+                //---------断点第一个回调的方法
+                 /* this is a stateful object so can only be used once */
+                //刚开始做一个command状态的判断，如果说command的状态不是NOT_STARTED，他就认为说你已经执行过一次command了
+                //他就不会让你重复执行一个command
+                //如果是command的状态是NOT_STARTED的话，那么就会将command的状态设置为OBSERVABLE_CHAIN_CREATED
+                //compareAndSet方法不符合则直接返回false,符合时返回ture,且改变对应commandState值
+                //正常流程，现在刚开始，command的state是NOT_STARTED，这么一个状态，所以不进入if抛异常
+
+                if (!commandState.compareAndSet(CommandState.NOT_STARTED, CommandState.OBSERVABLE_CHAIN_CREATED)) {
+                    IllegalStateException ex = new IllegalStateException("This instance can only be executed once. Please instantiate a new instance.");
+                    //TODO make a new error type for this
+                    throw new HystrixRuntimeException(FailureType.BAD_REQUEST_EXCEPTION, _cmd.getClass(), getLogMessagePrefix() + " command executed multiple times - this is not permitted.", ex, null);
+                }
+
+                commandStartTimestamp = System.currentTimeMillis();
+			   //feign也有请求日志，hystrix也搞请求日志，其实像这种日志，你不要也行，如果是正常的日志，对你的用处并不是很大。
+                //一般来说还是建议搞一个统一日志中心，全部自己在系统里自己打印日志，ELK去做的。
+                if (properties.requestLogEnabled().get()) {
+                    // log this command execution regardless of what happened
+                    //默认情况，request log enabled是打开的(进入这个if)
+                    //但是负责请求日志的对象，是null，所以这里什么都不会干(所以下面这个if不会进入)
+                    if (currentRequestLog != null) {
+                        currentRequestLog.addExecutedCommand(_cmd);
+                    }
+                }
+
+                final boolean requestCacheEnabled = isRequestCachingEnabled();
+                final String cacheKey = getCacheKey();
+
+                /* try from cache first */
+                //默认情况下，request cache是不启用的
+                if (requestCacheEnabled) {
+                    HystrixCommandResponseFromCache<R> fromCache = (HystrixCommandResponseFromCache<R>) requestCache.get(cacheKey);
+                    if (fromCache != null) {
+                        isResponseFromCache = true;
+                        return handleRequestCacheHitAndEmitValues(fromCache, _cmd);
+                    }
+                }
+			//基于applyHystrixSemantics和wrapWithAllOnNextHooks创建了一个hystrixObservable的东西
+                Observable<R> hystrixObservable =
+                    //-----------------断点第二个回调的方法
+                        Observable.defer(applyHystrixSemantics)
+                                .map(wrapWithAllOnNextHooks);
+
+                Observable<R> afterCache;
+
+                // put in cache
+                //默认情况下，request cache是不启用的
+                //cacheKey也没有设置，所以这里肯定不会进
+                if (requestCacheEnabled && cacheKey != null) {
+                    // wrap it for caching
+                    HystrixCachedObservable<R> toCache = HystrixCachedObservable.from(hystrixObservable, _cmd);
+                    HystrixCommandResponseFromCache<R> fromCache = (HystrixCommandResponseFromCache<R>) requestCache.putIfAbsent(cacheKey, toCache);
+                    if (fromCache != null) {
+                        // another thread beat us so we'll use the cached value instead
+                        toCache.unsubscribe();
+                        isResponseFromCache = true;
+                        return handleRequestCacheHitAndEmitValues(fromCache, _cmd);
+                    } else {
+                        // we just created an ObservableCommand so we cast and return it
+                        afterCache = toCache.toObservable();
+                    }
+                } else {
+                    //进入这个else
+                    //hystrixObservable赋值给最后返回的afterCache(Observable对象)
+                    //hystrixObservable，将之前搞的5个东西里，另外3个东西，也通过一些方法连续调用，设置给了这个Observable，到此为止的话呢，我们是不是就发现说，Observable，就是基于之前的5个东西来构造
+                    afterCache = hystrixObservable;
+                }
+				//基于上面相关的回调对象，最后就直接返回一个Observable对象了
+                return afterCache
+                        .doOnTerminate(terminateCommandCleanup)     // perform cleanup once (either on normal terminal state (this line), or unsubscribe (next line))
+                        .doOnUnsubscribe(unsubscribeCommandCleanup) // perform cleanup once
+                        .doOnCompleted(fireOnCompletedHook);
+            }
+        });
+    
+    //-----------------断点第二个回调的方法
+    private Observable<R> applyHystrixSemantics(final AbstractCommand<R> _cmd) {
+        // mark that we're starting execution on the ExecutionHook
+        // if this hook throws an exception, then a fast-fail occurs with no fallback.  No state is left inconsistent
+        //这行代码，其实里面什么都没干，代码都是空的
+        executionHook.onStart(_cmd);
+
+        /* determine if we're allowed to execute */
+        //circuitBreaker 短路器，熔断器
+        //明显就是在找熔断器判断，尝试去执行，是否被熔断，如果熔断了就不让你执行command了，就执行走fallback降级逻辑了
+		//但是正常情况下，明显是让你执行的，熔断也明显是没有打开的
+        if (circuitBreaker.attemptExecution()) {
+            //短路器未打开的情况下，会进入if继续执行
+             //没有设置信号量的话，返回个TryableSemaphoreNoOp.DEFAULT，里面方法什么都没干,没有逻辑
+            final TryableSemaphore executionSemaphore = getExecutionSemaphore();
+            final AtomicBoolean semaphoreHasBeenReleased = new AtomicBoolean(false);
+            
+            final Action0 singleSemaphoreRelease = new Action0() {
+                @Override
+                public void call() {
+                    if (semaphoreHasBeenReleased.compareAndSet(false, true)) {
+                        executionSemaphore.release();
+                    }
+                }
+            };
+			//这个东西里的call()回调方法里，看起来是会在发生异常的时候，将这个异常发生的情况给发布一个event，事件通知
+            final Action1<Throwable> markExceptionThrown = new Action1<Throwable>() {
+                @Override
+                public void call(Throwable t) {
+                    eventNotifier.markEvent(HystrixEventType.EXCEPTION_THROWN, commandKey);
+                }
+            };
+			//TryableSemaphoreNoOp.DEFAULT，里面方法什么都没干,没有逻辑,对应tryAcquire方法写死返回true
+            if (executionSemaphore.tryAcquire()) {
+                try {
+                    /* used to track userThreadExecutionTime */
+                    executionResult = executionResult.setInvocationStartTime(System.currentTimeMillis());
+                    //executeCommandAndObserve这个方法，光是看名字，就差不离了，
+                    //executeCommand，执行command.run()，andObserve，同时观察这个命令的执行结果
+                    return executeCommandAndObserve(_cmd)
+                            .doOnError(markExceptionThrown)
+                            .doOnTerminate(singleSemaphoreRelease)
+                            .doOnUnsubscribe(singleSemaphoreRelease);
+                } catch (RuntimeException e) {
+                    return Observable.error(e);
+                }
+            } else {
+                return handleSemaphoreRejectionViaFallback();
+            }
+        } else {
+            return handleShortCircuitViaFallback();
+        }
+    }
+..............
+    //executeCommand，执行command.run()，andObserve，同时观察这个命令的执行结果
+    private Observable<R> executeCommandAndObserve(final AbstractCommand<R> _cmd) {
+        final HystrixRequestContext currentRequestContext = HystrixRequestContext.getContextForCurrentThread();
+		//下面又是一些回调方法
+        final Action1<R> markEmits = new Action1<R>() {
+            @Override
+            public void call(R r) {
+                if (shouldOutputOnNextEvents()) {
+                    executionResult = executionResult.addEvent(HystrixEventType.EMIT);
+                    eventNotifier.markEvent(HystrixEventType.EMIT, commandKey);
+                }
+                if (commandIsScalar()) {
+                    long latency = System.currentTimeMillis() - executionResult.getStartTimestamp();
+                    eventNotifier.markEvent(HystrixEventType.SUCCESS, commandKey);
+                    executionResult = executionResult.addEvent((int) latency, HystrixEventType.SUCCESS);
+                    eventNotifier.markCommandExecution(getCommandKey(), properties.executionIsolationStrategy().get(), (int) latency, executionResult.getOrderedList());
+                    circuitBreaker.markSuccess();
+                }
+            }
+        };
+
+        final Action0 markOnCompleted = new Action0() {
+            @Override
+            public void call() {
+                if (!commandIsScalar()) {
+                    long latency = System.currentTimeMillis() - executionResult.getStartTimestamp();
+                    eventNotifier.markEvent(HystrixEventType.SUCCESS, commandKey);
+                    executionResult = executionResult.addEvent((int) latency, HystrixEventType.SUCCESS);
+                    eventNotifier.markCommandExecution(getCommandKey(), properties.executionIsolationStrategy().get(), (int) latency, executionResult.getOrderedList());
+                    circuitBreaker.markSuccess();
+                }
+            }
+        };
+
+        final Func1<Throwable, Observable<R>> handleFallback = new Func1<Throwable, Observable<R>>() {
+            @Override
+            public Observable<R> call(Throwable t) {
+                circuitBreaker.markNonSuccess();
+                Exception e = getExceptionFromThrowable(t);
+                executionResult = executionResult.setExecutionException(e);
+                if (e instanceof RejectedExecutionException) {
+                    return handleThreadPoolRejectionViaFallback(e);
+                } else if (t instanceof HystrixTimeoutException) {
+                    return handleTimeoutViaFallback();
+                } else if (t instanceof HystrixBadRequestException) {
+                    return handleBadRequestByEmittingError(e);
+                } else {
+                    /*
+                     * Treat HystrixBadRequestException from ExecutionHook like a plain HystrixBadRequestException.
+                     */
+                    if (e instanceof HystrixBadRequestException) {
+                        eventNotifier.markEvent(HystrixEventType.BAD_REQUEST, commandKey);
+                        return Observable.error(e);
+                    }
+
+                    return handleFailureViaFallback(e);
+                }
+            }
+        };
+	
+        final Action1<Notification<? super R>> setRequestContext = new Action1<Notification<? super R>>() {
+            @Override
+            public void call(Notification<? super R> rNotification) {
+                setRequestContextIfNeeded(currentRequestContext);
+            }
+        };
+
+        Observable<R> execution;
+    	//超时相关配置是否否开启
+        if (properties.executionTimeoutEnabled().get()) {
+            //默认开启超时配置，所以这里会进if
+            //executeCommandWithSpecifiedIsolation()，看名字，就是去基于线程池的隔离，来执行command，HystrixObservableTimeoutOperator（看起来像是负责监控command执行是否超时的这么一个东西）
+            //executeCommandWithSpecifiedIsolation方法是根据隔离策略是否为THREAD返回对应的execution(Observable)（默认是隔离策略为THREAD）
+            //6.3
+            execution = executeCommandWithSpecifiedIsolation(_cmd)
+                    .lift(new HystrixObservableTimeoutOperator<R>(_cmd));
+        } else {
+            execution = executeCommandWithSpecifiedIsolation(_cmd);
+        }
+		//execution的Observable对象，此时源码全速前进，由人家rxjava自己本身的机制，就会确保说，按照一定的顺序来执行Observable对象的一些回调的函数（4个东西）
+        return execution.doOnNext(markEmits)
+                .doOnCompleted(markOnCompleted)
+                .onErrorResumeNext(handleFallback)
+                .doOnEach(setRequestContext);
+    }
+
+......................
+    //没有设置信号量的话，返回个TryableSemaphoreNoOp.DEFAULT，里面方法什么都没干,没有逻辑
+    protected TryableSemaphore getExecutionSemaphore() {
+    //如果说，我们设置的隔离策略，是基于semaphore（信号量），才会走下面的代码逻辑
+        if (properties.executionIsolationStrategy().get() == ExecutionIsolationStrategy.SEMAPHORE) {
+            if (executionSemaphoreOverride == null) {
+                TryableSemaphore _s = executionSemaphorePerCircuit.get(commandKey.name());
+                if (_s == null) {
+                    // we didn't find one cache so setup
+                    executionSemaphorePerCircuit.putIfAbsent(commandKey.name(), new TryableSemaphoreActual(properties.executionIsolationSemaphoreMaxConcurrentRequests()));
+                    // assign whatever got set (this or another thread)
+                    return executionSemaphorePerCircuit.get(commandKey.name());
+                } else {
+                    return _s;
+                }
+            } else {
+                return executionSemaphoreOverride;
+            }
+        } else {
+            // return NoOp implementation since we're not using SEMAPHORE isolation
+            //我们默认一般都是基于线程池来进行隔离的，不是基于semaphore，所以在这里拿到的这个所谓的TryableSemaphore，其实是一个什么都不干的东西
+            return TryableSemaphoreNoOp.DEFAULT;
+        }
+    }
+}
+```
+
+**PS:applyHystrixSemantics()：基本涵盖了核心的hystirx的一套逻辑**
+
+## 6.3 来深入看看具体怎么执行请求的
 
 
 
+```java
+/* package */abstract class AbstractCommand<R> implements HystrixInvokableInfo<R>, HystrixObservable<R> {
+...............................
+
+    private Observable<R> executeCommandWithSpecifiedIsolation(final AbstractCommand<R> _cmd) {
+        if (properties.executionIsolationStrategy().get() == ExecutionIsolationStrategy.THREAD) {
+            // mark that we are executing in a thread (even if we end up being rejected we still were a THREAD execution and not SEMAPHORE)
+            return Observable.defer(new Func0<Observable<R>>() {
+                @Override
+                public Observable<R> call() {
+                    executionResult = executionResult.setExecutionOccurred();
+                    //如果说，要执行command了，结果command的state不是OBSERVABLE_CHAIN_CREATED，那么就会说在一个错误的state之下在执行command，报错
+				  //正常情况下，会将command state改成USER_CODE_EXECUTED
+                    if (!commandState.compareAndSet(CommandState.OBSERVABLE_CHAIN_CREATED, CommandState.USER_CODE_EXECUTED)) {
+                        return Observable.error(new IllegalStateException("execution attempted while in state : " + commandState.get().name()));
+                    }
+				  //threadpoolKey默认是跟groupKey是一样的，一个服务对应一个线程池
+                    metrics.markCommandStart(commandKey, threadPoolKey, ExecutionIsolationStrategy.THREAD);
+				  //正常来说这里的isCommandTimedOut状态为NOT_EXECUTED
+                    //如果是debug状态，且超时时间默认情况下(1秒)，这里大概率会超时TIMED_OUT状态抛出异常
+                    //这里相当于就是没有调用对应run方法逻辑前的超时判断
+                    if (isCommandTimedOut.get() == TimedOutStatus.TIMED_OUT) {
+                        // the command timed out in the wrapping thread so we will return immediately
+                        // and not increment any of the counters below or other such logic
+                        return Observable.error(new RuntimeException("timed out before executing run()"));
+                    }
+                    if (threadState.compareAndSet(ThreadState.NOT_USING_THREAD, ThreadState.STARTED)) {
+                        //we have not been unsubscribed, so should proceed
+                        HystrixCounters.incrementGlobalConcurrentThreads();
+                        threadPool.markThreadExecution();
+                        // store the command that is being run
+                        //说将要执行的commandKey压入一个栈中
+                        endCurrentThreadExecutingCommand = Hystrix.startCurrentThreadExecutingCommand(getCommandKey());
+                        executionResult = executionResult.setExecutedInThread();
+                        /**
+                         * If any of these hooks throw an exception, then it appears as if the actual execution threw an error
+                         */
+                        try {
+                            //executionHook相关start等3个方法 什么都没干
+                            executionHook.onThreadStart(_cmd);
+                            executionHook.onRunStart(_cmd);
+                            executionHook.onExecutionStart(_cmd);
+                            return getUserExecutionObservable(_cmd);
+                        } catch (Throwable ex) {
+                            return Observable.error(ex);
+                        }
+                    } else {
+                        //command has already been unsubscribed, so return immediately
+                        return Observable.error(new RuntimeException("unsubscribed before executing run()"));
+                    }
+                }
+            }).doOnTerminate(new Action0() {
+                @Override
+                public void call() {
+                    if (threadState.compareAndSet(ThreadState.STARTED, ThreadState.TERMINAL)) {
+                        handleThreadEnd(_cmd);
+                    }
+                    if (threadState.compareAndSet(ThreadState.NOT_USING_THREAD, ThreadState.TERMINAL)) {
+                        //if it was never started and received terminal, then no need to clean up (I don't think this is possible)
+                    }
+                    //if it was unsubscribed, then other cleanup handled it
+                }
+            }).doOnUnsubscribe(new Action0() {
+                @Override
+                public void call() {
+                    if (threadState.compareAndSet(ThreadState.STARTED, ThreadState.UNSUBSCRIBED)) {
+                        handleThreadEnd(_cmd);
+                    }
+                    if (threadState.compareAndSet(ThreadState.NOT_USING_THREAD, ThreadState.UNSUBSCRIBED)) {
+                        //if it was never started and was cancelled, then no need to clean up
+                    }
+                    //if it was terminal, then other cleanup handled it
+                }
+            }).subscribeOn(threadPool.getScheduler(new Func0<Boolean>() {
+                @Override
+                public Boolean call() {
+                    return properties.executionIsolationThreadInterruptOnTimeout().get() && _cmd.isCommandTimedOut.get() == TimedOutStatus.TIMED_OUT;
+                }
+            }));
+        } else {
+            return Observable.defer(new Func0<Observable<R>>() {
+                @Override
+                public Observable<R> call() {
+                    executionResult = executionResult.setExecutionOccurred();
+                    if (!commandState.compareAndSet(CommandState.OBSERVABLE_CHAIN_CREATED, CommandState.USER_CODE_EXECUTED)) {
+                        return Observable.error(new IllegalStateException("execution attempted while in state : " + commandState.get().name()));
+                    }
+
+                    metrics.markCommandStart(commandKey, threadPoolKey, ExecutionIsolationStrategy.SEMAPHORE);
+                    // semaphore isolated
+                    // store the command that is being run
+                    endCurrentThreadExecutingCommand = Hystrix.startCurrentThreadExecutingCommand(getCommandKey());
+                    try {
+                        executionHook.onRunStart(_cmd);
+                        executionHook.onExecutionStart(_cmd);
+                        return getUserExecutionObservable(_cmd);  //the getUserExecutionObservable method already wraps sync exceptions, so this shouldn't throw
+                    } catch (Throwable ex) {
+                        //If the above hooks throw, then use that as the result of the run method
+                        return Observable.error(ex);
+                    }
+                }
+            });
+        }
+    }
+...............................
+    //在这里会有实际执行command的这么一个逻辑
+    private Observable<R> getUserExecutionObservable(final AbstractCommand<R> _cmd) {
+        Observable<R> userObservable;
+
+        try {
+            //这里面终于找到了调用run方法的逻辑
+            userObservable = getExecutionObservable();
+        } catch (Throwable ex) {
+            // the run() method is a user provided implementation so can throw instead of using Observable.onError
+            // so we catch it here and turn it into Observable.error
+            userObservable = Observable.error(ex);
+        }
+
+        return userObservable
+                .lift(new ExecutionHookApplication(_cmd))
+                .lift(new DeprecatedOnRunHookApplication(_cmd));
+    }
+}
+```
+
+在这里会有实际执行command的这么一个逻辑
+
+```java
+public abstract class HystrixCommand<R> extends AbstractCommand<R> implements HystrixExecutable<R>, HystrixInvokableInfo<R>, HystrixObservable<R> {
+.........................
+
+	//这里面终于找到了调用run方法的逻辑
+    //对应父类次方法为抽象方法
+    @Override
+    final protected Observable<R> getExecutionObservable() {
+        return Observable.defer(new Func0<Observable<R>>() {
+            //这里封装了一个Observable，里面的Func0.call()，就执行了我们自己写的那个run()方法
+            //还记得一点儿，如果你要让一个Observable去执行的话，必须对这个Observable进行订阅，在这里的话呢，其实他内部先会搞一个Subscriber出来，订阅器出来，然后用这个Subscriber去订阅userObservable，然后才能出发userObservable的执行
+            //(会进入之前加入的Subscriber几个call方法，订阅后才会进入这个call去执行)
+            @Override
+            public Observable<R> call() {
+                try {
+                    //5.3.2 中的Invoke中的匿名内部类的run方法
+                    return Observable.just(run());
+                } catch (Throwable ex) {
+                    return Observable.error(ex);
+                }
+            }
+        }).doOnSubscribe(new Action0() {
+            @Override
+            public void call() {
+                // Save thread on which we get subscribed so that we can interrupt it later if needed
+                executionThread.set(Thread.currentThread());
+            }
+        });
+    }
+.................
+}
+```
 
 
 
+```java
+public class Hystrix {
+    ////说将要执行的commandKey压入一个栈中
+   /* package */static Action0 startCurrentThreadExecutingCommand(HystrixCommandKey key) {
+        final ConcurrentStack<HystrixCommandKey> list = currentCommand.get();
+        try {
+            list.push(key);
+        } catch (Exception e) {
+            logger.warn("Unable to record command starting", e);
+        }
+        return new Action0() {
+
+            @Override
+            public void call() {
+                endCurrentThreadExecutingCommand(list);
+            }
+
+        };
+    }
+}
+```
+
+**总结：**
+
+1 执行HystrixInvocationHandler里面的那个HystrixCommand.run() => SynchronousMethodHandler
+
+2 feign + ribbon + eureka的逻辑
+
+PS 但是这里有一个很大的问题，还没看到如何在线程池里执行呢
+
+下一讲专门来找这个userObservable是如何在线程池里进行执行的。。。
