@@ -4090,8 +4090,10 @@ Action0 fireOnCompletedHook
 ```java
 /* package */abstract class AbstractCommand<R> implements HystrixInvokableInfo<R>, HystrixObservable<R> {
 ...............................
-
+    
+   //executeCommandWithSpecifiedIsolation方法是根据隔离策略是否为THREAD返回对应的execution(Observable)（默认是隔离策略为THREAD）
     private Observable<R> executeCommandWithSpecifiedIsolation(final AbstractCommand<R> _cmd) {
+    	//默认是隔离策略为THREAD所以进入了这个if
         if (properties.executionIsolationStrategy().get() == ExecutionIsolationStrategy.THREAD) {
             // mark that we are executing in a thread (even if we end up being rejected we still were a THREAD execution and not SEMAPHORE)
             return Observable.defer(new Func0<Observable<R>>() {
@@ -4251,7 +4253,7 @@ public abstract class HystrixCommand<R> extends AbstractCommand<R> implements Hy
 
 ```java
 public class Hystrix {
-    ////说将要执行的commandKey压入一个栈中
+    //说将要执行的commandKey压入一个栈中
    /* package */static Action0 startCurrentThreadExecutingCommand(HystrixCommandKey key) {
         final ConcurrentStack<HystrixCommandKey> list = currentCommand.get();
         try {
@@ -4280,3 +4282,4 @@ public class Hystrix {
 PS 但是这里有一个很大的问题，还没看到如何在线程池里执行呢
 
 下一讲专门来找这个userObservable是如何在线程池里进行执行的。。。
+
