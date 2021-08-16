@@ -4283,3 +4283,37 @@ PS 但是这里有一个很大的问题，还没看到如何在线程池里执�
 
 下一讲专门来找这个userObservable是如何在线程池里进行执行的。。。
 
+## 6.4 相关状态简介
+
+
+
+```java
+
+/* package */abstract class AbstractCommand<R> implements HystrixInvokableInfo<R>, HystrixObservable<R> {
+    private static final Logger logger = LoggerFactory.getLogger(AbstractCommand.class);
+    protected final HystrixCircuitBreaker circuitBreaker;
+    protected final HystrixThreadPool threadPool;
+    protected final HystrixThreadPoolKey threadPoolKey;
+    protected final HystrixCommandProperties properties;
+
+    //超时相关状态
+    protected enum TimedOutStatus {
+        //还没开始(未执行run之前)，完成、超时(执行run前也会判断)
+        NOT_EXECUTED, COMPLETED, TIMED_OUT
+    }
+
+    //command相关状态
+    protected enum CommandState {
+        //未开始、创建、调用了、退订(未经同意调用？)、结束
+        NOT_STARTED, OBSERVABLE_CHAIN_CREATED, USER_CODE_EXECUTED, UNSUBSCRIBED, TERMINAL
+    }
+
+    //线程相关状态
+    protected enum ThreadState {
+        //未调用、开始了、退订(未经同意调用？非正常流程的状态吗？)、TERMINAL结束
+        NOT_USING_THREAD, STARTED, UNSUBSCRIBED, TERMINAL
+    }
+.................................
+}
+```
+
