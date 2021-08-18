@@ -4162,6 +4162,8 @@ Action0 fireOnCompletedHook
                     }
                     //if it was terminal, then other cleanup handled it
                 }
+                //在这里！！！(第7节)
+                //线程池相关逻辑threadPool.getScheduler
             }).subscribeOn(threadPool.getScheduler(new Func0<Boolean>() {
                 @Override
                 public Boolean call() {
@@ -4226,7 +4228,7 @@ public abstract class HystrixCommand<R> extends AbstractCommand<R> implements Hy
     final protected Observable<R> getExecutionObservable() {
         return Observable.defer(new Func0<Observable<R>>() {
             //这里封装了一个Observable，里面的Func0.call()，就执行了我们自己写的那个run()方法
-            //还记得一点儿，如果你要让一个Observable去执行的话，必须对这个Observable进行订阅，在这里的话呢，其实他内部先会搞一个Subscriber出来，订阅器出来，然后用这个Subscriber去订阅userObservable，然后才能出发userObservable的执行
+            //还记得一点儿，如果你要让一个Observable去执行的话，必须对这个Observable进行订阅，在这里的话呢，其实他内部先会搞一个Subscriber出来，订阅器出来，然后用这个Subscriber去订阅userObservable，然后才能触发userObservable的执行
             //(会进入之前加入的Subscriber几个call方法，订阅后才会进入这个call去执行)
             @Override
             public Observable<R> call() {
@@ -4279,9 +4281,9 @@ public class Hystrix {
 
 2 feign + ribbon + eureka的逻辑
 
-PS 但是这里有一个很大的问题，还没看到如何在线程池里执行呢
+**PS 但是这里有一个很大的问题，还没看到如何在线程池里执行呢**
 
-下一讲专门来找这个userObservable是如何在线程池里进行执行的。。。
+**下一讲专门来找这个userObservable是如何在线程池里进行执行的**。。。
 
 ## 6.4 相关状态简介
 
@@ -4318,4 +4320,103 @@ PS 但是这里有一个很大的问题，还没看到如何在线程池里执�
 ```
 
 **6小结还欠账一个流程图**
+
+# 7 hystrix线程池
+
+## 7.1 线程池的执行逻辑完成揭秘
+
+
+
+```java
+public interface HystrixThreadPool {
+............................
+
+
+    /* package */static class HystrixThreadPoolDefault implements HystrixThreadPool {
+        private static final Logger logger = LoggerFactory.getLogger(HystrixThreadPoolDefault.class);
+
+        private final HystrixThreadPoolProperties properties;
+        private final BlockingQueue<Runnable> queue;
+        private final ThreadPoolExecutor threadPool;
+        private final HystrixThreadPoolMetrics metrics;
+        private final int queueSize;
+
+        public HystrixThreadPoolDefault(HystrixThreadPoolKey threadPoolKey, HystrixThreadPoolProperties.Setter propertiesDefaults) {
+            this.properties = HystrixPropertiesFactory.getThreadPoolProperties(threadPoolKey, propertiesDefaults);
+            HystrixConcurrencyStrategy concurrencyStrategy = HystrixPlugins.getInstance().getConcurrencyStrategy();
+            this.queueSize = properties.maxQueueSize().get();
+
+            this.metrics = HystrixThreadPoolMetrics.getInstance(threadPoolKey,
+                    concurrencyStrategy.getThreadPool(threadPoolKey, properties),
+                    properties);
+            this.threadPool = this.metrics.getThreadPool();
+            this.queue = this.threadPool.getQueue();
+
+            /* strategy: HystrixMetricsPublisherThreadPool */
+            HystrixMetricsPublisherFactory.createOrRetrievePublisherForThreadPool(threadPoolKey, this.metrics, this.properties);
+        }
+.............................
+    
+    	//接着6.3节，6.3节调用的第7节的方法入口就在这里
+    	//线程池调用方法入口
+        @Override
+        public Scheduler getScheduler(Func0<Boolean> shouldInterruptThread) {
+            touchConfig();
+            return new HystrixContextScheduler(HystrixPlugins.getInstance().getConcurrencyStrategy(), this, shouldInterruptThread);
+        }
+
+        // allow us to change things via fast-properties by setting it each time
+        //将默认properties相关默认参数赋值线程池
+        private void touchConfig() {
+            final int dynamicCoreSize = properties.coreSize().get();
+            final int configuredMaximumSize = properties.maximumSize().get();
+            int dynamicMaximumSize = properties.actualMaximumSize();
+            final boolean allowSizesToDiverge = properties.getAllowMaximumSizeToDivergeFromCoreSize().get();
+            boolean maxTooLow = false;
+			//默认这个if不会进入，allowSizesToDiverge=false,configuredMaximumSize=10,dynamicCoreSize=10
+            //这是线程池自动扩容相关的，开启了才可能进入
+            if (allowSizesToDiverge && configuredMaximumSize < dynamicCoreSize) {
+                //if user sets maximum < core (or defaults get us there), we need to maintain invariant of core <= maximum
+                dynamicMaximumSize = dynamicCoreSize;
+                maxTooLow = true;
+            }
+
+            // In JDK 6, setCorePoolSize and setMaximumPoolSize will execute a lock operation. Avoid them if the pool size is not changed.		//默认这个If也不会进入
+            //这是线程池自动扩容相关的，开启了才可能进入
+            if (threadPool.getCorePoolSize() != dynamicCoreSize || (allowSizesToDiverge && threadPool.getMaximumPoolSize() != dynamicMaximumSize)) {
+                if (maxTooLow) {
+                    logger.error("Hystrix ThreadPool configuration for : " + metrics.getThreadPoolKey().name() + " is trying to set coreSize = " +
+                            dynamicCoreSize + " and maximumSize = " + configuredMaximumSize + ".  Maximum size will be set to " +
+                            dynamicMaximumSize + ", the coreSize value, since it must be equal to or greater than the coreSize value");
+                }
+                threadPool.setCorePoolSize(dynamicCoreSize);
+                threadPool.setMaximumPoolSize(dynamicMaximumSize);
+            }
+			//设置线程存活时长，默认1分钟
+            threadPool.setKeepAliveTime(properties.keepAliveTimeMinutes().get(), TimeUnit.MINUTES);
+        }
+        
+	}
+
+
+}
+```
+
+HystrixThreadPoolDefault构造断点，属性初始化
+
+![image-20210819074836698](Hystrix.assets/image-20210819074836698.png)
+
+
+
+
+
+## 7.2 hystrix线程池默认参数以及默认情况下构建的线程池
+
+
+
+## 7.3 如何通过线程池来执行任务(hystrix的核心执行逻辑)
+
+
+
+
 
