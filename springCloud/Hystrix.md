@@ -4321,9 +4321,9 @@ public class Hystrix {
 
 **6小结还欠账一个流程图**
 
-# 7 hystrix线程池
+# 7 hystrix线程池源码揭秘
 
-## 7.1 线程池的执行逻辑完成揭秘
+## 7.1 线程池的执行逻辑完成揭秘(找到线程池逻辑)
 
 
 
@@ -4332,29 +4332,18 @@ public interface HystrixThreadPool {
 ............................
 
 
+    //HystrixThreadPoolDefault：比较关键的一个类
     /* package */static class HystrixThreadPoolDefault implements HystrixThreadPool {
         private static final Logger logger = LoggerFactory.getLogger(HystrixThreadPoolDefault.class);
 
         private final HystrixThreadPoolProperties properties;
+        //queue，BlockingQueue -> 用来排队的这么一个queue
         private final BlockingQueue<Runnable> queue;
+        //threadPool -> ThreadPoolExecutor -> JDK的线程池
         private final ThreadPoolExecutor threadPool;
         private final HystrixThreadPoolMetrics metrics;
         private final int queueSize;
 
-        public HystrixThreadPoolDefault(HystrixThreadPoolKey threadPoolKey, HystrixThreadPoolProperties.Setter propertiesDefaults) {
-            this.properties = HystrixPropertiesFactory.getThreadPoolProperties(threadPoolKey, propertiesDefaults);
-            HystrixConcurrencyStrategy concurrencyStrategy = HystrixPlugins.getInstance().getConcurrencyStrategy();
-            this.queueSize = properties.maxQueueSize().get();
-
-            this.metrics = HystrixThreadPoolMetrics.getInstance(threadPoolKey,
-                    concurrencyStrategy.getThreadPool(threadPoolKey, properties),
-                    properties);
-            this.threadPool = this.metrics.getThreadPool();
-            this.queue = this.threadPool.getQueue();
-
-            /* strategy: HystrixMetricsPublisherThreadPool */
-            HystrixMetricsPublisherFactory.createOrRetrievePublisherForThreadPool(threadPoolKey, this.metrics, this.properties);
-        }
 .............................
     
     	//接着6.3节，6.3节调用的第7节的方法入口就在这里
@@ -4406,11 +4395,298 @@ HystrixThreadPoolDefault构造断点，属性初始化
 
 ![image-20210819074836698](Hystrix.assets/image-20210819074836698.png)
 
+hystrix.threadpool.ServiceA.allowMaximumSizeToDivergeFromCoreSize = false
+
+hystrix.threadpool.ServiceA.keepAliveTimeMinutes = 1
+
+hystrix.threadpool.ServiceA.maximumSize = 10
+
+hystrix.threadpool.ServiceA.coreSize = 10
+
+hystrix.threadpool.ServiceA.maxQueueSize = -1
+
+hystrix.threadpool.ServiceA.queueSizeRejectionThreshold = 5
+
+hystrix.threadpool.ServiceA.metrics.rollingStats.numBuckets = 10
+
+hystrix.threadpool.ServiceA.metrics.rollingStats.timeInMilliseconds = 10000
 
 
 
+```java
+public class HystrixContextScheduler extends Scheduler {
+...........................
 
-## 7.2 hystrix线程池默认参数以及默认情况下构建的线程池
+    //接着上面的//线程池调用方法入口来构造HystrixContextScheduler
+    public HystrixContextScheduler(HystrixConcurrencyStrategy concurrencyStrategy, HystrixThreadPool threadPool, Func0<Boolean> shouldInterruptThread) {
+        this.concurrencyStrategy = concurrencyStrategy;
+        this.threadPool = threadPool;
+        this.actualScheduler = new ThreadPoolScheduler(threadPool, shouldInterruptThread);
+    }
+    
+    //构造完成后，会在对应回调中，调用该方法createWorker
+     @Override
+    public Worker createWorker() {
+        return new HystrixContextSchedulerWorker(actualScheduler.createWorker());
+    }
+...........................
+
+    private class HystrixContextSchedulerWorker extends Worker {
+        
+        private final Worker worker;
+		//构造HystrixContextSchedulerWorker
+        private HystrixContextSchedulerWorker(Worker actualWorker) {
+            this.worker = actualWorker;
+        }
+    
+        @Override
+        public Subscription schedule(Action0 action, long delayTime, TimeUnit unit) {
+            if (threadPool != null) {
+                if (!threadPool.isQueueSpaceAvailable()) {
+                    throw new RejectedExecutionException("Rejected command because thread-pool queueSize is at rejection threshold.");
+                }
+            }
+            return worker.schedule(new HystrixContexSchedulerAction(concurrencyStrategy, action), delayTime, unit);
+        }
+
+        //构造完成后，经过回调会进入该方法schedule(Action0 action)
+        @Override
+        public Subscription schedule(Action0 action) {
+            if (threadPool != null) {
+                //就是在判断线程池是否已满？如果已经满了，那么就会报一个reject的异常
+                if (!threadPool.isQueueSpaceAvailable()) {
+                    throw new RejectedExecutionException("Rejected command because thread-pool queueSize is at rejection threshold.");
+                }
+            }
+            //还有的话，如果线程池没有满，那么就会去通过线程池进行调度
+            return worker.schedule(new HystrixContexSchedulerAction(concurrencyStrategy, action));
+        }
+
+    }
+    
+
+
+}
+```
+
+
+
+线程池是怎么初始化的，任务如何提交到线程池，如何检查线程池是否已满，如何基于线程池来执行一个HystrixCommand.run()
+
+
+
+## 7.2 hystrix线程池初始化及默认配置
+
+1 在HystrixInvocationHandler构造HystrixCommand的时候，其实就会触发和完成线程池的一个初始化
+
+2 发送请求的时候，直接就是会先初始化这个线程池
+
+3 就是说，一个threadpoolKey会对应着一个线程池，每个HystrixCommand的threadpoolKey默认就是服务名称，ServiceA，所以说对每个服务都会初始化一个线程池
+
+```java
+public interface HystrixThreadPool {
+.............................
+    /* package */static class Factory {
+
+        /* package */final static ConcurrentHashMap<String, HystrixThreadPool> threadPools = new ConcurrentHashMap<String, HystrixThreadPool>();
+
+		//getInstance方法为AbstractCommand构造方法调用的
+        /* package */static HystrixThreadPool getInstance(HystrixThreadPoolKey threadPoolKey, HystrixThreadPoolProperties.Setter propertiesBuilder) {
+   
+            //就是在构造HystrixCommand的时候，同步会去初始化对应的服务的线程池，一个服务ServiceA -> threadPool
+            String key = threadPoolKey.name();
+
+            // this should find it for all but the first time
+		   //从一个map里，根据ServiceA名字去获取一个threadPool
+            HystrixThreadPool previouslyCached = threadPools.get(key);
+            if (previouslyCached != null) {
+                return previouslyCached;
+            }
+
+            // if we get here this is the first time so we need to initialize
+            //但是获取不到，就会新建一个放到map里去，下次就是直接复用了
+            synchronized (HystrixThreadPool.class) {
+                if (!threadPools.containsKey(key)) {
+                    threadPools.put(key, new HystrixThreadPoolDefault(threadPoolKey, propertiesBuilder));
+                }
+            }
+            return threadPools.get(key);
+        }
+        
+................
+    }
+
+
+}
+```
+
+对应getInstance方法最后return断点
+
+![image-20210821140351296](Hystrix.assets/image-20210821140351296.png)
+
+
+
+```java
+public interface HystrixThreadPool {
+.....................................
+    /* package */static class HystrixThreadPoolDefault implements HystrixThreadPool {
+        private static final Logger logger = LoggerFactory.getLogger(HystrixThreadPoolDefault.class);
+
+        private final HystrixThreadPoolProperties properties;
+        private final BlockingQueue<Runnable> queue;
+        private final ThreadPoolExecutor threadPool;
+        private final HystrixThreadPoolMetrics metrics;
+        private final int queueSize;
+
+        public HystrixThreadPoolDefault(HystrixThreadPoolKey threadPoolKey, HystrixThreadPoolProperties.Setter propertiesDefaults) {
+            this.properties = HystrixPropertiesFactory.getThreadPoolProperties(threadPoolKey, propertiesDefaults);
+            //HystrixConcurrencyStrategy->HystrixConcurrencyStrategyDefault实例化
+            HystrixConcurrencyStrategy concurrencyStrategy = HystrixPlugins.getInstance().getConcurrencyStrategy();
+            this.queueSize = properties.maxQueueSize().get();
+			//ThreadPoolExecutor的构造逻辑
+            //就在concurrencyStrategy.getThreadPool方法中
+            this.metrics = HystrixThreadPoolMetrics.getInstance(threadPoolKey,
+                    concurrencyStrategy.getThreadPool(threadPoolKey, properties),
+                    properties);
+            this.threadPool = this.metrics.getThreadPool();
+            this.queue = this.threadPool.getQueue();
+
+            /* strategy: HystrixMetricsPublisherThreadPool */
+            HystrixMetricsPublisherFactory.createOrRetrievePublisherForThreadPool(threadPoolKey, this.metrics, this.properties);
+        }
+    }
+
+
+}
+```
+
+HystrixConcurrencyStrategyDefault其实就是单例模式，获取实例化对象
+
+```java
+public class HystrixConcurrencyStrategyDefault extends HystrixConcurrencyStrategy {
+
+    private static HystrixConcurrencyStrategyDefault INSTANCE = new HystrixConcurrencyStrategyDefault();
+
+    public static HystrixConcurrencyStrategy getInstance() {
+        return INSTANCE;
+    }
+
+    private HystrixConcurrencyStrategyDefault() {
+    }
+
+}
+
+public abstract class HystrixConcurrencyStrategy {
+.....................................
+    //接着上面的调用，首先进入该方法
+    //ThreadPoolExecutor的构造逻辑
+    public ThreadPoolExecutor getThreadPool(final HystrixThreadPoolKey threadPoolKey, HystrixThreadPoolProperties threadPoolProperties) {
+        final ThreadFactory threadFactory = getThreadFactory(threadPoolKey);
+		//初始化线程池相关参数
+        final boolean allowMaximumSizeToDivergeFromCoreSize = threadPoolProperties.getAllowMaximumSizeToDivergeFromCoreSize().get();
+        final int dynamicCoreSize = threadPoolProperties.coreSize().get();
+        final int keepAliveTime = threadPoolProperties.keepAliveTimeMinutes().get();
+        final int maxQueueSize = threadPoolProperties.maxQueueSize().get();
+    	//初始化队列
+        final BlockingQueue<Runnable> workQueue = getBlockingQueue(maxQueueSize);
+
+        if (allowMaximumSizeToDivergeFromCoreSize) {
+            final int dynamicMaximumSize = threadPoolProperties.maximumSize().get();
+            if (dynamicCoreSize > dynamicMaximumSize) {
+                logger.error("Hystrix ThreadPool configuration at startup for : " + threadPoolKey.name() + " is trying to set coreSize = " +
+                        dynamicCoreSize + " and maximumSize = " + dynamicMaximumSize + ".  Maximum size will be set to " +
+                        dynamicCoreSize + ", the coreSize value, since it must be equal to or greater than the coreSize value");
+                return new ThreadPoolExecutor(dynamicCoreSize, dynamicCoreSize, keepAliveTime, TimeUnit.MINUTES, workQueue, threadFactory);
+            } else {
+                return new ThreadPoolExecutor(dynamicCoreSize, dynamicMaximumSize, keepAliveTime, TimeUnit.MINUTES, workQueue, threadFactory);
+            }
+        } else {
+            //会走到这里创建对应线程池
+            return new ThreadPoolExecutor(dynamicCoreSize, dynamicCoreSize, keepAliveTime, TimeUnit.MINUTES, workQueue, threadFactory);
+        }
+    }
+    
+    //这个ThreadFactory，就是说，在线程池创建一个新的线程的时候，会基于这个ThreadFactory来创建，这里主要是创建出来一个Thread对象才能够，给这个Thread设置一个线程名称
+    private static ThreadFactory getThreadFactory(final HystrixThreadPoolKey threadPoolKey) {
+        if (!PlatformSpecific.isAppEngineStandardEnvironment()) {
+            return new ThreadFactory() {
+                private final AtomicInteger threadNumber = new AtomicInteger(0);
+
+                @Override
+                public Thread newThread(Runnable r) {
+                    //设置线程名
+                    //这种线程名 hystrix-ServiceA-1 hystrix-ServiceA-2	
+                    Thread thread = new Thread(r, "hystrix-" + threadPoolKey.name() + "-" + threadNumber.incrementAndGet());
+                    //设置守护线程
+                    thread.setDaemon(true);
+                    return thread;
+                }
+
+            };
+        } else {
+            return PlatformSpecific.getAppEngineThreadFactory();
+        }
+    }
+    
+    public BlockingQueue<Runnable> getBlockingQueue(int maxQueueSize) {
+		//如果默认情况下，maxQueueSize = -1，是没有所谓的排队的效果的(就是默认不设置队列长度就为-1)
+        if (maxQueueSize <= 0) {
+            //该队列没有排队效果，没有容量，有数据就直接加入到线程池中，类似于通道
+            //SynchronousQueue是没有排队的，一个请求过来了，就会直接创建一个新的线程，来执行这个请求，如果一旦线程池满了，没有新的线程可以了，那么此时就会尝试去创建更多的线程
+            return new SynchronousQueue<Runnable>();
+        } else {
+            //排队队列，长度为maxQueueSize的大小
+            return new LinkedBlockingQueue<Runnable>(maxQueueSize);
+        }
+    }
+..........................
+}
+```
+
+对应各种参数的情况：
+
+**SynchronousQueue队列的情况(没有设置maxQueueSize)**
+
+```properties
+hystrix.threadpool.ServiceA.maximumSize = 10
+hystrix.threadpool.ServiceA.coreSize = 10
+#没有设置默认-1
+hystrix.threadpool.ServiceA.maxQueueSize = -1
+```
+
+1 一个请求过来，会找一个新的线程来处理这个请求，但是最多同时只能是coreSize指定的10个线程，同时处理10个请求
+
+2 如果10个线程都在繁忙中，此时来了第11个请求，直接就是线程池reject掉
+
+3 并没有所谓的排队的机制
+
+**LinkedBlockingQueue队列的情况(设置maxQueueSize为10)**
+
+```properties
+hystrix.threadpool.ServiceA.maximumSize = 10
+hystrix.threadpool.ServiceA.coreSize = 10
+hystrix.threadpool.ServiceA.maxQueueSize = 10
+```
+
+1 一个队列，大小是10；线程池，10个线程
+
+2 此时会这样子，优先就是先用10个线程来处理请求，如果线程池满了，此时就会在队列里面排队，最多可以排10个请求
+
+3 如果10个请求队列都满了，线程池里的10个线程也满了，还在繁忙中，此时maxsimumSize是10，无法增加新的线程，此时就会reject掉
+
+**设置了动态线程池**
+
+```properties
+hystrix.threadpool.ServiceA.allowMaximumSizeToDivergeFromCoreSize = true
+hystrix.threadpool.ServiceA.keepAliveTimeMinutes = 1
+hystrix.threadpool.ServiceA.maximumSize = 20
+hystrix.threadpool.ServiceA.coreSize = 10
+hystrix.threadpool.ServiceA.maxQueueSize = 10
+```
+
+1 先是用线程池里的10个线程来处理，如果10个线程都繁忙了，此时会进入队列排队，最多排10个请求，如果队列也满了，此时会创建新的线程，最多创建额外的10个线程，让线程池的综述，最多增加到20个。
+
+2 新增加出来的10个线程，如果处理完了请求，超过1分钟是空闲的，那么此时就会释放掉新增加出来的额外的10个线程。
 
 
 
@@ -4418,5 +4694,933 @@ HystrixThreadPoolDefault构造断点，属性初始化
 
 
 
+```java
+public class HystrixContextScheduler extends Scheduler {
+.............................
+    private class HystrixContextSchedulerWorker extends Worker {
+.........................
+    //7.1 最后回调的线程池方法
+        @Override
+        public Subscription schedule(Action0 action) {
+            if (threadPool != null) {
+                //该if是判断队列相关的，没有配置队列长度不会进入该if
+                //配置了队列相关参数，则根据对应等待队列长度来判断是否进入if抛出异常
+                if (!threadPool.isQueueSpaceAvailable()) {
+                    throw new RejectedExecutionException("Rejected command because thread-pool queueSize is at rejection threshold.");
+                }
+            }
+            return worker.schedule(new HystrixContexSchedulerAction(concurrencyStrategy, action));
+        }
+    }
+.............................
+    
+    private static class ThreadPoolWorker extends Worker {
+        private final HystrixThreadPool threadPool;
+        private final CompositeSubscription subscription = new CompositeSubscription();
+        private final Func0<Boolean> shouldInterruptThread;
+
+        public ThreadPoolWorker(HystrixThreadPool threadPool, Func0<Boolean> shouldInterruptThread) {
+            this.threadPool = threadPool;
+            this.shouldInterruptThread = shouldInterruptThread;
+        }
+................................
+    	//这块就是将任务，提交到线程池里的核心逻辑了
+		//如果提交任务的时候，线程池已经满了，默认是会走AbortPolicy
+    	//线程池的默认拒绝策略为AbortPolicy，即丢弃任务并抛出RejectedExecutionException异常
+        @Override
+        public Subscription schedule(final Action0 action) {
+            if (subscription.isUnsubscribed()) {
+                // don't schedule, we are unsubscribed
+                return Subscriptions.unsubscribed();
+            }
+
+            // This is internal RxJava API but it is too useful.
+            ScheduledAction sa = new ScheduledAction(action);
+
+            subscription.add(sa);
+            sa.addParent(subscription);
+
+            ThreadPoolExecutor executor = (ThreadPoolExecutor) threadPool.getExecutor();
+            FutureTask<?> f = (FutureTask<?>) executor.submit(sa);
+            sa.add(new FutureCompleterWithConfigurableInterrupt(f, shouldInterruptThread, executor));
+
+            return sa;
+        }
+..............................
+    
+    }
+}
+```
+
+队列相关判断补充
+
+```java
+public interface HystrixThreadPool {
+....................
+    /* package */static class HystrixThreadPoolDefault implements HystrixThreadPool {
+...................
+		@Override
+        public boolean isQueueSpaceAvailable() {
+    		//queueSize默认-1(没设置maxQueueSize)
+            if (queueSize <= 0) {
+                // we don't have a queue so we won't look for space but instead
+                // let the thread-pool reject or not
+                //返回true
+                return true;
+            } else {
+                //threadPool.getQueue().size()为当前队列排队长度
+                //properties.queueSizeRejectionThreshold()为对应配置的队列长度
+                //如果当前队列长度大于配置的队列长度则返回false
+                return threadPool.getQueue().size() < properties.queueSizeRejectionThreshold().get();
+            }
+        }
+    }
+................
+}
+```
 
 
+
+schedule最后返回断点
+
+![image-20210821151028901](Hystrix.assets/image-20210821151028901.png)
+
+总结：
+
+```properties
+hystrix.threadpool.ServiceA.allowMaximumSizeToDivergeFromCoreSize = false
+hystrix.threadpool.ServiceA.keepAliveTimeMinutes = 1
+hystrix.threadpool.ServiceA.maximumSize = 10
+hystrix.threadpool.ServiceA.coreSize = 10
+hystrix.threadpool.ServiceA.maxQueueSize = -1
+hystrix.threadpool.ServiceA.queueSizeRejectionThreshold = 5
+
+hystrix.threadpool.ServiceA.allowMaximumSizeToDivergeFromCoreSize = false
+hystrix.threadpool.ServiceA.keepAliveTimeMinutes = 1
+hystrix.threadpool.ServiceA.maximumSize = 10
+hystrix.threadpool.ServiceA.coreSize = 10
+hystrix.threadpool.ServiceA.maxQueueSize = -1
+hystrix.threadpool.ServiceA.queueSizeRejectionThreshold = 5
+
+#他首先会将任务不断的给线程池，让线程池来处理，如果10个线程都满了，此时就会进入队列来排队
+
+#如果此时队列里排队的请求是3个，那么此时就会判断说3 < 5，此时还可以继续送个请求过去，进行排队
+
+#但是如果此时队列里排队的请求第5个，此时就会判断说5 = 5，5不小于5，此时就会报错：Rejected command because thread-pool queueSize is at rejection threshold.
+```
+
+# 8 hystrix相关机制源码
+
+hystrix最最核心的就是几块
+
+隔离+限流：线程池（结合面试突击第二季里的线程池），拒绝任务（队列满了，线程池满了）
+
+超时监测：如果执行的时候超时了，可以发现和中断执行
+
+异常：报错
+
+降级：如何执行降级的机制，fallback机制
+
+熔断：熔断器如何统计、如何打开、如何自动恢复
+
+请求缓存
+
+请求合并
+
+## 8.1 线程池中异步执行任务的时候如何进行超时检测以及中断线程的执行呢(超时相关)
+
+
+
+```java
+/* package */abstract class AbstractCommand<R> implements HystrixInvokableInfo<R>, HystrixObservable<R> {
+
+........................
+//toObservable()方法中对应回调函数中，调用了applyHystrixSemantics，applyHystrixSemantics又调用了该方法
+    private Observable<R> executeCommandAndObserve(final AbstractCommand<R> _cmd) 
+.......................................................
+	    //HystrixObservableTimeoutOperator为超时相关类
+        if (properties.executionTimeoutEnabled().get()) {
+            execution = executeCommandWithSpecifiedIsolation(_cmd)
+                    .lift(new HystrixObservableTimeoutOperator<R>(_cmd));
+        } else {
+            execution = executeCommandWithSpecifiedIsolation(_cmd);
+        }
+
+        return execution.doOnNext(markEmits)
+                .doOnCompleted(markOnCompleted)
+                .onErrorResumeNext(handleFallback)
+                .doOnEach(setRequestContext);    
+........................
+    
+
+}
+```
+
+HystrixObservableTimeoutOperator为超时相关逻辑
+
+```java
+/* package */abstract class AbstractCommand<R> implements HystrixInvokableInfo<R>, HystrixObservable<R> {
+................
+    //超时检查
+    protected final AtomicReference<Reference<TimerListener>> timeoutTimer = new AtomicReference<Reference<TimerListener>>();
+................
+//很明显是在command执行结束之后被调用的，处理一些命令结束之后的事情，上来就是将这个command对应的那个检查timeout的任务给clean掉
+private void handleCommandEnd(boolean commandExecutionStarted) {
+    	//清理屌对应command的超时检查
+        Reference<TimerListener> tl = timeoutTimer.get();
+        if (tl != null) {
+            tl.clear();
+        }
+
+        long userThreadLatency = System.currentTimeMillis() - commandStartTimestamp;
+        executionResult = executionResult.markUserThreadCompletion((int) userThreadLatency);
+        if (executionResultAtTimeOfCancellation == null) {
+            metrics.markCommandDone(executionResult, commandKey, threadPoolKey, commandExecutionStarted);
+        } else {
+            metrics.markCommandDone(executionResultAtTimeOfCancellation, commandKey, threadPoolKey, commandExecutionStarted);
+        }
+
+        if (endCurrentThreadExecutingCommand != null) {
+            endCurrentThreadExecutingCommand.call();
+        }
+    }
+..................
+	private static class HystrixObservableTimeoutOperator<R> implements Operator<R, R> {
+
+        final AbstractCommand<R> originalCommand;
+
+        public HystrixObservableTimeoutOperator(final AbstractCommand<R> originalCommand) {
+            this.originalCommand = originalCommand;
+        }
+
+        @Override
+        public Subscriber<? super R> call(final Subscriber<? super R> child) {
+            final CompositeSubscription s = new CompositeSubscription();
+            // if the child unsubscribes we unsubscribe our parent as well
+            child.add(s);
+
+            //capture the HystrixRequestContext upfront so that we can use it in the timeout thread later
+            final HystrixRequestContext hystrixRequestContext = HystrixRequestContext.getContextForCurrentThread();
+
+            //它其实是一个监听我们的command执行是否超时的这么一个监听器，如果command执行超时了，那么此时就会回调这个TimerListener里面的这个方法，将状态设置为TIMED_OUT，而且会抛出一个HystrixTimeoutException
+            TimerListener listener = new TimerListener() {
+
+                @Override
+                public void tick() {
+                    // if we can go from NOT_EXECUTED to TIMED_OUT then we do the timeout codepath
+                    // otherwise it means we lost a race and the run() execution completed or did not start
+                    //如果此时还未为NOT_EXECUTED状态的话，就说明超时了，将状态改为TIMED_OUT超时
+                    if (originalCommand.isCommandTimedOut.compareAndSet(TimedOutStatus.NOT_EXECUTED, TimedOutStatus.TIMED_OUT)) {
+                        // report timeout failure
+                        originalCommand.eventNotifier.markEvent(HystrixEventType.TIMEOUT, originalCommand.commandKey);
+
+                        // shut down the original request
+                        s.unsubscribe();
+
+                        final HystrixContextRunnable timeoutRunnable = new HystrixContextRunnable(originalCommand.concurrencyStrategy, hystrixRequestContext, new Runnable() {
+
+                            @Override
+                            public void run() {
+                                //超时则抛出HystrixTimeoutException异常
+                                child.onError(new HystrixTimeoutException());
+                            }
+                        });
+
+
+                        timeoutRunnable.run();
+                        //if it did not start, then we need to mark a command start for concurrency metrics, and then issue the timeout
+                    }
+                }
+
+                @Override
+                public int getIntervalTimeInMilliseconds() {
+                    return originalCommand.properties.executionTimeoutInMilliseconds().get();
+                }
+            };
+            
+			//这里明显是拿到了一个HystirxTimer的东西，在这个里面加入了上面的那个监听器，回调那个监听器
+            final Reference<TimerListener> tl = HystrixTimer.getInstance().addTimerListener(listener);
+
+            // set externally so execute/queue can see this
+            //然后将这个HystrixTimer，给放到了command的里面去
+            originalCommand.timeoutTimer.set(tl);
+
+            /**
+             * If this subscriber receives values it means the parent succeeded/completed
+             */
+            Subscriber<R> parent = new Subscriber<R>() {
+
+                @Override
+                public void onCompleted() {
+                    if (isNotTimedOut()) {
+                        // stop timer and pass notification through
+                        tl.clear();
+                        child.onCompleted();
+                    }
+                }
+
+                @Override
+                public void onError(Throwable e) {
+                    if (isNotTimedOut()) {
+                        // stop timer and pass notification through
+                        tl.clear();
+                        child.onError(e);
+                    }
+                }
+
+                @Override
+                public void onNext(R v) {
+                    if (isNotTimedOut()) {
+                        child.onNext(v);
+                    }
+                }
+
+                private boolean isNotTimedOut() {
+                    // if already marked COMPLETED (by onNext) or succeeds in setting to COMPLETED
+                    return originalCommand.isCommandTimedOut.get() == TimedOutStatus.COMPLETED ||
+                            originalCommand.isCommandTimedOut.compareAndSet(TimedOutStatus.NOT_EXECUTED, TimedOutStatus.COMPLETED);
+                }
+
+            };
+
+            // if s is unsubscribed we want to unsubscribe the parent
+            s.add(parent);
+
+            return parent;
+        }
+
+    }
+}
+```
+
+HystrixTimer就是负责去监控command的执行是否超时的，初始化超时相关线程池，及执行对应超时检查方法
+
+```java
+
+/**
+ * Timer used by {@link HystrixCommand} to timeout async executions and {@link HystrixCollapser} to trigger batch executions.
+ */
+//注释都很清晰了，明确说明了HystrixTimer就是一个核心的组件，负责去将HystrixCommand的异步执行给超时掉
+public class HystrixTimer {
+..........................
+    
+    /* package */ AtomicReference<ScheduledExecutor> executor = new AtomicReference<ScheduledExecutor>();
+
+    //接着上面的方法addTimerListener
+    //初始化定时任务
+    public Reference<TimerListener> addTimerListener(final TimerListener listener) {
+        //
+        startThreadIfNeeded();
+        // add the listener
+		//这个线程，就是在调用TimerListener的tick()方法
+        Runnable r = new Runnable() {
+
+            @Override
+            public void run() {
+                try {
+                    //超时检查
+                    listener.tick();
+                } catch (Exception e) {
+                    logger.error("Failed while ticking TimerListener", e);
+                }
+            }
+        };
+		//将超时检查的异步线程加入定时调度执行
+    	//listener.getIntervalTimeInMilliseconds() 该参数默认为1，就是1秒执行一次
+        //ScheduledThreadPoolExecutor(JUC相关线程池)，就是在调用TimerListener的tick()方法
+        ScheduledFuture<?> f = executor.get().getThreadPool().scheduleAtFixedRate(r, listener.getIntervalTimeInMilliseconds(), listener.getIntervalTimeInMilliseconds(), TimeUnit.MILLISECONDS);
+        return new TimerReference(listener, f);
+    }
+........................
+  protected void startThreadIfNeeded() {
+        // create and start thread if one doesn't exist
+    	//初始化executor，如果为空则调用initialize方法初始化
+        while (executor.get() == null || ! executor.get().isInitialized()) {
+            if (executor.compareAndSet(null, new ScheduledExecutor())) {
+                // initialize the executor that we 'won' setting
+                executor.get().initialize();
+            }
+        }
+    }
+.......................
+
+    /* package */ static class ScheduledExecutor {
+        /* package */ volatile ScheduledThreadPoolExecutor executor;
+        private volatile boolean initialized;
+
+        /**
+         * We want this only done once when created in compareAndSet so use an initialize method
+         */
+        //初始化ScheduledExecutor executor
+        public void initialize() {
+
+            HystrixPropertiesStrategy propertiesStrategy = HystrixPlugins.getInstance().getPropertiesStrategy();
+            int coreSize = propertiesStrategy.getTimerThreadPoolProperties().getCorePoolSize().get();
+
+            ThreadFactory threadFactory = null;
+            if (!PlatformSpecific.isAppEngineStandardEnvironment()) {
+                //设置了timer线程的工厂
+                threadFactory = new ThreadFactory() {
+                    final AtomicInteger counter = new AtomicInteger();
+
+                    @Override
+                    public Thread newThread(Runnable r) {
+                        //timer线程的名字叫做：HystirxTimer-1
+                        Thread thread = new Thread(r, "HystrixTimer-" + counter.incrementAndGet());
+                        thread.setDaemon(true);
+                        return thread;
+                    }
+
+                };
+            } else {
+                threadFactory = PlatformSpecific.getAppEngineThreadFactory();
+            }
+		   //coreSize：8，这个是代表的timer线程池的大小
+            //这个线程池和执行任务线程池不是一回事，没有关系
+            //ScheduledThreadPoolExecutor：创建了一个用来进行调度的线程池，大小是8，最多只能同时调度8个线程
+            executor = new ScheduledThreadPoolExecutor(coreSize, threadFactory);
+            initialized = true;
+        }
+
+        public ScheduledThreadPoolExecutor getThreadPool() {
+            return executor;
+        }
+
+        public boolean isInitialized() {
+            return initialized;
+        }
+    }
+    
+    //超时检查接口
+    public static interface TimerListener {
+
+        public void tick();
+
+   
+        public int getIntervalTimeInMilliseconds();
+    }
+}
+```
+
+
+
+## 8.2 降级机制是如何触发执行的呢
+
+### 8.2.1 前言
+
+命令执行
+
+超时：有一个定时任务线程的不断的去检查状态，如果在超时时间之前，命令执行完了，此时会清理掉那个定时任务，命令的timeout state => COMPLETED
+
+异常：命令执行的过程中，报错了，抛异常了，异常肯定会不断的抛出来，给别人去处理
+
+拒绝：等待队列满，线程池，抛异常
+
+共同的一个特点，都是在抛出这个异常，我们想，抛出异常的话呢，肯定会让别人去处理，肯定有个人会去处理你异常的情况，然后执行你的fallback降级逻辑
+
+fallback降级逻辑是在哪儿执行的？？？
+
+### 8.2.2 机制
+
+所有的异常，都会交给handleFallback来处理，针对不同的异常，reject、timeout、failure，拒绝、超时、失败，都会执行降级逻辑(getFallback方法)
+
+```java
+/* package */abstract class AbstractCommand<R> implements HystrixInvokableInfo<R>, HystrixObservable<R> {
+................................
+	//toObservable()方法中对应回调函数中，调用了applyHystrixSemantics，applyHystrixSemantics又调用了该方法
+    private Observable<R> executeCommandAndObserve(final AbstractCommand<R> _cmd)
+    ............................
+            final Func1<Throwable, Observable<R>> handleFallback = new Func1<Throwable, Observable<R>>() {
+    
+    		//所有的异常，都会交给handleFallback来处理，针对不同的异常，reject、timeout、failure，拒绝、超时、失败，都会执行降级逻辑
+            @Override
+            public Observable<R> call(Throwable t) {
+                circuitBreaker.markNonSuccess();
+                Exception e = getExceptionFromThrowable(t);
+                executionResult = executionResult.setExecutionException(e);
+                //reject拒绝，降级
+                if (e instanceof RejectedExecutionException) {
+                    return handleThreadPoolRejectionViaFallback(e);
+                //timeout超时，降级
+                } else if (t instanceof HystrixTimeoutException) {
+                    return handleTimeoutViaFallback();
+                //failure请求失败，降级    
+                } else if (t instanceof HystrixBadRequestException) {
+                    return handleBadRequestByEmittingError(e);
+                } else {
+                    /*
+                     * Treat HystrixBadRequestException from ExecutionHook like a plain HystrixBadRequestException.
+                     */
+                    if (e instanceof HystrixBadRequestException) {
+                        eventNotifier.markEvent(HystrixEventType.BAD_REQUEST, commandKey);
+                        return Observable.error(e);
+                    }
+
+                    return handleFailureViaFallback(e);
+                }
+            }
+        };
+................................
+    //以handleThreadPoolRejectionViaFallback拒绝的情况降级为样例探究
+  private Observable<R> handleThreadPoolRejectionViaFallback(Exception underlying) {
+        eventNotifier.markEvent(HystrixEventType.THREAD_POOL_REJECTED, commandKey);
+        threadPool.markThreadRejection();
+        // use a fallback instead (or throw exception if not implemented)
+    	//真正执行降级逻辑的核心方法
+        return getFallbackOrThrowException(this, HystrixEventType.THREAD_POOL_REJECTED, FailureType.REJECTED_THREAD_EXECUTION, "could not be queued for execution", underlying);
+    }
+.................................
+	//真正执行降级逻辑的核心方法
+    private Observable<R> getFallbackOrThrowException(final AbstractCommand<R> _cmd, final HystrixEventType eventType, final FailureType failureType, final String message, final Exception originalException) 
+                if (fallbackSemaphore.tryAcquire()) {
+                    try {
+                        if (isFallbackUserDefined()) {
+                            executionHook.onFallbackStart(this);
+                            //getFallbackObservable实例化fallbackExecutionChain（Observable<R>）
+                            fallbackExecutionChain = getFallbackObservable();
+                        } else {
+                            //same logic as above without the hook invocation
+                            fallbackExecutionChain = getFallbackObservable();
+                        }
+                    } catch (Throwable ex) {
+                        //If hook or user-fallback throws, then use that as the result of the fallback lookup
+                        fallbackExecutionChain = Observable.error(ex);
+                    }
+				//关键在fallbackExecutionChain的实例化代码
+                    return fallbackExecutionChain
+                            .doOnEach(setRequestContext)
+                            .lift(new FallbackHookApplication(_cmd))
+                            .lift(new DeprecatedOnFallbackHookApplication(_cmd))
+                            .doOnNext(markFallbackEmit)
+                            .doOnCompleted(markFallbackCompleted)
+                            .onErrorResumeNext(handleFallbackError)
+                            .doOnTerminate(singleSemaphoreRelease)
+                            .doOnUnsubscribe(singleSemaphoreRelease);
+                } else {
+                   return handleFallbackRejectionByEmittingError();
+                }
+........................
+    //在该方法中回调了降级getFallback方法
+    protected abstract Observable<R> getFallbackObservable();
+
+    
+}
+
+```
+
+最终回调了降级方法
+
+```java
+public abstract class HystrixCommand<R> extends AbstractCommand<R> implements HystrixExecutable<R>, HystrixInvokableInfo<R>, HystrixObservable<R> {
+............................
+    @Override
+    final protected Observable<R> getFallbackObservable() {
+        return Observable.defer(new Func0<Observable<R>>() {
+            @Override
+            public Observable<R> call() {
+                try {
+                    return Observable.just(getFallback());
+                } catch (Throwable ex) {
+                    return Observable.error(ex);
+                }
+            }
+        });
+    }
+
+.........................
+}
+```
+
+## 8.3 线程池拒绝、超时以及异常的时候又是如何触发熔断开关的呢(短路器-触发)
+
+
+
+```java
+/* package */abstract class AbstractCommand<R> implements HystrixInvokableInfo<R>, HystrixObservable<R> {
+................................
+    protected final HystrixCircuitBreaker circuitBreaker;
+    //AbstractCommand构造中调用initCircuitBreaker，并赋值给circuitBreaker
+    private static HystrixCircuitBreaker initCircuitBreaker(boolean enabled, HystrixCircuitBreaker fromConstructor,
+                                                            HystrixCommandGroupKey groupKey, HystrixCommandKey commandKey,
+                                                            HystrixCommandProperties properties, HystrixCommandMetrics metrics) {
+        if (enabled) {
+            if (fromConstructor == null) {
+                // get the default implementation of HystrixCircuitBreaker
+                //这里初始化短路器
+                return HystrixCircuitBreaker.Factory.getInstance(commandKey, groupKey, properties, metrics);
+            } else {
+                return fromConstructor;
+            }
+        } else {
+            return new NoOpCircuitBreaker();
+        }
+    }
+...............................
+}
+```
+
+每个commandKey都有自己的熔断器，对应feign结合hystrix来说就是每个方法都有自己的熔断器
+
+```java
+public interface HystrixCircuitBreaker {
+............................
+    class Factory {
+        //短路器map
+        private static ConcurrentHashMap<String, HystrixCircuitBreaker> circuitBreakersByCommand = new ConcurrentHashMap<String, HystrixCircuitBreaker>();
+
+        public static HystrixCircuitBreaker getInstance(HystrixCommandKey key, HystrixCommandGroupKey group, HystrixCommandProperties properties, HystrixCommandMetrics metrics) {
+            //通过commandKey去获取一个command对应的熔断器
+            HystrixCircuitBreaker previouslyCached = circuitBreakersByCommand.get(key.name());
+            if (previouslyCached != null) {
+                return previouslyCached;
+            }
+
+		  //如果map中对应熔断器为空，则实例化对应熔断器放入map并返回(HystrixCircuitBreakerImpl)
+            HystrixCircuitBreaker cbForCommand = circuitBreakersByCommand.putIfAbsent(key.name(), new HystrixCircuitBreakerImpl(key, group, properties, metrics));
+            if (cbForCommand == null) {
+                return circuitBreakersByCommand.get(key.name());
+            } else {
+      
+                return cbForCommand;
+            }
+        }
+        
+......................
+    }
+    /* package */class HystrixCircuitBreakerImpl implements HystrixCircuitBreaker {
+        private final HystrixCommandProperties properties;
+        //核心监控类，，监听了拒绝、超时、失败的次数等信息
+        private final HystrixCommandMetrics metrics;
+		//短路器状态
+        enum Status {
+            //关闭、打开、半开
+            CLOSED, OPEN, HALF_OPEN;
+        }
+
+        private final AtomicReference<Status> status = new AtomicReference<Status>(Status.CLOSED);
+        private final AtomicLong circuitOpened = new AtomicLong(-1);
+        private final AtomicReference<Subscription> activeSubscription = new AtomicReference<Subscription>(null);
+
+        protected HystrixCircuitBreakerImpl(HystrixCommandKey key, HystrixCommandGroupKey commandGroup, final HystrixCommandProperties properties, HystrixCommandMetrics metrics) {
+            this.properties = properties;
+            this.metrics = metrics;
+
+            //On a timer, this will set the circuit between OPEN/CLOSED as command executions occur
+            //这行代码直接就是让熔断器监听了各种异常的统计信息，监听了拒绝、超时、失败的次数，如果说各种次数达到一定的范围内，此时就会触发熔断
+            Subscription s = subscribeToStream();
+            activeSubscription.set(s);
+        }
+
+        private Subscription subscribeToStream() {
+            /*
+             * This stream will recalculate the OPEN/CLOSED status on every onNext from the health stream
+             */
+            //这段代码，直接就实现了打开熔断的逻辑
+			//订阅了以后，每次如果有新的统计信息，就会来回调这个onNext()方法
+            return metrics.getHealthCountsStream()
+                    .observe()
+                    .subscribe(new Subscriber<HealthCounts>() {
+                        @Override
+                        public void onCompleted() {
+
+                        }
+
+                        @Override
+                        public void onError(Throwable e) {
+
+                        }
+
+                        //短路器核心检查方法
+                        //最近一个时间窗口（默认是10s）
+					//onNext()方法就会对统计信息进行各种检查，按照我们设置的一些参数，来完成对应的熔断的打开
+                        @Override
+                        public void onNext(HealthCounts hc) {
+                            // check if we are past the statisticalWindowVolumeThreshold
+                            //就是说在最近一个时间窗口内（10s），
+                            //totalRequests（总请求数量）小于circuitBreakerRequestVolumeThreshold（默认是20），那么什么都不干
+                            if (hc.getTotalRequests() < properties.circuitBreakerRequestVolumeThreshold().get()) {
+                                // we are not past the minimum volume threshold for the stat window,
+                                // so no change to circuit status.
+                                // if it was CLOSED, it stays CLOSED
+                                // if it was half-open, we need to wait for a successful command execution
+                                // if it was open, we need to wait for sleep window to elapse
+                            } else {
+                                //如果说最近一个时间窗口（默认是10s）内的异常的请求次数所占的比例（25次请求，5次，20%），< circuitBreakerErrorThresholdPercentage（异常比例，默认是50%），什么都不干
+                                if (hc.getErrorPercentage() < properties.circuitBreakerErrorThresholdPercentage().get()) {
+                                    //we are not past the minimum error threshold for the stat window,
+                                    // so no change to circuit status.
+                                    // if it was CLOSED, it stays CLOSED
+                                    // if it was half-open, we need to wait for a successful command execution
+                                    // if it was open, we need to wait for sleep window to elapse
+                                } else {
+                                    // our failure rate is too high, we need to set the state to OPEN
+                                    //但是反之，如果最近一个时间窗口内（默认是10s）内的异常的请求次数所占的比例（25次请求，20次，80%） > circuitBreakerErrorThresholdPercentage（默认是50%），此时就会打开熔断开关
+                                    if (status.compareAndSet(Status.CLOSED, Status.OPEN)) {
+                                        circuitOpened.set(System.currentTimeMillis());
+                                    }
+                                }
+                            }
+                        }
+                    });
+        }
+        
+        
+........................   
+    }
+}
+```
+
+**总结：**
+
+总的请求次数必须是 >= circuitBreakerRequestVolumeThreshold（默认是20次）
+
+异常请求的比例（一共25次，20次都失败了，拒绝、超时、失败，80%），>= circuitBreakerErrorThresholdPercentage（默认是50%），此时就会触发熔断开关
+
+## 8.4 熔断开关一旦打开之后是如何对后续的请求直接走fallback逻辑的呢(短路器-降级)
+
+
+
+```java
+/* package */abstract class AbstractCommand<R> implements HystrixInvokableInfo<R>, HystrixObservable<R> {
+
+    //toObservable()方法中对应回调函数中，调用了applyHystrixSemantics
+    private Observable<R> applyHystrixSemantics(final AbstractCommand<R> _cmd) {
+        // mark that we're starting execution on the ExecutionHook
+        // if this hook throws an exception, then a fast-fail occurs with no fallback.  No state is left inconsistent
+        executionHook.onStart(_cmd);
+
+        /* determine if we're allowed to execute */
+        //是否通过短路器进行降级的核心判断方法circuitBreaker.attemptExecution()
+        //如果返回true就说明短路器打开了，就进入else降级逻辑
+        if (circuitBreaker.attemptExecution()) {
+            final TryableSemaphore executionSemaphore = getExecutionSemaphore();
+            final AtomicBoolean semaphoreHasBeenReleased = new AtomicBoolean(false);
+            final Action0 singleSemaphoreRelease = new Action0() {
+                @Override
+                public void call() {
+                    if (semaphoreHasBeenReleased.compareAndSet(false, true)) {
+                        executionSemaphore.release();
+                    }
+                }
+            };
+
+            final Action1<Throwable> markExceptionThrown = new Action1<Throwable>() {
+                @Override
+                public void call(Throwable t) {
+                    eventNotifier.markEvent(HystrixEventType.EXCEPTION_THROWN, commandKey);
+                }
+            };
+
+            if (executionSemaphore.tryAcquire()) {
+                try {
+                    /* used to track userThreadExecutionTime */
+                    executionResult = executionResult.setInvocationStartTime(System.currentTimeMillis());
+                    return executeCommandAndObserve(_cmd)
+                            .doOnError(markExceptionThrown)
+                            .doOnTerminate(singleSemaphoreRelease)
+                            .doOnUnsubscribe(singleSemaphoreRelease);
+                } catch (RuntimeException e) {
+                    return Observable.error(e);
+                }
+            } else {
+                //服务降级
+                return handleSemaphoreRejectionViaFallback();
+            }
+        } else {
+            return handleShortCircuitViaFallback();
+        }
+    }
+}
+```
+
+是否进行熔断，核心方法 attemptExecution
+
+```java
+public interface HystrixCircuitBreaker {
+..........................
+    /* package */class HystrixCircuitBreakerImpl implements HystrixCircuitBreaker {
+.........................
+        private final AtomicLong circuitOpened = new AtomicLong(-1);
+............................
+    	//判断熔断是否经过了一定时间
+        private boolean isAfterSleepWindow() {
+    		//开始熔断的时间戳
+            final long circuitOpenTime = circuitOpened.get();
+    		//当前时间戳
+            final long currentTime = System.currentTimeMillis();
+    		//配置的尝试恢复到半开状态的时间(默认5秒)
+            final long sleepWindowTime = properties.circuitBreakerSleepWindowInMilliseconds().get();
+    		// 当前时间的话 > 开始熔断时间+配置时间（默认5秒）则尝试变为半开状态，恢复熔断
+            return currentTime > circuitOpenTime + sleepWindowTime;
+        }
+        
+    	//返回false则说明打开了短路器(不允许经过请求)
+        @Override
+        public boolean attemptExecution() {
+    		//是否配置了强制打开短路器
+            if (properties.circuitBreakerForceOpen().get()) {
+                return false;
+            }
+    		//是否配置了强制关闭短路器
+            if (properties.circuitBreakerForceClosed().get()) {
+                return true;
+            }
+    		//circuitOpened的时间戳为-1，则说明没有短路，默认为-1
+            if (circuitOpened.get() == -1) {
+                return true;
+            } else {
+                //上一次熔断时间到目前为止是否经过了5秒(默认5秒)
+                //经过了5秒的话则变为半开状态
+                //允许第一次请求经过
+                if (isAfterSleepWindow()) {
+                    //第一次请求为打开状态
+                    //将打开状态变为半开状态
+                    //通过请求
+                    if (status.compareAndSet(Status.OPEN, Status.HALF_OPEN)) {
+                        //only the first request after sleep window should execute
+                        return true;
+                    } else {
+                        //如果是第二次及后续请求就为半开状态了，直接返回false
+                        //如果半开状态变为关闭，则上面的(circuitOpened.get() == -1)直接返回
+                        //如果半开状态变为打开，则重新进入isAfterSleepWindow()相关判断再来一遍
+                        return false;
+                    }
+                } else {
+                    //没有到5秒还是不允许经过
+                    return false;
+                }
+            }
+        }
+    }
+......................
+}
+```
+
+
+
+## 8.5 熔断一段时间过后是如何自动尝试探查下游服务是否已经恢复的(短路器-恢复/继续短路)
+
+
+
+```java
+/* package */abstract class AbstractCommand<R> implements HystrixInvokableInfo<R>, HystrixObservable<R> {
+...............................
+    private Observable<R> executeCommandAndObserve(final AbstractCommand<R> _cmd) 
+        final HystrixRequestContext currentRequestContext = HystrixRequestContext.getContextForCurrentThread();
+
+    	//如果尝试请求成功了，会回调markEmits或者markOnCompleted => circuitBreaker.markSuccess() => 关闭熔断器
+        final Action1<R> markEmits = new Action1<R>() {
+            //如果方法执行成功了会回调这个方法
+            @Override
+            public void call(R r) {
+                if (shouldOutputOnNextEvents()) {
+                    executionResult = executionResult.addEvent(HystrixEventType.EMIT);
+                    eventNotifier.markEvent(HystrixEventType.EMIT, commandKey);
+                }
+                //默认会进入这个If,commandIsScalar()默认为true
+                if (commandIsScalar()) {
+                    long latency = System.currentTimeMillis() - executionResult.getStartTimestamp();
+                    eventNotifier.markEvent(HystrixEventType.SUCCESS, commandKey);
+                    executionResult = executionResult.addEvent((int) latency, HystrixEventType.SUCCESS);
+                    eventNotifier.markCommandExecution(getCommandKey(), properties.executionIsolationStrategy().get(), (int) latency, executionResult.getOrderedList());
+                    //恢复短路器/关闭短路器
+                    circuitBreaker.markSuccess();
+                }
+            }
+        };
+
+         final Action0 markOnCompleted = new Action0() {
+            @Override
+            public void call() {
+                //后续也会回调这个方法，如果成功了commandIsScalar()默认为true，所以不会进入这个if
+                if (!commandIsScalar()) {
+                    long latency = System.currentTimeMillis() - executionResult.getStartTimestamp();
+                    eventNotifier.markEvent(HystrixEventType.SUCCESS, commandKey);
+                    executionResult = executionResult.addEvent((int) latency, HystrixEventType.SUCCESS);
+                    eventNotifier.markCommandExecution(getCommandKey(), properties.executionIsolationStrategy().get(), (int) latency, executionResult.getOrderedList());
+                    circuitBreaker.markSuccess();
+                }
+            }
+        };
+
+    	//如果尝试请求失败了，拒绝、超时、失败，handleFallback => circuitBreaker.markNonSuccess(); => 重新打开熔断器
+        final Func1<Throwable, Observable<R>> handleFallback = new Func1<Throwable, Observable<R>>() {
+            
+            //方法执行失败的回调方法
+            @Override
+            public Observable<R> call(Throwable t) {
+                //如果短路器为半开状态，直接变为打开状态(打开短路器)
+                circuitBreaker.markNonSuccess();
+                Exception e = getExceptionFromThrowable(t);
+                executionResult = executionResult.setExecutionException(e);
+                if (e instanceof RejectedExecutionException) {
+                    return handleThreadPoolRejectionViaFallback(e);
+                } else if (t instanceof HystrixTimeoutException) {
+                    return handleTimeoutViaFallback();
+                } else if (t instanceof HystrixBadRequestException) {
+                    return handleBadRequestByEmittingError(e);
+                } else {
+                    /*
+                     * Treat HystrixBadRequestException from ExecutionHook like a plain HystrixBadRequestException.
+                     */
+                    if (e instanceof HystrixBadRequestException) {
+                        eventNotifier.markEvent(HystrixEventType.BAD_REQUEST, commandKey);
+                        return Observable.error(e);
+                    }
+
+                    return handleFailureViaFallback(e);
+                }
+            }
+        };
+...............................
+}
+```
+
+恢复/继续短路相关方法
+
+```java
+public interface HystrixCircuitBreaker {
+.......................
+
+    /* package */class HystrixCircuitBreakerImpl implements HystrixCircuitBreaker {
+........................
+    	//恢复短路器
+        @Override
+        public void markSuccess() {
+    		//半开状态变为关闭状态
+            if (status.compareAndSet(Status.HALF_OPEN, Status.CLOSED)) {
+                //This thread wins the race to close the circuit - it resets the stream to start it over from 0
+                metrics.resetStream();
+                Subscription previousSubscription = activeSubscription.get();
+                if (previousSubscription != null) {
+                    previousSubscription.unsubscribe();
+                }
+                Subscription newSubscription = subscribeToStream();
+                activeSubscription.set(newSubscription);
+                //短路时间戳变为-1，关闭状态时间戳都为-1
+                circuitOpened.set(-1L);
+            }
+        }
+
+        //继续短路
+        @Override
+        public void markNonSuccess() {
+            //短路器半开状态变为打开状态
+            if (status.compareAndSet(Status.HALF_OPEN, Status.OPEN)) {
+                //This thread wins the race to re-open the circuit - it resets the start time for the sleep window
+                //更新短路器打开时间戳
+                circuitOpened.set(System.currentTimeMillis());
+            }
+        }
+.....................
+    }
+..................
+
+}
+```
+
+## 8.6 小结
+
+执行、隔离、超时、失败、降级、熔断
+
+请求缓存、请求合并，两个小feature => 源码不讲都无所谓，在实际生产环境中，这两个高阶的功能，尽量不要用，缓存 => ehcache，请求合并 => 轻易不要用 => 自己做batch机制 => eureka（三层队列实现的batch提交的机制）
