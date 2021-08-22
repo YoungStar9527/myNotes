@@ -4097,6 +4097,8 @@ Action0 fireOnCompletedHook
         if (properties.executionIsolationStrategy().get() == ExecutionIsolationStrategy.THREAD) {
             // mark that we are executing in a thread (even if we end up being rejected we still were a THREAD execution and not SEMAPHORE)
             return Observable.defer(new Func0<Observable<R>>() {
+                
+                //这个call是线程池相关逻辑执行后，再回调这个call来执行最终的请求的
                 @Override
                 public Observable<R> call() {
                     executionResult = executionResult.setExecutionOccurred();
@@ -4319,7 +4321,9 @@ public class Hystrix {
 }
 ```
 
-**6小结还欠账一个流程图**
+完整流程图：
+
+https://www.processon.com/view/link/612213e50e3e743b32796d68
 
 # 7 hystrix线程池源码揭秘
 
@@ -4453,7 +4457,7 @@ public class HystrixContextScheduler extends Scheduler {
         @Override
         public Subscription schedule(Action0 action) {
             if (threadPool != null) {
-                //就是在判断线程池是否已满？如果已经满了，那么就会报一个reject的异常
+                //就是在判断队列是否已满？如果已经满了，那么就会报一个reject的异常
                 if (!threadPool.isQueueSpaceAvailable()) {
                     throw new RejectedExecutionException("Rejected command because thread-pool queueSize is at rejection threshold.");
                 }
@@ -4589,7 +4593,7 @@ public abstract class HystrixConcurrencyStrategy {
         final int maxQueueSize = threadPoolProperties.maxQueueSize().get();
     	//初始化队列
         final BlockingQueue<Runnable> workQueue = getBlockingQueue(maxQueueSize);
-
+		//这是动态扩展线程相关的，默认关闭动态扩展线程池
         if (allowMaximumSizeToDivergeFromCoreSize) {
             final int dynamicMaximumSize = threadPoolProperties.maximumSize().get();
             if (dynamicCoreSize > dynamicMaximumSize) {
@@ -4809,6 +4813,10 @@ hystrix.threadpool.ServiceA.queueSizeRejectionThreshold = 5
 #但是如果此时队列里排队的请求第5个，此时就会判断说5 = 5，5不小于5，此时就会报错：Rejected command because thread-pool queueSize is at rejection threshold.
 ```
 
+完整流程图：
+
+https://www.processon.com/view/link/612213e50e3e743b32796d68
+
 # 8 hystrix相关机制源码
 
 hystrix最最核心的就是几块
@@ -4866,7 +4874,7 @@ HystrixObservableTimeoutOperator为超时相关逻辑
 ................
 //很明显是在command执行结束之后被调用的，处理一些命令结束之后的事情，上来就是将这个command对应的那个检查timeout的任务给clean掉
 private void handleCommandEnd(boolean commandExecutionStarted) {
-    	//清理屌对应command的超时检查
+    	//清理掉对应command的超时检查
         Reference<TimerListener> tl = timeoutTimer.get();
         if (tl != null) {
             tl.clear();
@@ -5101,6 +5109,8 @@ public class HystrixTimer {
     }
 }
 ```
+
+流程图：https://www.processon.com/view/link/6122307e1efad44bb2786d3e
 
 
 
@@ -5623,4 +5633,5 @@ public interface HystrixCircuitBreaker {
 
 执行、隔离、超时、失败、降级、熔断
 
-请求缓存、请求合并，两个小feature => 源码不讲都无所谓，在实际生产环境中，这两个高阶的功能，尽量不要用，缓存 => ehcache，请求合并 => 轻易不要用 => 自己做batch机制 => eureka（三层队列实现的batch提交的机制）
+请求缓存、请求合并，两个小feature => 源码不讲都无所谓，在实际生产环境中，这两个高阶的功能，尽量不要用，缓存 => ehcache，请求合并 => 轻易不要用 => 自己做batch机制 => eureka（三层队列实现的batch提交的机制） 
+
