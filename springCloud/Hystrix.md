@@ -5629,6 +5629,8 @@ public interface HystrixCircuitBreaker {
 }
 ```
 
+流程图：https://www.processon.com/view/link/6123acdae401fd5228f875a8
+
 ## 8.6 小结
 
 执行、隔离、超时、失败、降级、熔断
