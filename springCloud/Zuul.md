@@ -1572,9 +1572,7 @@ public class FilterProcessor {
 
 对应runFilters方法断点
 
-![img](file:///C:\Users\18146\AppData\Roaming\Tencent\Users\562292680\QQ\WinTemp\RichOle\2JN~$GDKP}~EH}P9JZ[51DN.png)
-
-
+![image-20210827063628422](Zuul.assets/image-20210827063628422.png)
 
 **RibbonRoutingFilter => 将请求转发到服务的(正常来说都会配置服务，走这个过滤器)**
 
@@ -2217,3 +2215,8 @@ public class SendErrorFilter extends ZuulFilter {
 下图返回结果为对应服务抛出异常的500状态
 
 ![image-20210826221038140](Zuul.assets/image-20210826221038140.png)
+
+# 3 流程图
+
+https://www.processon.com/view/link/612827461efad40d93804b3d
+
