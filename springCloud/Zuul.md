@@ -536,9 +536,9 @@ zuul:
 
 ### 1.7.7 error过滤器
 
-在自定义过滤器里搞一个异常抛出来，ZuulException
+在**自定义过滤器里搞一个异常抛出来，ZuulException**
 
-然后写一个MyErrorController，继承BasicErrorController，统一处理异常，打印一些信息，这就是统一异常处理
+**然后写一个MyErrorController，继承BasicErrorController，统一处理异常，打印一些信息，这就是统一异常处理**
 
 统一异常处理
 
@@ -2211,6 +2211,8 @@ public class SendErrorFilter extends ZuulFilter {
 ![image-20210826220026299](Zuul.assets/image-20210826220026299.png)
 
 **PS:对应服务抛出异常并不会进入errorFilter,只是返回了对应的500等状态。需要zuul内部抛出异常才会进入**
+
+​	**所以说统一异常处理需要在自定义过滤器抛出异常(检测接口返回状态去自己抛异常出来)，然后再由error过滤器转发给对应BasicErrorController才能进行统一异常处理。**
 
 下图返回结果为对应服务抛出异常的500状态
 
