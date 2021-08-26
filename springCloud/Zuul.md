@@ -912,6 +912,8 @@ public class RequestContext extends ConcurrentHashMap<String, Object> {
 
 ## 2.2  pre过滤器源码
 
+### 2.2.1 pre相关过滤器
+
 ```
 pre过滤器
 
@@ -1357,7 +1359,7 @@ public class PreDecorationFilter extends ZuulFilter {
 
 将Route路由规则中的各种信息给放在了RequestContext中了，给下一个阶段route过滤器来使用
 
-## 2.3 解析请求URI以及匹配路由规则（Route）
+### 2.2.2 解析请求URI以及匹配路由规则（Route）
 
 其实是根据解析出来的请求URI，去匹配application.yml文件中我们配置的路由规则，将路由规则封装成一个Route
 
@@ -1526,5 +1528,690 @@ getZuulRoute方法中的遍历map的值，匹配到demo/** 则返回ZuulRoute
 
 
 
+## 2.4 route过滤器源码
+
+### 2.4.1 route相关过滤器
+
+```
+routing过滤器
+
+10：RibbonRoutingFilter
+100：SimpleHostRoutingFilter
+500：SendForwardFilter
+```
+
+对应route过滤器执行，和pre过滤器套路是一样的
+
+```java
+public class ZuulRunner {
+......................
+    public void route() throws ZuulException {
+        FilterProcessor.getInstance().route();
+    }
+......................
+}
+```
+
+对应route过滤器执行，和pre过滤器套路是一样的
+
+```java
+public class FilterProcessor {
+......................
+    public void route() throws ZuulException {
+        try {
+            runFilters("route");
+        } catch (ZuulException e) {
+            throw e;
+        } catch (Throwable e) {
+            throw new ZuulException(e, 500, "UNCAUGHT_EXCEPTION_IN_ROUTE_FILTER_" + e.getClass().getName());
+        }
+    }
+......................
+}
+```
+
+对应runFilters方法断点
+
+![img](file:///C:\Users\18146\AppData\Roaming\Tencent\Users\562292680\QQ\WinTemp\RichOle\2JN~$GDKP}~EH}P9JZ[51DN.png)
 
 
+
+**RibbonRoutingFilter => 将请求转发到服务的(正常来说都会配置服务，走这个过滤器)**
+
+```java
+public class RibbonRoutingFilter extends ZuulFilter {
+.........................
+    //没有配置服务则不执行
+	@Override
+	public boolean shouldFilter() {
+		RequestContext ctx = RequestContext.getCurrentContext();
+		return (ctx.getRouteHost() == null && ctx.get(SERVICE_ID_KEY) != null
+				&& ctx.sendZuulResponse());
+	}
+
+	@Override
+	public Object run() {
+		RequestContext context = RequestContext.getCurrentContext();
+		this.helper.addIgnoredHeaders();
+		try {
+			RibbonCommandContext commandContext = buildCommandContext(context);
+			ClientHttpResponse response = forward(commandContext);
+			setResponse(response);
+			return response;
+		}
+		catch (ZuulException ex) {
+			throw new ZuulRuntimeException(ex);
+		}
+		catch (Exception ex) {
+			throw new ZuulRuntimeException(ex);
+		}
+	}
+.........................
+}
+```
+
+**SimpleHostRoutingFilter => 将请求转发到某个url地址的(很少用，没配置则不会执行)**
+
+如果你要转发给某个url地址，就是这个过滤器来干，源码非常简单，很少用
+
+其实就是处理一下请求头、请求参数、请求体（json数据），然后交给底层的http组件，将这个请求发给指定的主机名:端口号，就ok了
+
+```java
+public class SimpleHostRoutingFilter extends ZuulFilter {
+...................
+	//没有配置RouteHost（url地址）则不执行
+	@Override
+	public boolean shouldFilter() {
+		return RequestContext.getCurrentContext().getRouteHost() != null
+				&& RequestContext.getCurrentContext().sendZuulResponse();
+	}
+
+	@Override
+	public Object run() {
+		RequestContext context = RequestContext.getCurrentContext();
+		HttpServletRequest request = context.getRequest();
+		MultiValueMap<String, String> headers = this.helper
+				.buildZuulRequestHeaders(request);
+		MultiValueMap<String, String> params = this.helper
+				.buildZuulRequestQueryParams(request);
+		String verb = getVerb(request);
+		InputStream requestEntity = getRequestBody(request);
+		if (request.getContentLength() < 0) {
+			context.setChunkedRequestBody();
+		}
+		
+		String uri = this.helper.buildZuulRequestURI(request);
+		this.helper.addIgnoredHeaders();
+
+		try {
+            //然后交给底层的http组件，将这个请求发给指定的主机名
+			CloseableHttpResponse response = forward(this.httpClient, verb, uri, request,
+					headers, params, requestEntity);
+			setResponse(response);
+		}
+		catch (Exception ex) {
+			throw new ZuulRuntimeException(ex);
+		}
+		return null;
+	}
+.....................
+}
+```
+
+**SendForwardFilter => 将请求转发到zuul网关服务自己的一个接口上去(很少用，没配置则不执行)**
+
+```java
+public class SendForwardFilter extends ZuulFilter {
+    
+.............................
+
+    //没有配置(FORWARD_TO_KEY = "forward.to")则不执行
+	@Override
+	public boolean shouldFilter() {
+		RequestContext ctx = RequestContext.getCurrentContext();
+		return ctx.containsKey(FORWARD_TO_KEY)
+				&& !ctx.getBoolean(SEND_FORWARD_FILTER_RAN, false);
+	}
+
+	@Override
+	public Object run() {
+		try {
+			RequestContext ctx = RequestContext.getCurrentContext();
+			String path = (String) ctx.get(FORWARD_TO_KEY);
+            //java web的最最基础和原生的api，RequestDispacher进行请求转发，将这个请求转发给本地其他的这个接口来处理
+			RequestDispatcher dispatcher = ctx.getRequest().getRequestDispatcher(path);
+			if (dispatcher != null) {
+				ctx.set(SEND_FORWARD_FILTER_RAN, true);
+				if (!ctx.getResponse().isCommitted()) {
+					dispatcher.forward(ctx.getRequest(), ctx.getResponse());
+					ctx.getResponse().flushBuffer();
+				}
+			}
+		}
+		catch (Exception ex) {
+			ReflectionUtils.rethrowRuntimeException(ex);
+		}
+		return null;
+	}
+
+}
+```
+
+
+
+### 2.4.2 RibbonRoutingFilter是如何将请求转发给服务的
+
+
+
+```java
+public class RibbonRoutingFilter extends ZuulFilter {
+................
+	@Override
+	public Object run() {
+		RequestContext context = RequestContext.getCurrentContext();
+		this.helper.addIgnoredHeaders();
+		try {
+            //构建RibbonCommandContext
+			RibbonCommandContext commandContext = buildCommandContext(context);
+            //forward真正执行请求的方法
+			ClientHttpResponse response = forward(commandContext);
+			setResponse(response);
+			return response;
+		}
+		catch (ZuulException ex) {
+			throw new ZuulRuntimeException(ex);
+		}
+		catch (Exception ex) {
+			throw new ZuulRuntimeException(ex);
+		}
+	}
+    
+    //这个方法就是通过RequestContext去构建一个RibbonCommandContext
+	protected RibbonCommandContext buildCommandContext(RequestContext context) {
+		HttpServletRequest request = context.getRequest();
+
+		MultiValueMap<String, String> headers = this.helper
+				.buildZuulRequestHeaders(request);
+		MultiValueMap<String, String> params = this.helper
+				.buildZuulRequestQueryParams(request);
+		String verb = getVerb(request);
+		InputStream requestEntity = getRequestBody(request);
+		if (request.getContentLength() < 0 && !verb.equalsIgnoreCase("GET")) {
+			context.setChunkedRequestBody();
+		}
+
+		String serviceId = (String) context.get(SERVICE_ID_KEY);
+		Boolean retryable = (Boolean) context.get(RETRYABLE_KEY);
+		Object loadBalancerKey = context.get(LOAD_BALANCER_KEY);
+
+		String uri = this.helper.buildZuulRequestURI(request);
+
+		// remove double slashes
+		uri = uri.replace("//", "/");
+
+		long contentLength = useServlet31 ? request.getContentLengthLong(): request.getContentLength();
+		
+		return new RibbonCommandContext(serviceId, verb, uri, retryable, headers, params,
+				requestEntity, this.requestCustomizers, contentLength, loadBalancerKey);
+	}
+    
+    //核心方法，发送请求
+	protected ClientHttpResponse forward(RibbonCommandContext context) throws Exception {
+		Map<String, Object> info = this.helper.debug(context.getMethod(),
+				context.getUri(), context.getHeaders(), context.getParams(),
+				context.getRequestEntity());
+		//构建RibbonCommand(HttpClientRibbonCommand)
+		RibbonCommand command = this.ribbonCommandFactory.create(context);
+		try {
+            //RibbonCommand其实就是hystrix的command，其中集成了ribbon的负载均衡逻辑
+			//负载均衡选择server,发送请求到对应服务
+            //返回ClientHttpResponse response
+            //command.execute()很明显就是调用hystrix的command执行的方法
+			ClientHttpResponse response = command.execute();
+			this.helper.appendDebug(info, response.getRawStatusCode(), response.getHeaders());
+			return response;
+		}
+		catch (HystrixRuntimeException ex) {
+			return handleException(info, ex);
+		}
+
+	}
+................
+}
+```
+
+buildCommandContext最后构建RibbonCommandContext的相关参数
+
+![image-20210826204138746](Zuul.assets/image-20210826204138746.png)
+
+构建完成的RibbonCommandContext
+
+![image-20210826204435791](Zuul.assets/image-20210826204435791.png)
+
+HttpClientRibbonCommand（继承自HystrixCommand），里面实现了run()逻辑，实现了这个command要发送的请求的核心逻辑
+
+```java
+public class HttpClientRibbonCommandFactory extends AbstractRibbonCommandFactory {
+...................
+    //构建核心组件HttpClientRibbonCommand
+    //HttpClientRibbonCommand，他核心的一点就是自己设置的那个run()方法，封装了自己核心的业务逻辑，发送一个请求出去
+	@Override
+	public HttpClientRibbonCommand create(final RibbonCommandContext context) {
+		ZuulFallbackProvider zuulFallbackProvider = getFallbackProvider(context.getServiceId());
+		final String serviceId = context.getServiceId();
+    	//获取对应的loadBlance
+		final RibbonLoadBalancingHttpClient client = this.clientFactory.getClient(
+				serviceId, RibbonLoadBalancingHttpClient.class);
+    	//这里的loadBalancer就是ZoneAwareLoadBalancer
+		client.setLoadBalancer(this.clientFactory.getLoadBalancer(serviceId));
+
+		return new HttpClientRibbonCommand(serviceId, client, context, zuulProperties, zuulFallbackProvider,
+				clientFactory.getClientConfig(serviceId));
+	}
+}
+```
+
+![image-20210826211829672](Zuul.assets/image-20210826211829672.png)
+
+HttpClientRibbonCommand这个类里面没什么逻辑，主要逻辑在父类
+
+```java
+public class HttpClientRibbonCommand extends AbstractRibbonCommand<RibbonLoadBalancingHttpClient, RibbonApacheHttpRequest, RibbonApacheHttpResponse> {
+................
+//构建HttpClientRibbonCommand
+public HttpClientRibbonCommand(final String commandKey,
+								   final RibbonLoadBalancingHttpClient client,
+								   final RibbonCommandContext context,
+								   final ZuulProperties zuulProperties,
+								   final ZuulFallbackProvider zuulFallbackProvider,
+								   final IClientConfig config) {
+		super(commandKey, client, context, zuulProperties, zuulFallbackProvider, config);
+	}
+................
+}
+//核心类AbstractRibbonCommand，结合hystrix和ribbon，发送请求
+public abstract class AbstractRibbonCommand<LBC extends AbstractLoadBalancerAwareClient<RQ, RS>, RQ extends ClientRequest, RS extends HttpResponse>
+		extends HystrixCommand<ClientHttpResponse> implements RibbonCommand {
+...............
+	public AbstractRibbonCommand(String commandKey, LBC client,
+								 RibbonCommandContext context, ZuulProperties zuulProperties,
+								 ZuulFallbackProvider fallbackProvider, IClientConfig config) {
+		this(getSetter(commandKey, zuulProperties, config), client, context, fallbackProvider, config);
+	}
+............
+    //run方法，发送请求
+	@Override
+	protected ClientHttpResponse run() throws Exception {
+		final RequestContext context = RequestContext.getCurrentContext();
+
+		RQ request = createRequest();
+		RS response;
+		
+		boolean retryableClient = this.client instanceof AbstractLoadBalancingClient
+				&& ((AbstractLoadBalancingClient)this.client).isClientRetryable((ContextAwareRequest)request);
+		
+		if (retryableClient) {
+			response = this.client.execute(request, config);
+		} else {
+			response = this.client.executeWithLoadBalancer(request, config);
+		}
+		context.set("ribbonResponse", response);
+
+		// Explicitly close the HttpResponse if the Hystrix command timed out to
+		// release the underlying HTTP connection held by the response.
+		//
+		if (this.isResponseTimedOut()) {
+			if (response != null) {
+				response.close();
+			}
+		}
+		//最终返回结果
+		return new RibbonHttpResponse(response);
+	}
+}
+```
+
+
+
+## 2.5 post过滤器
+
+```
+post过滤器
+
+LocationRewriteFilter 不执行(没有初始化)
+
+1000：SendResponseFilter
+
+
+```
+
+LocationRewriteFilter 这个filter默认情况下没跑，看看说响应结果是否是要进行请求重定向，如果是的话才会执行，但是这里默认一般不是
+
+对应post过滤器执行，和pre过滤器套路是一样的
+
+```java
+public class ZuulRunner {
+......................
+    public void postRoute() throws ZuulException {
+        FilterProcessor.getInstance().postRoute();
+    }
+......................
+}
+```
+
+对应post过滤器执行，和pre过滤器套路是一样的
+
+```java
+public class FilterProcessor {
+......................
+    public void postRoute() throws ZuulException {
+        try {
+            runFilters("post");
+        } catch (ZuulException e) {
+            throw e;
+        } catch (Throwable e) {
+            throw new ZuulException(e, 500, "UNCAUGHT_EXCEPTION_IN_POST_FILTER_" + e.getClass().getName());
+        }
+    }
+......................
+}
+```
+
+SendResponseFilter就是处理route过滤器返回的流，将输入流转换为输出流输出
+
+```java
+public class SendResponseFilter extends ZuulFilter {
+................
+	@Override
+	public boolean shouldFilter() {
+		RequestContext context = RequestContext.getCurrentContext();
+		return context.getThrowable() == null
+				&& (!context.getZuulResponseHeaders().isEmpty()
+					|| context.getResponseDataStream() != null
+					|| context.getResponseBody() != null);
+	}
+
+	@Override
+	public Object run() {
+		try {
+            //根据请求头，处理一下输入流
+			addResponseHeaders();
+            //将输入流转换为输出流输出
+			writeResponse();
+		}
+		catch (Exception ex) {
+			ReflectionUtils.rethrowRuntimeException(ex);
+		}
+		return null;
+	}
+
+    //将输入流转换为输出流输出
+	private void writeResponse() throws Exception {
+		RequestContext context = RequestContext.getCurrentContext();
+		// there is no body to send
+		if (context.getResponseBody() == null
+				&& context.getResponseDataStream() == null) {
+			return;
+		}
+		HttpServletResponse servletResponse = context.getResponse();
+		if (servletResponse.getCharacterEncoding() == null) { // only set if not set
+			servletResponse.setCharacterEncoding("UTF-8");
+		}
+        //ServletResponse是原生的servletResponse，获取到了针对浏览器的一个输出流，outStream就是一个输出流
+		OutputStream outStream = servletResponse.getOutputStream();
+		InputStream is = null;
+		try {
+			if (RequestContext.getCurrentContext().getResponseBody() != null) {
+				String body = RequestContext.getCurrentContext().getResponseBody();
+				writeResponse(
+						new ByteArrayInputStream(
+								body.getBytes(servletResponse.getCharacterEncoding())),
+						outStream);
+				return;
+			}
+			boolean isGzipRequested = false;
+			final String requestEncoding = context.getRequest()
+					.getHeader(ZuulHeaders.ACCEPT_ENCODING);
+
+			if (requestEncoding != null
+					&& HTTPRequestUtils.getInstance().isGzipped(requestEncoding)) {
+				isGzipRequested = true;
+			}
+			is = context.getResponseDataStream();
+			InputStream inputStream = is;
+			if (is != null) {
+				if (context.sendZuulResponse()) {
+					// if origin response is gzipped, and client has not requested gzip,
+					// decompress stream
+					// before sending to client
+					// else, stream gzip directly to client
+					if (context.getResponseGZipped() && !isGzipRequested) {
+						// If origin tell it's GZipped but the content is ZERO bytes,
+						// don't try to uncompress
+						final Long len = context.getOriginContentLength();
+						if (len == null || len > 0) {
+							try {
+								inputStream = new GZIPInputStream(is);
+							}
+							catch (java.util.zip.ZipException ex) {
+								log.debug(
+										"gzip expected but not "
+												+ "received assuming unencoded response "
+												+ RequestContext.getCurrentContext()
+												.getRequest().getRequestURL()
+												.toString());
+								inputStream = is;
+							}
+						}
+						else {
+							// Already done : inputStream = is;
+						}
+					}
+					else if (context.getResponseGZipped() && isGzipRequested) {
+						servletResponse.setHeader(ZuulHeaders.CONTENT_ENCODING, "gzip");
+					}
+					writeResponse(inputStream, outStream);
+				}
+			}
+		}
+		finally {
+			/**
+			* We must ensure that the InputStream provided by our upstream pooling mechanism is ALWAYS closed
+		 	* even in the case of wrapped streams, which are supplied by pooled sources such as Apache's
+		 	* PoolingHttpClientConnectionManager. In that particular case, the underlying HTTP connection will
+		 	* be returned back to the connection pool iif either close() is explicitly called, a read
+			* error occurs, or the end of the underlying stream is reached. If, however a write error occurs, we will
+			* end up leaking a connection from the pool without an explicit close()
+			*
+			* @author Johannes Edmeier
+			*/
+			if (is != null) {
+				try {
+					is.close();
+				}
+				catch (Exception ex) {
+					log.warn("Error while closing upstream input stream", ex);
+				}
+			}
+
+			try {
+				Object zuulResponse = RequestContext.getCurrentContext()
+						.get("zuulResponse");
+				if (zuulResponse instanceof Closeable) {
+					((Closeable) zuulResponse).close();
+				}
+				outStream.flush();
+				// The container will close the stream for us
+			}
+			catch (IOException ex) {
+				log.warn("Error while sending response to client: " + ex.getMessage());
+			}
+		}
+	}
+
+    //inputStream是服务B返回的json串读取的输入流，outStream是针对浏览器的一个输出流，他其实就是会从inputStream输入流中读取json串，然后写到outStream输出流中，写给浏览器
+	private void writeResponse(InputStream zin, OutputStream out) throws Exception {
+		byte[] bytes = buffers.get();
+		int bytesRead = -1;
+		while ((bytesRead = zin.read(bytes)) != -1) {
+			out.write(bytes, 0, bytesRead);
+		}
+	}
+
+    //根据请求头，处理一下输入流
+	private void addResponseHeaders() {
+		RequestContext context = RequestContext.getCurrentContext();
+		HttpServletResponse servletResponse = context.getResponse();
+		if (INCLUDE_DEBUG_HEADER.get()) {
+			@SuppressWarnings("unchecked")
+			List<String> rd = (List<String>) context.get(ROUTING_DEBUG_KEY);
+			if (rd != null) {
+				StringBuilder debugHeader = new StringBuilder();
+				for (String it : rd) {
+					debugHeader.append("[[[" + it + "]]]");
+				}
+				servletResponse.addHeader(X_ZUUL_DEBUG_HEADER, debugHeader.toString());
+			}
+		}
+		List<Pair<String, String>> zuulResponseHeaders = context.getZuulResponseHeaders();
+		if (zuulResponseHeaders != null) {
+			for (Pair<String, String> it : zuulResponseHeaders) {
+				servletResponse.addHeader(it.first(), it.second());
+			}
+		}
+		// Only inserts Content-Length if origin provides it and origin response is not
+		// gzipped
+		if (SET_CONTENT_LENGTH.get()) {
+			Long contentLength = context.getOriginContentLength();
+			if ( contentLength != null && !context.getResponseGZipped()) {
+				if(useServlet31) {
+					servletResponse.setContentLengthLong(contentLength);
+				} else {
+					//Try and set some kind of content length if we can safely convert the Long to an int
+					if (isLongSafe(contentLength)) {
+						servletResponse.setContentLength(contentLength.intValue());
+					}
+				}
+			}
+		}
+	}
+
+	private boolean isLongSafe(long value) {
+		return value <= Integer.MAX_VALUE && value >= Integer.MIN_VALUE;
+	}
+
+}
+```
+
+
+
+## 2.6 error 过滤器
+
+```
+0：SendErrorFilter
+```
+
+```java
+public class ZuulServlet extends HttpServlet {
+.............
+    //将对应异常放到RequestContext中
+    //并执行error过滤器
+    void error(ZuulException e) {
+        RequestContext.getCurrentContext().setThrowable(e);
+        zuulRunner.error();
+    }
+.............
+}
+```
+
+对应error过滤器执行，和pre过滤器套路是一样的
+
+```java
+public class ZuulRunner {
+......................
+    public void error() {
+        FilterProcessor.getInstance().error();
+    }
+......................
+}
+```
+
+对应error过滤器执行，和pre过滤器套路是一样的
+
+```java
+public class FilterProcessor {
+......................
+    public void error() {
+        try {
+            runFilters("error");
+        } catch (Throwable e) {
+            logger.error(e.getMessage(), e);
+        }
+    }
+......................
+}
+```
+
+**SendErrorFilter**
+
+可以自己写一个controller（**BasicErrorController**），**专门来处理zuul的所有异常报错，继承另外一个controller的基类就可以了，这样的话就可以实现统一的异常处理**
+
+**默认情况下，如果有异常，打印出异常日志，在控制台，将异常信息输出到浏览器中去**
+
+```java
+public class SendErrorFilter extends ZuulFilter {
+..........................
+	@Override
+	public boolean shouldFilter() {
+		RequestContext ctx = RequestContext.getCurrentContext();
+		// only forward to errorPath if it hasn't been forwarded to already
+		return ctx.getThrowable() != null
+				&& !ctx.getBoolean(SEND_ERROR_FILTER_RAN, false);
+	}
+     //之前的pre阶段、route阶段、post阶段，任何一个阶段抛出了异常，都会执行SendErrorFilter
+	@Override
+	public Object run() {
+		try {
+			RequestContext ctx = RequestContext.getCurrentContext();
+			ZuulException exception = findZuulException(ctx.getThrowable());
+			HttpServletRequest request = ctx.getRequest();
+
+			request.setAttribute("javax.servlet.error.status_code", exception.nStatusCode);
+
+			log.warn("Error during filtering", exception);
+			request.setAttribute("javax.servlet.error.exception", exception);
+
+			if (StringUtils.hasText(exception.errorCause)) {
+				request.setAttribute("javax.servlet.error.message", exception.errorCause);
+			}
+			//初始化一个RequestDispatcher去发送请求
+			RequestDispatcher dispatcher = request.getRequestDispatcher(
+					this.errorPath);
+			if (dispatcher != null) {
+				ctx.set(SEND_ERROR_FILTER_RAN, true);
+				if (!ctx.getResponse().isCommitted()) {
+					ctx.setResponseStatusCode(exception.nStatusCode);
+                    //将错误信息发送给对应BasicErrorController
+					dispatcher.forward(request, ctx.getResponse());
+				}
+			}
+		}
+		catch (Exception ex) {
+			ReflectionUtils.rethrowRuntimeException(ex);
+		}
+		return null;
+	}
+..........................
+}
+
+```
+
+对应error过滤器
+
+![image-20210826220026299](Zuul.assets/image-20210826220026299.png)
+
+**PS:对应服务抛出异常并不会进入errorFilter,只是返回了对应的500等状态。需要zuul内部抛出异常才会进入**
+
+下图返回结果为对应服务抛出异常的500状态
+
+![image-20210826221038140](Zuul.assets/image-20210826221038140.png)
