@@ -381,6 +381,10 @@ logging.level.com.zhss.service.ServiceAClient: DEBUG
 
 ![image-20210719204531799](Feign.assets/image-20210719204531799.png)
 
+流程图：https://www.processon.com/view/link/6129ee535653bb2d6d139ad1
+
+思维导图：https://www.processon.com/view/link/612a2f6e079129550eebd430
+
 # 3 spring cloud - feign入口源码探索
 
 ## 3.1 从@EnableFeignClients入手来找一找扫描@FeignClient的入口在哪儿
@@ -3228,19 +3232,19 @@ public class LoadBalancerCommand<T> {
 
 （3）FeignLoadBalancer.execute()方法中，发起请求的超时时间，都是1000毫秒，就是我们设置的
 
-（5）第一次负载均衡就是请求8087端口，很明显出问题了，就是说，请求超时了，1秒钟没有返回结果直接就超时了
+（4）第一次负载均衡就是请求8087端口，很明显出问题了，就是说，请求超时了，1秒钟没有返回结果直接就超时了
 
-（6）超时之后，就会跳入那个LoadBalancerCommand.retryPolicy()的一个方法中，判断是否要进行重试，重试次数是否大于设置的retrySameServer，第一次重试肯定是1=1，不是1>1，RequestSpecificRetryHandler.isRetriableException()，判断当前出现的这个问题，是否需要重试，此时只要你设置了okToRetryOnAllErrors这个参数是true，全部会认为是要进行重试的
+（5）超时之后，就会跳入那个LoadBalancerCommand.retryPolicy()的一个方法中，判断是否要进行重试，重试次数是否大于设置的retrySameServer，第一次重试肯定是1=1，不是1>1，RequestSpecificRetryHandler.isRetriableException()，判断当前出现的这个问题，是否需要重试，此时只要你设置了okToRetryOnAllErrors这个参数是true，全部会认为是要进行重试的
 
-（7）发现直接LoadBalancerCommand自动给你进行重试了，自动执行ServerOperation.call()方法，重试的还是8080这台机器，发现再次超时，又开始判断是否要进行重试，但是此时tryCount是2，trySameServer是1，也就是说我们设置的是最多同一台机器重试1次，但是此时已经到第二次重试了，此时会判断不要再重试这台机器了
+（6）发现直接LoadBalancerCommand自动给你进行重试了，自动执行ServerOperation.call()方法，重试的还是8080这台机器，发现再次超时，又开始判断是否要进行重试，但是此时tryCount是2，trySameServer是1，也就是说我们设置的是最多同一台机器重试1次，但是此时已经到第二次重试了，此时会判断不要再重试这台机器了
 
-（8）直接代码会进到LoadBalancerCommand的判断是否要重试其他机器的代码里，此时会判断是否要重试其他机器，肯定是可以重试其他机器的
+（7）直接代码会进到LoadBalancerCommand的判断是否要重试其他机器的代码里，此时会判断是否要重试其他机器，肯定是可以重试其他机器的
 
-（9）此时又进入了ServerOption.call()方法，为是8088这台机器，此时肯定还是超时，又会去判断是否要重试，retryPolicy()方法中。
+（8）此时又进入了ServerOption.call()方法，为是8088这台机器，此时肯定还是超时，又会去判断是否要重试，retryPolicy()方法中。
 
 **PS:当重试到其他机器的时候，这个时候的其他机器就是当前机器了，就会请求一次，重试一次(最大重试次数为1)。**
 
-（10）然后第三次重试其他机器的时候，就会去重试8089机器了，此时就ok了
+（9）然后第三次重试其他机器的时候，就会去重试8089机器了，此时就ok了
 
 对应服务请求次数日志记录：
 

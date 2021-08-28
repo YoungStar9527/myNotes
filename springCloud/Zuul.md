@@ -352,7 +352,7 @@ zuul:
 
 **5、超时配置**
 
-人zuul也是用的hystrix + ribbon那套东西，所以说，超时这里要考虑hystrix和ribbon的，而且hystrix的超时要考虑ribbon的重试次数和单次超时时间
+zuul也是用的hystrix + ribbon那套东西，所以说，超时这里要考虑hystrix和ribbon的，而且hystrix的超时要考虑ribbon的重试次数和单次超时时间
 
 hystrix的超时时间计算公式如下：
 
@@ -513,6 +513,12 @@ class MyFilter extends ZuulFilter {
 
 先启动网关项目，然后将这个过滤器放到指定目录，过几秒钟就会生效
 
+扩展：
+
+Groovy是Java虚拟机的敏捷和动态语言，以Java语言的优势为基础，添加了从Python、Ruby和Smalltalk等语言中借鉴的特性。提供流行的编程语言特性，学习成本几乎为零。提供静态类型检查的能力，并静态地编译成java字节码，以获得健壮性和性能，与所有现有的Java类和库无缝集成，可以在任何可以使用java的地方使用它。通过其强大的处理原语、OO能力和Ant DSL使编写shell和构建脚本变得容易。在开发Web，GUI，数据库或控制台程序时通过减少框架性的代码大大提高了开发者的效率。支持DSL（Domain Specific Languages领域定义语言）和其它简洁的语法，让代码变得易于阅读和维护。并且支持单元测试，可以简化测试。
+
+原文链接：https://blog.csdn.net/asty9000/article/details/80267984
+
 ### 1.7.4 禁用过滤器
 
 ```yaml
@@ -521,6 +527,8 @@ zuul:
     route:
       disable: true
 ```
+
+
 
 ### 1.7.5 RequestContext
 
