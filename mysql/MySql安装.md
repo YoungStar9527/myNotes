@@ -92,6 +92,8 @@ flush privileges;
  ALTER USER 'root'@'localhost' IDENTIFIED BY 'password' PASSWORD EXPIRE NEVER;   
  #修改加密规则
  #注意如果将root的localhost已经修改为了%，运行相关alter的sql需要将'root'@'localhost' 改成对应的'root'@'%'
+  ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'password'; 
+  #还要更新用户密码
  flush privileges;
 #刷新配置
 ```
