@@ -1156,6 +1156,12 @@ maven默认会从几个地方去读取archetype-catalog.xml的内容：
 
 可以用mvn archetype:crawl来自动化扫描本地仓库中的archetype，然后生成一份archetype-catalog.xml，放在~/.m2/目录下，但是一般不用这种方式。
 
+# 13 一些问题
+
+直接在控制台输入mavne命令打包，jdk默认是用了mavne目录下的setting文件的配置，主要是读取jdk用了这个文件中的配置
+
+(一直以为是c盘用户下的m2的文件，结果就是因为这个文件坑了我好几个月打包jdk都有问题，但是m2配置文件的阿里云配置也有用，难道两个文件都生效，混用？？？)
+
 
 
 
