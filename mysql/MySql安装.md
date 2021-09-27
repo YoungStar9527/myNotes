@@ -98,6 +98,12 @@ flush privileges;
 #刷新配置
 ```
 
+命令行退出
+
+```
+quit;
+```
+
 参考文章：
 
 https://www.cnblogs.com/skyblue123/p/13287028.html?utm_source=tuicool
@@ -107,4 +113,8 @@ https://blog.csdn.net/iiiiiilikangshuai/article/details/100905996
 https://www.cnblogs.com/zhurong/p/9898675.html
 
 https://blog.csdn.net/q258523454/article/details/84555847
+
+# 2 mysql 5.7安装
+
+https://www.cnblogs.com/porotin/p/9045391.html
 
