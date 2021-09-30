@@ -528,3 +528,321 @@ dstat -n
 ​	这个说的就是每秒钟网卡接收到流量有多少b/kb，每秒钟通过网卡发送出去的流量有多少b/kb/mb，通常来说，如果你的机器使用的是千兆网卡，那么每秒钟网卡的总流量也就在100MB左右，甚至更低一些。
 
 ​	所以我们在压测的时候也得观察好网卡的流量情况，如果网卡传输流量已经到了极限值了，那么此时你再怎么提高sysbench线程数量，数据库的QPS也上不去了，因为这台机器每秒钟无法通过网卡传输更多的数据了。
+
+# 3 监控系统工具 - Prometheus和Grafana
+
+## 3.1 如何为生产环境中的数据库部署监控系统
+
+**Prometheus和Grafana简介**
+
+​	Prometheus：是一个监控数据采集和存储系统，他可以利用监控数据采集组件（比如mysql_exporter）从你指定的MySQL数据库中采集他需要的监控数据，然后他自己有一个时序数据库，他会把采集到的监控数据放入自己的时序数据库中，其实本质就是存储在磁盘文件里
+
+​	Grafana：就是一个可视化的监控数据展示系统，他可以把Prometheus采集到的大量的MySQL监控数据展示成各种精美的报表，让我们可以直观的看到MySQL的监控情况
+
+​	**PS:不光是对数据库监控可以采用Prometheus+Grafana的组合，对你开发出来的各种Java系统、中间件系统，都可以使用这套组合去进行可视化的监控，无非就是让Prometheus去采集你的监控数据，然后用Grafana展示成报表而已**
+
+## 3.2 安装和启动Prometheus
+
+**1 首先需要下载3个压缩包**
+
+http://cactifans.hi-www.com/prometheus/
+
+![image-20210930105713769](儒猿MySql专栏.assets/image-20210930105713769.png)
+
+prometheus-2.1.0.linux-amd64.tar.gz   
+
+node_exporter-0.15.2.linux-amd64.tar.gz  
+
+第三个压缩包：mysqld_exporter-0.10.0.linux-amd64.tar.gz
+
+https://github.com/prometheus/mysqld_exporter/releases/download/v0.10.0/mysqld_exporter-0.10.0.linux-amd64.tar.gz
+
+**2 解压对应压缩包**
+
+```shell
+mkdir /data
+mkdir /root
+tar xvf prometheus-2.1.0.linux-amd64.tar -C /data
+tar xf node_exporter-0.15.2.linux-amd64.tar -C /root
+tar xf mysqld_exporter-0.10.0.linux-amd64.tar.gz -C /root
+cd /data
+mv prometheus-2.1.0.linux-amd64/ prometheus
+cd /prometheus
+```
+
+**3 修改prometheus的配置文件**
+
+```yaml
+# my global config
+global:
+  scrape_interval:     15s # Set the scrape interval to every 15 seconds. Default is every 1 minute.
+  evaluation_interval: 15s # Evaluate rules every 15 seconds. The default is every 1 minute.
+  # scrape_timeout is set to the global default (10s).
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+  - static_configs:
+    - targets:
+      # - alertmanager:9093
+
+# Load rules once and periodically evaluate them according to the global 'evaluation_interval'.
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+# A scrape configuration containing exactly one endpoint to scrape:
+# Here it's Prometheus itself.
+scrape_configs:
+  - job_name: 'Host'
+    file_sd_configs:
+    - files:
+      - 'host.yml'
+    metrics_path: /metrics
+    relabel_configs:
+    - source_labels: [__address__]
+      regex: (.*)
+      target_label: instance
+      replacement: $1
+    - source_labels: [__address__]
+      regex: (.*)
+      target_label: __address__
+      replacement: $1:9100
+
+  - job_name: 'MySQL'
+    file_sd_configs:
+    - files:
+        - 'mysql.yml'
+    metrics_path: /metrics
+    relabel_configs:
+    - source_labels: [__address__]
+      regex: (.*)
+      target_label: instance
+      replacement: $1
+    - source_labels: [__address__]
+      regex: (.*)
+      target_label: __address__
+      replacement: $1:9104
+
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+```
+
+**4 /data/prometheus目录中，去执行启动命令**
+
+```shell
+/data/prometheus/prometheus --storage.tsdb.retention=30d &
+```
+
+​	这里的30d是说你的监控数据保留30天的。启动之后，就可以在浏览器中访问9090端口号去查看prometheus的主页了
+
+## 3.3 部署Grafana及相关监控
+
+**1 下载grafana及启动**
+
+```shell
+https://s3-us-west-2.amazonaws.com/grafana-releases/release/grafana-4.6.3.linux-x64.tar.gz
+
+tar xf grafana-4.6.3.linux-x64.tar.gz -C /data/prometheus
+cd /data/prometheus
+mv grafana-4.6.3 grafana
+
+cd /data/prometheus/grafana
+./bin/grafana-server &
+```
+
+接着就完成了grafana的启动，然后可以通过浏览器访问3000端口，默认的用户名和密码是admin/admin
+
+**2 配置grafana数据源**
+
+​	接着在Grafana左侧菜单栏里有一个Data Sources，点击里面的一个按钮是Add data source，就是添加一个数据源。
+
+![image-20210930111021196](儒猿MySql专栏.assets/image-20210930111021196.png)
+
+![image-20210930111038041](儒猿MySql专栏.assets/image-20210930111038041.png)	
+
+​	然后在界面里输入你的数据源的名字是Prometheus，类型是Prometheus，HTTP URL地址是http://127.0.0.1:9090，其他的都用默认的配置就行了，接下来Grafana就会自动从Prometheus里获取监控数据和展示了。
+
+![image-20210930111050889](儒猿MySql专栏.assets/image-20210930111050889.png)
+
+**3 安装Grafana的仪表盘组件**
+
+```shell
+#首先需要下载grafana-dashboards-1.6.1.tar.gz
+wget https://github.com/percona/grafana-dashboards/archive/v1.6.1.tar.gz
+
+#接着执行一系列的命令去安装grafana-dashboard组件
+tar xvf grafana-dashboards-1.6.1.tar.gz
+cd grafana-dashboards-1.6.1
+updatedb
+locate json |grep dashboards/
+
+```
+
+​	这个时候会看到一大堆的json文件，就是各种不同的仪表盘对应的json配置文件
+
+​	你可以把这些json配置文件通过WinSCP之类的工具从linux机器上拖到你的windows电脑上来，因为需要通过浏览器上传他们
+
+​	grafana4.4版本以上不用一个个json的导了,可以直接去它官网找到想要的监控界面的id,然后复制id它会自动加载
+
+**4 上传相关json文件(添加不同维度的仪表盘)**
+
+![image-20210930112009444](儒猿MySql专栏.assets/image-20210930112009444.png)
+
+![image-20210930112024292](儒猿MySql专栏.assets/image-20210930112024292.png)
+
+​	比如机器的CPU使用率的仪表盘，磁盘性能仪表盘，磁盘空间仪表盘，MySQL监控仪表盘，等等。
+
+```shell
+/root/grafana-dashboards-1.6.1/dashboards/CPU_Utilization_Details_Cores.json
+/root/grafana-dashboards-1.6.1/dashboards/Disk_Performance.json
+/root/grafana-dashboards-1.6.1/dashboards/Disk_Space.json
+............
+/root/grafana-dashboards-1.6.1/dashboards/MySQL_InnoDB_Metrics.json
+/root/grafana-dashboards-1.6.1/dashboards/MySQL_InnoDB_Metrics_Advanced.json
+............
+/root/grafana-dashboards-1.6.1/dashboards/MySQL_Overview.json
+/root/grafana-dashboards-1.6.1/dashboards/MySQL_Performance_Schema.json
+............
+/root/grafana-dashboards-1.6.1/dashboards/MySQL_Replication.json
+/root/grafana-dashboards-1.6.1/dashboards/MySQL_Table_Statistics.json
+............
+/root/grafana-dashboards-1.6.1/dashboards/Summary_Dashboard.json
+/root/grafana-dashboards-1.6.1/dashboards/System_Overview.json
+#比如以上这些json文件
+```
+
+**5 添加mysql机器的监控**
+
+​	首先我们如果想要让Prometheus去采集MySQL机器的监控数据（CPU、内存、磁盘、网络，等等），然后让Grafana可以展示出来，那么就必须先添加Prometheus对MySQL机器的监控
+
+```shell
+#在开头3个压缩包那里已经下载了，在这里解压及相关配置
+tar xf node_exporter-0.15.2.linux-amd64.tar
+mv node_exporter-0.15.2.linux-amd64 node_exporter
+cd node_exporter
+nohup ./node_exporter >/dev/null 2>&1 &
+```
+
+在MySQL所在的机器上启动了一个node_exporter了，他就会自动采集这台机器的CPU、磁盘、内存、网络的监控数据
+
+再加入Prometheus对这台机器的监控
+
+​	在/data/prometheus 对应prometheus.yml的同级目录添加 host.yml
+
+```yaml
+- labels:
+    service: test
+  targets:
+  - 127.0.0.1
+
+```
+
+​	Prometheus就会跟MySQL机器上部署的node_exporter进行通信，源源不断的获取到这台机器的监控数据，写入自己的时序数据库中进行存储
+
+解决yml格式问题：https://www.jianshu.com/p/715a614ef5e4
+
+**6 添加MySql数据库的监控**
+
+​	需要在MySQL所在机器上再启动一个mysqld_exporter的组件，他负责去采集MySQL数据库自己的一些监控数据
+
+```shell
+#在开头3个压缩包那里已经下载了，在这里解压及相关配置
+
+tar xf mysqld_exporter-0.10.0.linux-amd64.tar.gz
+
+mv mysqld_exporter-0.10.0.linux-amd64 mysqld_exporter
+```
+
+​	接着需要配置一些环境变量，去设置mysqld_exporter要监控的数据库的地址信息，看下面配置了账号、密码以及地址和端口号
+
+```shell
+#admin:password@(10.10.20.14:3306)
+export DATA_SOURCE_NAME='root:root@(127.0.0.1:3306)/'
+echo "export DATA_SOURCE_NAME='root:root@(127.0.0.1:3306)/'" >> /etc/profile
+```
+
+接着启动mysqld_exporter
+
+```shell
+nohup ./mysqld_exporter --collect.info_schema.innodb_tablespaces --collect.info_schema.innodb_metrics --collect.perf_schema.tableiowaits --collect.perf_schema.indexiowaits --collect.perf_schema.tablelocks --collect.engine_innodb_status --collect.perf_schema.file_events --collect.info_schema.processlist --collect.binlog_size --collect.info_schema.clientstats --collect.perf_schema.eventswaits >/dev/null 2>&1 &
+```
+
+引用解决输出问题：https://blog.csdn.net/jiangyu1013/article/details/81476184
+
+还需要在Prometheus里配置一下他去跟mysqld_exporter通信获取数据以及存储，然后Grafana才能看到对应的报表
+
+```yaml
+#vi /data/prometheus/mysql.yml 对应目录添加mysql.yml
+- labels:
+    service: mysql_test
+  targets:
+  - 127.0.0.1
+```
+
+接着我们在Grafana中就可以看到MySQL的各种监控数据了
+
+![image-20210930140134833](儒猿MySql专栏.assets/image-20210930140134833.png)
+
+引用：https://blog.csdn.net/woqutechteam/article/details/81532092
+
+# 4 buffer pool相关结构
+
+## 4.1回顾一下Buffer Pool在数据库里的地位
+
+![image-20210930164754935](儒猿MySql专栏.assets/image-20210930164754935.png)
+
+​	Buffer Pool就是数据库的一个内存组件，里面缓存了磁盘上的真实数据，然后我们的Java系统对数据库执行的增删改操作，其实就是对这个内存数据结构中的缓存数据执行的
+
+## 4.2 Buffer Pool这个内存数据结构到底长个什么样子
+
+**配置Buffer Pool的大小**
+
+​	Buffer默认为128MB，有一点偏小了，在实际生产环境下可以对Buffer Pool进行调整
+
+在对应my.cnf配置文件修改(文件位置一般在/etc目录下)
+
+数据库如果是16核32G的机器，那么你就可以给Buffer Pool分配个2GB的内存
+
+```
+[server]
+
+innodb_buffer_pool_size = 2147483648
+```
+
+**数据页：MySql中抽象出来的数据单位**
+
+​	1 数据库核心数据模型是表+字段+行的概念
+
+​	2 MySql对数据抽象出来一个数据页的额概念，把很多行数据放在了一个数据页里面
+
+​	3 磁盘文件中会有很多数据页，每个一页数据放了很多行数据
+
+​	4 更新一行数据，数据库会找到这行数据的数据页，然后磁盘文件把这行数据所在的数据页加载到Buffer pool中
+
+​	5 也就是说，Buffer Pool中存放的是一个一个的数据页
+
+**磁盘上的数据页和Buffer Pool的缓存页**
+
+​	1 默认情况，磁盘存放的数据页大小是16kb
+
+​	2 Buffer Pool存放的数据页，通常叫做缓存页
+
+​	3 Buffer Pool默认请情况，一个缓存页的大小和磁盘数据页大小是对应起来的，都是16kb
+
+**缓存页对应的描述信息是什么**
+
+​	1 每一个缓存页，都有对应一个描述信息
+
+​	2 描述信息包含以下以下东西：这个缓存页/数据页所属的表空间、数据页的编号、这个缓存页/数据页在Buffer Pool中的地址等其他信息
+
+​	3 Buffer Pool中的描述数据大概站缓存页的5%左右的大小，也就是800个字节左右
+
+​	4 buffer pool默认大小是128MB,实际上真正大小会超出一些，可能130MB多一些，因为里面还有每个缓存页的描述数据
+
+​	5 在Buffer Pool中，每个缓存页的描述信息放在最前面的位置，然后各个缓存页放在后面
+
+**所以此时我们看下面的图，Buffer Pool实际看起来大概长这个样子**
+
+![image-20210930172643246](儒猿MySql专栏.assets/image-20210930172643246.png)
