@@ -969,6 +969,8 @@ public class Vector<E>
 
 ​	Stack是一种基于数组来实现的栈数据结构
 
+​	Stack是基于Vector实现的，说明Stack也是线程安全的
+
 **队列与栈概述**
 
 ​	栈，先进后出，跟队列的先进先出是不一样
