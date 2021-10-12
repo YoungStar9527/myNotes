@@ -1053,17 +1053,142 @@ class Stack<E> extends Vector<E> {
 
 # 3 HashMap
 
+## 3.1 基本原理及数据结构
+
+**HashMap基本概念：**
+
+​	对应hash表(哈希)相关概念参考-算法图解笔记
+
+​	HashMap基本数据结构是：数组+链表
+
+​	在JDK1.8之后利用红黑树优化了hashmap，在链表达到一定程度时，会用红黑树替换链表
+
+​	JDK 1.8以后，hashmap的数据结构是，数组 + 链表 + 红黑树
+
+**HashMap红黑树相关概念：**
+
+​	（1）红黑树是二叉查找树，左小右大，根据这个规则可以快速查找某个值
+
+​	（2）但是普通的二叉查找树，是有可能出现瘸子的情况，只有一条腿，不平衡了，导致查询性能变成O(n)，线性查询了
+
+​	（3）红黑树，红色和黑色两种节点，有一大堆的条件限制，尽可能保证树是平衡的，不会出现瘸腿的情况
+
+​	（4）如果插入节点的时候破坏了红黑树的规则和平衡，会自动重新平衡，变色（红 <-> 黑），旋转，左旋转，右旋转
+
+​	**PS:链表的查询效率是log(n),JDK 1.8以后，优化了一下，如果一个链表的长度超过了8，就会自动将链表转换为红黑树，查找的性能，是O(logn)，这个性能是比O(n)要高的**
+
+**扩展：fail-fast**
+
+​	简介：fail-fast 机制，即快速失败机制，是java集合(Collection)中的一种错误检测机制。当在迭代集合的过程中该集合在结构上发生改变的时候，就有可能会发生fail-fast，即抛出 ConcurrentModificationException异常。fail-fast机制并不保证在不同步的修改下一定会抛出异常，它只是尽最大努力去抛出，所以这种机制一般仅用于检测bug
+
+引用：https://blog.csdn.net/zymx14/article/details/78394464
 
 
-# 4 LinkedHashMap与TreeMap
 
+![image-20211013062802223](集合、Map等基本数据结构源码剖析.assets/image-20211013062802223.png)
 
+## 3.2 常用方法及源码解析
 
-# 5 Set
+### 3.2.1 核心成员变量的作用分析
 
-# xx 扩展
+```java
+public class HashMap<K,V> extends AbstractMap<K,V>
+    implements Map<K,V>, Cloneable, Serializable {
+............................
+    //数组默认初始大小，16
+    //一般建议初始化的时候自己指定hashmap的大小，避免频繁扩容
+    static final int DEFAULT_INITIAL_CAPACITY = 1 << 4; // aka 16
+    /**
+     * 数组最大容量，
+     * 必须是2次方
+     */
+    static final int MAXIMUM_CAPACITY = 1 << 30;
 
-## x.xhash值与取数组下标（1.8）
+    /**
+     * 默认负载因子 
+     * 如果你在数组里的元素的个数达到了数组大小（16） * 负载因子（0.75f），默认是达到12个元素，就会进行数组的扩容
+     */
+    static final float DEFAULT_LOAD_FACTOR = 0.75f;
+
+    /**
+     *  链表转换为红黑树的默认阈值
+     *  当链表>8的时候，就转换为红黑树
+     */
+    static final int TREEIFY_THRESHOLD = 8;
+    
+    /**
+      * 红黑树转换为链表的默认阈值
+      *  当为红黑树<6的时候，就转换为链表
+      */
+    static final int UNTREEIFY_THRESHOLD = 6;
+
+    /**
+     *  最小树形化容量阈值
+     * 即hashmap的大小至少要>64才会允许将链表转换为红黑树
+     * 否则，若桶内元素太多时，则直接扩容，而不是树形化
+     * 为了避免进行扩容、树形化选择的冲突，这个值不能小于 4 * TREEIFY_THRESHOLD
+     */
+    static final int MIN_TREEIFY_CAPACITY = 64;
+```
+
+​	这是一个很关键的内部类，他其实是代表了一个key-value对，里面包含了key的hash值，key，value，还有就是可以有一个next的指针，指向下一个Node，也就是指向单向链表中的下一个节点
+
+​	通过这个next指针，就可以形成一个链表
+
+```java
+   //hashmap中的链表内部类
+	static class Node<K,V> implements Map.Entry<K,V> {
+        final int hash;
+        final K key;
+        V value;
+        Node<K,V> next;
+
+        Node(int hash, K key, V value, Node<K,V> next) {
+            this.hash = hash;
+            this.key = key;
+            this.value = value;
+            this.next = next;
+        }
+..........................
+    }
+```
+
+引用：https://blog.csdn.net/Junizxr/article/details/92692544
+
+```java
+
+    /**
+     *  map里的核心数据结构的数组，数组的元素就可以看到是Node类型的，天然就可以挂成一个链表，单向链表，Node里面只有一个next指针
+     */
+    transient Node<K,V>[] table;
+
+    /**
+     * 所有值得一个set集合
+     */
+    transient Set<Map.Entry<K,V>> entrySet;
+
+    /**
+     *  这个size代表的是就是当前hashmap中有多少个key-value对，如果这个数量达到了指定大小 * 负载因子，那么就会进行数组的扩容
+     */
+    transient int size;
+
+    /**
+     * 迭代相关
+     */
+    transient int modCount;
+
+    /**
+     *  扩容相关阈值
+     */
+    int threshold;
+
+    /**
+     * 默认就是负载因子，默认的值是0.75f，你也可以自己指定，如果你指定的越大，一般就越是拖慢扩容的速度，一般不要修改
+     */
+    final float loadFactor;
+```
+
+### 3.2.2 取数组下标及对应优化后的hash算法
 
 **根据hash取下标，核心算法在 (n - 1) & hash**
 
@@ -1091,7 +1216,7 @@ class Stack<E> extends Vector<E> {
     }
 ```
 
-得出更为散列的hash值
+得出更为散列的hash值(**扰动函数**)
 
 ```java
     static final int hash(Object key) {
@@ -1106,7 +1231,7 @@ class Stack<E> extends Vector<E> {
 
 
 
-实战应用,参考HashMap的分配数组的方式，将对应值均匀的路由到队列中去
+**实战应用,参考HashMap的分配数组的方式，将对应值均匀的路由到队列中去**
 
 ```java
 	/**
@@ -1135,7 +1260,17 @@ class Stack<E> extends Vector<E> {
 
 https://blog.csdn.net/j1231230/article/details/78072115
 
-https://blog.csdn.net/j1231230/article/details/78072115
+https://www.zhihu.com/question/20733617
 
-中华石杉-亿级流量
+# 4 LinkedHashMap与TreeMap
+
+
+
+# 5 Set
+
+## 
+
+
+
+
 
