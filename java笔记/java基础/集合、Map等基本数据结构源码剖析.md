@@ -1262,6 +1262,117 @@ https://blog.csdn.net/j1231230/article/details/78072115
 
 https://www.zhihu.com/question/20733617
 
+### 3.2.3 put方法源码分析
+
+```java
+.......................
+    public V put(K key, V value) {
+    	//实际上就是调用putVal方法
+    	//第一个参数hash，由hashmap优化后的方法给出hash值
+        return putVal(hash(key), key, value, false, true);
+    }
+...........................
+    /**
+     * Implements Map.put and related methods.
+     *
+     * @param hash hash for key 哈希值
+     * @param key the key 键值
+     * @param value the value to put value值
+     * @param onlyIfAbsent if true, don't change existing value 如果该参数为true。则key值一样时，不覆盖现有值
+     * @param evict if false, the table is in creation mode. 模板方法相关，空方法调用的，没重写的话，无实际意义
+     * @return previous value, or null if none 返回空，或者被覆盖的旧值
+     */
+    final V putVal(int hash, K key, V value, boolean onlyIfAbsent,
+                   boolean evict) {
+    	//初始化数组，链表节点，数组长度，数组下标这几个临时变量
+    	//便于后续使用
+        Node<K,V>[] tab; Node<K,V> p; int n, i;
+    	//如果数组为空，说明hashmap为空
+        if ((tab = table) == null || (n = tab.length) == 0)
+            //为空则进行一次初始化
+            //将初始化之后的 数组、数组长度 都赋给对应临时变量
+            n = (tab = resize()).length;
+    	//如果对应寻址算法，路由到的数组下标没有值(为空)得话
+        if ((p = tab[i = (n - 1) & hash]) == null)
+            //则直接创建新的Node节点，赋值给数组的对应下标
+            tab[i] = newNode(hash, key, value, null);
+        else {
+            //走到这个else,说明hash寻址算法路由到的数组位置不为空，已经存在对应Node了
+            //这里建立新的链表节点，key值 两个临时变量
+            Node<K,V> e; K k;
+            //如果传入的key值和路由到的当前数组下标对应的链表第一个节点的key值相同
+            //简单的说就是传入key和之前的key相同
+            if (p.hash == hash &&
+                ((k = p.key) == key || (key != null && key.equals(k))))
+                //这里将当前链表赋值给对应e这个临时变量
+                //e临时变量的作用就是用于传入的新value覆盖旧value
+                //这里将e赋值，后续会覆盖e这个链表当前节点的value值
+                e = p;
+            //如果当前链表节点p为TreeNode类型
+            else if (p instanceof TreeNode)
+                //这里TreeNode相关逻辑还未研究????????(这里估计就是红黑树，后面看看)
+                e = ((TreeNode<K,V>)p).putTreeVal(this, tab, hash, key, value);
+            else {
+                //走到这个else,说明hash寻址算法路由到的数组位置不为空，已经存在对应Node了
+                //并且对应Node的第一个节点还和传入值的key不同
+                //这里就需要继续遍历当前链表的后续节点了
+                //这里是用for循环遍历链表的，这里没有终止条件，所以用break来中断循环
+                //一般是用while来遍历链表，这里用for应该是可以方便的获取遍历次数，用于判断是否需要链表转红黑树
+                for (int binCount = 0; ; ++binCount) {
+                    //如果链表的next为空，说明已经遍历到链表的尾部了
+                    if ((e = p.next) == null) {
+                        //这里直接根据传入值创建新的节点
+                        //并且放在对应链表的next
+                        p.next = newNode(hash, key, value, null);
+                        //这里如果遍历次数/链表长度>=8-1
+                        if (binCount >= TREEIFY_THRESHOLD - 1) // -1 for 1st
+                            //则将链表转为红黑树
+                            treeifyBin(tab, hash);
+                        break;
+                    }
+                    //如果链表的e节点和传入的key值相等
+                    if (e.hash == hash &&
+                        ((k = e.key) == key || (key != null && key.equals(k))))
+                        //这里就直接break掉，走后续的覆盖逻辑
+                        break;
+                    //这里将临时变量p覆盖为e
+                    //p就是链表遍历的当前节点，e就是p.next的下一个节点
+                    //这里链表遍历用p,e两个节点
+                    p = e;
+                }
+            }
+            //e为空的话，说明对应链表没有key和传入的key相同，且已经创建新节点挂到对应链表的尾部了
+            //e不为空的话，说明找到链表key和传入的key相同
+            if (e != null) { // existing mapping for key
+                //不为空，所以这里走传入值覆盖旧值的逻辑
+                //这里旧值赋给临时变量oldValue，用于返回
+                V oldValue = e.value;
+                //如果允许覆盖或者对应节点的value值为空
+                if (!onlyIfAbsent || oldValue == null)
+                    //这里就将传入的新值覆盖旧值
+                    e.value = value;
+                //这里是空方法，模板方法模式
+                afterNodeAccess(e);
+                //返回旧值
+                return oldValue;
+            }
+        }
+    	//迭代相关计数
+        ++modCount;
+    	//hashmap长度size如果大于阈值
+        if (++size > threshold)
+            //这里则进行扩容
+            resize();
+    	//这里是空方法，模板方法模式
+        afterNodeInsertion(evict)
+        //返回空
+        return null;
+    }
+.....................
+```
+
+
+
 # 4 LinkedHashMap与TreeMap
 
 
