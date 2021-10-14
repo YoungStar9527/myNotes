@@ -1764,8 +1764,9 @@ dataFile.write(cachePage)
 
 3. **充放电的时候不要关闭write back，就是设置一下，锂电池充放电的时候不要把缓存级别从write back修改为write through，这个也是可以做到的，可以和第二个策略配合起来使用**
 
+
 ​	
 ​	
 ​	
 ​	
-​	
+
