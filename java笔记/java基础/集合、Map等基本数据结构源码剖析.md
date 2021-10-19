@@ -1190,7 +1190,21 @@ public class HashMap<K,V> extends AbstractMap<K,V>
 
 ### 3.2.2 取数组下标及对应优化后的hash算法
 
-**根据hash取下标，核心算法在 (n - 1) & hash**
+**取模运算(位运算)->(n - 1) & hash**
+
+​	**1 (n - 1) & hash等价与hash%数组长度的取模运算(n为数组长度，hash是hash值)**
+
+​	2 因为hashmap的数组长度都为2的次方，所以n-1转换为二进制必然全部都是1,16-1的二进制就为 01111
+
+​	**3 然后n-1就作为hash值的低位掩码进行与运算**(&:两个位都是1才是1)
+
+​	**4 hash值和n-1进行了与运算，相当于对hash值得低位进行了截取**(数组-1高位是0，所以与运算后结果高位都是0。数组-1低位都是1，所以就直接截取了hash值得低位，作为结果)
+
+​	5 如果hashmap长度不是2的次方的话，则n-1就不会全部都为1，进行与运算的话，更容易发生hash碰撞了(也可以说，这里的运算就不能等价取模了)
+
+​	6 根据这里的取模(位运算)，也得出，hashmap的数组长度必须为2的次方
+
+**getNode方法，根据hash取下标 **
 
 ```java
     final Node<K,V> getNode(int hash, Object key) {
@@ -1216,20 +1230,41 @@ public class HashMap<K,V> extends AbstractMap<K,V>
     }
 ```
 
-得出更为散列的hash值(**扰动函数**)
+**扰动函数:**
 
 ```java
-    static final int hash(Object key) {
+	/**
+	* 1 hash值为int类型范围为-2147483648到2147483648
+	* 2 因为内存是有限的，不可能有-2147483648到2147483648位的数组，而且map默认长度是16，则需要通过hash值在16的数组内寻址，且尽量避免碰撞
+	* 3 对于hash值得取模运算往往是取低位的最后几位，就算hash函数分布的再松散，只取最后几位的话，还是很容易发生碰撞的
+	* 4 右位移16位，正好是32bit的一半，自己的高半区和低半区做异或，就是为了混合原始哈希码的高位和低位，以此来加大低位的随机性
+	* 5 而且混合后的低位掺杂了高位的部分特征，这样高位的信息也被变相保留下来
+	*/
+	static final int hash(Object key) {
         int h;
+        //将hash值右移16位，然后与哈希值做异或操作
+        //得出的二进制结果，让后16位低位也有了高位的特征
         return (key == null) ? 0 : (h = key.hashCode()) ^ (h >>> 16);
     }
 ```
+
+**优化后的哈希(寻址算法)-整套流程**
+
+​	1 首先hashmap重写了hash方法，改方法也叫"扰动函数"，目的就是让int类型的hash值得低位有部分高位的特征
+
+​	2 然后hash值和数组长度减一 进行与位运算，就是取hash值的低位值，也就是取模
+
+​	3 得出对应数组下标位置
 
 结合hash值和 (n - 1) & hash 的取模算法，可以更为平均的将对应hash数据分布在tab数组的Node节点中
 
 ![image-20210901215039221](集合、Map等基本数据结构源码剖析.assets/image-20210901215039221.png)
 
 
+
+**位掩码**
+
+​	**位掩码（BitMask），是”位（Bit）“和”掩码（Mask）“的组合词。”位“指代着二进制数据当中的二进制位，而”掩码“指的是一串用于与目标数据进行按位操作的二进制数字。组合起来，就是”用一串二进制数字（掩码）去操作另一串二进制数字“的意思。**
 
 **实战应用,参考HashMap的分配数组的方式，将对应值均匀的路由到队列中去**
 
@@ -1308,9 +1343,9 @@ https://www.zhihu.com/question/20733617
                 //e临时变量的作用就是用于传入的新value覆盖旧value
                 //这里将e赋值，后续会覆盖e这个链表当前节点的value值
                 e = p;
-            //如果当前链表节点p为TreeNode类型
+            //如果当前链表节点p为TreeNode类型(红黑树)
             else if (p instanceof TreeNode)
-                //这里TreeNode相关逻辑还未研究????????(这里估计就是红黑树，后面看看)
+                //红黑树相关逻辑
                 e = ((TreeNode<K,V>)p).putTreeVal(this, tab, hash, key, value);
             else {
                 //走到这个else,说明hash寻址算法路由到的数组位置不为空，已经存在对应Node了
@@ -1371,7 +1406,104 @@ https://www.zhihu.com/question/20733617
 .....................
 ```
 
+### 3.2.4 通过引入红黑树来优化hash冲突
 
+**PS:红黑树相关知识参考笔记中的->数据结构之树**
+
+在JDK8，通过引用红黑树来优化链表，在链表长度大于8的时候，将链表转换为红黑树
+
+**为什么这样干呢？**
+
+​	1 因为链表的查找效率为O(n)，如果hash冲突比较多，链表很长的话，查找效率就很低了
+
+​	2 红黑树为自平衡的二叉查找树，高度最多相差1倍，查找效率为O(log n)，数据量越大，效率越高
+
+**为什么链表长度达到8？**
+
+​	因为达到8个元素的时候，概率已经很低了。此时树化，性价比会很高。
+
+​	**既不会因为链表太长(8)导致复杂度加大，也不会因为概率太高导致太多节点树化。**
+
+**为什么数组长度达到64？**
+
+​	应该至少为4 * TREEIFY_THRESHOLD = 32，以避免大小调整和树化阈值之间发生冲突。
+
+**为什么默认的 加载系数/扩容因子/负载因子 (0.75)**
+
+​	一般来说，默认的加载系数(0.75)提供了一个很好的选择时间和空间成本的权衡。较高的数值会降低空间开销，但增加查找成本(反映在大多数 `HashMap`类的操作，包括`get` and `put`)
+
+​	**时间和空间成本的权衡 ==> 决定了扩容因子是0.75 ==> 决定了泊松分布的参数λ是0.5 ==> 计算出泊松分布结果为8时，概率为亿分之六 ==> 决定了树化节点为8.**
+
+```java
+//树结构
+.........................
+    static final class TreeNode<K,V> extends LinkedHashMap.Entry<K,V> {
+        TreeNode<K,V> parent;  // red-black tree links
+        TreeNode<K,V> left;
+        TreeNode<K,V> right;
+        TreeNode<K,V> prev;    // needed to unlink next upon deletion
+        boolean red;
+        TreeNode(int hash, K key, V val, Node<K,V> next) {
+            super(hash, key, val, next);
+        }
+.........................
+```
+
+
+
+```java
+    /**
+     * Replaces all linked nodes in bin at index for given hash unless
+     * table is too small, in which case resizes instead.
+     * 将链表转为红黑树
+     */
+    final void treeifyBin(Node<K,V>[] tab, int hash) {
+        //初始化 数组长度 对应Hash值所在下标 对应Node节点，的临时变量
+        int n, index; Node<K,V> e;
+        //数组为空，或者数组长度小于64，都进行扩容
+        if (tab == null || (n = tab.length) < MIN_TREEIFY_CAPACITY)
+            //进行扩容
+            resize();
+        //找到对应数组位置的节点不为空，并将对应节点赋值给临时变量e
+        else if ((e = tab[index = (n - 1) & hash]) != null) {
+            //初始化两个树节点的临时变量
+            TreeNode<K,V> hd = null, tl = null;
+            do {
+                //根据链表节点e，初始化树节点p
+                //TreeNode的其中一个父类(父的父....)就是链表的Node类
+                TreeNode<K,V> p = replacementTreeNode(e, null);
+                //第一次tl肯定是空
+                if (tl == null)
+                    //为空则将p也就是链表的第一个节点赋值给hd
+                    hd = p;
+                else {
+                    //到这里已经是第二次了及以上了(也可以说是循环的第一次，这里是do while，先do 再循环)
+                    //假设当前是第二次，这里的p就是链表的第二个节点，p.prev也就是上一个指向tl
+                    //此时tl还是第一个，所以这里代码意思就是第二个的prev指向上一个
+                    //以此类推，循环下去，形成链表的引用链
+                    p.prev = tl;
+                    //这里的next来自父类Node的变量
+                    //这里也将tl.next，也就是上一个节点的下一个节点指向当前节点
+                    //以此类推，循环下去，形成双向链表的引用链
+                    tl.next = p;
+                }
+                //每次循环都将临时变量tl指向当前树节点p
+                tl = p;
+            //遍历e节点，也就是链表节点
+            //每次都将e.next赋值给e,直到next为空，节点遍历完成为止
+            } while ((e = e.next) != null);
+            //上面一段代码的while循环完成后，将Node节点e，转换成TreeNode的双向链表引用
+            //这里hd就是对应TreeNode的头结点
+            //如果头结点不为空
+            if ((tab[index] = hd) != null)
+                //则将刚刚转换好的双向链表进行树化
+                //真正树化的过程
+                hd.treeify(tab);
+        }
+    }
+```
+
+引用：https://blog.csdn.net/weixin_43883685/article/details/109809049
 
 # 4 LinkedHashMap与TreeMap
 
