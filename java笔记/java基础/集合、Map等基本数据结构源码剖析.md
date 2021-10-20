@@ -1345,7 +1345,7 @@ https://www.zhihu.com/question/20733617
                 e = p;
             //如果当前链表节点p为TreeNode类型(红黑树)
             else if (p instanceof TreeNode)
-                //红黑树相关逻辑
+                //红黑树相关逻辑,将节点放入红黑树
                 e = ((TreeNode<K,V>)p).putTreeVal(this, tab, hash, key, value);
             else {
                 //走到这个else,说明hash寻址算法路由到的数组位置不为空，已经存在对应Node了
@@ -1503,7 +1503,333 @@ https://www.zhihu.com/question/20733617
     }
 ```
 
+
+
+```java
+    static final class TreeNode<K,V> extends LinkedHashMap.Entry<K,V> 
+    .........................
+        /**
+         * Forms tree of the nodes linked from this node.
+         * 为hashmap内部类TreeNode中的方法，真正将链表转换为红黑树结构的方法
+         */
+        final void treeify(Node<K,V>[] tab) {
+            TreeNode<K,V> root = null;
+        	//遍历已经转换为双向链表结构的节点，将其转换为树结构
+            for (TreeNode<K,V> x = this, next; x != null; x = next) {
+                //每一次都重新指向next，也就是下一个节点
+                next = (TreeNode<K,V>)x.next;
+                //下面一段for循环代码，双向链表转换为红黑树的过程暂时略过
+                x.left = x.right = null;
+                if (root == null) {
+                    x.parent = null;
+                    x.red = false;
+                    root = x;
+                }
+                else {
+                    K k = x.key;
+                    int h = x.hash;
+                    Class<?> kc = null;
+                    for (TreeNode<K,V> p = root;;) {
+                        int dir, ph;
+                        K pk = p.key;
+                        if ((ph = p.hash) > h)
+                            dir = -1;
+                        else if (ph < h)
+                            dir = 1;
+                        else if ((kc == null &&
+                                  (kc = comparableClassFor(k)) == null) ||
+                                 (dir = compareComparables(kc, k, pk)) == 0)
+                            dir = tieBreakOrder(k, pk);
+
+                        TreeNode<K,V> xp = p;
+                        if ((p = (dir <= 0) ? p.left : p.right) == null) {
+                            x.parent = xp;
+                            if (dir <= 0)
+                                xp.left = x;
+                            else
+                                xp.right = x;
+                            root = balanceInsertion(root, x);
+                            break;
+                        }
+                    }
+                }
+            }
+        	//将双向链表转换为红黑树后
+        	//moveRootToFront则将红黑树的根节点root重新挂到对应数组下标的节点上(之前挂的是链表，现在改为把红黑树的root节点挂上去)
+            moveRootToFront(tab, root);
+        }
+    .........................
+```
+
+
+
 引用：https://blog.csdn.net/weixin_43883685/article/details/109809049
+
+
+
+```java
+    static final class TreeNode<K,V> extends LinkedHashMap.Entry<K,V> 
+    .........................
+        /**
+         * Tree version of putVal.
+         */
+        final TreeNode<K,V> putTreeVal(HashMap<K,V> map, Node<K,V>[] tab,
+                                       int h, K k, V v) {
+        //添加值到红黑树中，对应说明..略
+            Class<?> kc = null;
+            boolean searched = false;
+            TreeNode<K,V> root = (parent != null) ? root() : this;
+            for (TreeNode<K,V> p = root;;) {
+                int dir, ph; K pk;
+                if ((ph = p.hash) > h)
+                    dir = -1;
+                else if (ph < h)
+                    dir = 1;
+                else if ((pk = p.key) == k || (k != null && k.equals(pk)))
+                    return p;
+                else if ((kc == null &&
+                          (kc = comparableClassFor(k)) == null) ||
+                         (dir = compareComparables(kc, k, pk)) == 0) {
+                    if (!searched) {
+                        TreeNode<K,V> q, ch;
+                        searched = true;
+                        if (((ch = p.left) != null &&
+                             (q = ch.find(h, k, kc)) != null) ||
+                            ((ch = p.right) != null &&
+                             (q = ch.find(h, k, kc)) != null))
+                            return q;
+                    }
+                    dir = tieBreakOrder(k, pk);
+                }
+
+                TreeNode<K,V> xp = p;
+                if ((p = (dir <= 0) ? p.left : p.right) == null) {
+                    Node<K,V> xpn = xp.next;
+                    TreeNode<K,V> x = map.newTreeNode(h, k, v, xpn);
+                    if (dir <= 0)
+                        xp.left = x;
+                    else
+                        xp.right = x;
+                    xp.next = x;
+                    x.parent = x.prev = xp;
+                    if (xpn != null)
+                        ((TreeNode<K,V>)xpn).prev = x;
+                    moveRootToFront(tab, balanceInsertion(root, x));
+                    return null;
+                }
+            }
+        }
+..................
+```
+
+### 3.2.5 数组扩容及高性能的rehash算法
+
+hashmap扩容的原理
+
+​	1 2倍扩容 + rehash，每个key-value对，都会基于key的hash值重新寻址找到新数组的新的位置 
+
+​	2 本来所有的key的hash，对16取模是一个位置，比如说是index = 5；但是如果对32取模，可能就是index = 11,，位置可能变化	
+
+​	3 以上原理大体上是JDK 1.7以前的原理，现在的话呢，**JDK 1.8以后，都是数组大小是2的n次方扩容(其实也是每次两倍，一样的)，用的是与操作符来实现hash寻址的算法，来进行扩容的时候，rehash**
+
+```java
+    /**
+     * Initializes or doubles table size.  If null, allocates in
+     * accord with initial capacity target held in field threshold.
+     * Otherwise, because we are using power-of-two expansion, the
+     * elements from each bin must either stay at same index, or move
+     * with a power of two offset in the new table.
+     * 数组扩容
+     * @return the table
+     */
+    final Node<K,V>[] resize() {
+        //初始化，临时变量oldTab引用旧数组
+        Node<K,V>[] oldTab = table;
+        //初始化，旧数组长度
+        int oldCap = (oldTab == null) ? 0 : oldTab.length;
+        //初始化，旧阈值，阈值作用就是达到阈值则进行resize操作
+        int oldThr = threshold;
+        //初始化，新长度 新阈值的临时变量
+        int newCap, newThr = 0;
+        //如果旧数组长度大于0
+        if (oldCap > 0) {
+            //如果旧数组长度oldCap >= 数组最大长度( 1<<30 = 1073741824)
+            if (oldCap >= MAXIMUM_CAPACITY) {
+                //阈值直接设置为Integer最大值
+                threshold = Integer.MAX_VALUE;
+                //返回旧数组长度
+                //因为数组太大，做不了扩容，直接返回了
+                return oldTab;
+            }
+            //先给新数组长度赋值，大小为旧数组的两倍
+            //如果旧数组长度oldCap的两倍小于数组最大值，及大于16
+            //这里新数组长度已经赋值了，在if里面。这里if条件判断的是是否更新新阈值
+            else if ((newCap = oldCap << 1) < MAXIMUM_CAPACITY &&
+                     oldCap >= DEFAULT_INITIAL_CAPACITY)
+                //阈值也是旧阈值的两倍
+                newThr = oldThr << 1; // double threshold
+        }
+        //如果旧阈值大于0
+        else if (oldThr > 0) // initial capacity was placed in threshold
+            //走到这里是数组长度<=0，所以将旧阈值赋值给新长度
+            newCap = oldThr;
+        else {               // zero initial threshold signifies using defaults
+            //走到这里是旧阈值以及旧数组长度都<=0
+            //数组长度设为默认长度16
+            newCap = DEFAULT_INITIAL_CAPACITY;
+            //阈值设为16*0.75
+            newThr = (int)(DEFAULT_LOAD_FACTOR * DEFAULT_INITIAL_CAPACITY);
+        }
+        //这里新阈值等于0，要不是 0<数组长度<16,要不就是数组长度<=0且旧阈值oldThr>0,这两种情况，导致新阈值为初始化的值，没有被赋值
+        if (newThr == 0) {
+            //这里ft=新数组长度*负载因子(没设置就是0.75)
+            float ft = (float)newCap * loadFactor;
+            //这里判断下，如果小于数组最大长度，信誉值就为ft也就是（新数组长度*负载因子(没设置就是0.75)）
+            //否则就是Integer的最大值
+            newThr = (newCap < MAXIMUM_CAPACITY && ft < (float)MAXIMUM_CAPACITY ?
+                      (int)ft : Integer.MAX_VALUE);
+        }
+        //这里将阈值threshold成员变量，设置为新阈值
+        threshold = newThr;
+        @SuppressWarnings({"rawtypes","unchecked"})
+        //根据新的数组长度创建新数组
+        Node<K,V>[] newTab = (Node<K,V>[])new Node[newCap];
+        //table成员变量指向新数组
+        table = newTab;
+        //这里判断下，如果旧数组不为空
+        if (oldTab != null) {
+            //旧数组不为空，则将旧数组的数据迁移到新数组
+            //遍历旧数组
+            for (int j = 0; j < oldCap; ++j) {
+                //初始化临时变量，链表Node节点e
+                Node<K,V> e;
+                //将当前节点赋值给变量e,如果数组当前节点不为空则进入if
+                if ((e = oldTab[j]) != null) {
+                    //先将旧数组对应引用置为空
+                    oldTab[j] = null;
+                    //如果e.next为空，说明链表只有一个节点
+                    if (e.next == null)
+                        //直接通过hash取模找到对应新数组的下标位置，并赋值
+                        newTab[e.hash & (newCap - 1)] = e;
+                    //如果对应节点为红黑树
+                    else if (e instanceof TreeNode)
+                        //红黑树相关逻辑暂时略过
+                        ((TreeNode<K,V>)e).split(this, newTab, j, oldCap);
+                    else { // preserve order
+                        //走到这里说明对应节点的链表至少一个以上
+                        //初始化低位链表节点临时变量
+                        Node<K,V> loHead = null, loTail = null;
+                        //初始化低位链表节点临时变量
+                        Node<K,V> hiHead = null, hiTail = null;
+                        //初始化临时变量next用于链表遍历
+                        Node<K,V> next;
+                        do {
+                            //next指向e.next，下一个节点，配合while条件，来遍历链表
+                            next = e.next;
+                            //这里是最核心的代码，通过该判断条件，可以将链表分割为还在原有数组位置的低位链表
+                            //oldCap(旧数组长度)+原数组位置下标 的高位链表
+                            //原数组链表分割为 低位链表 及 高位链表两部分
+                            if ((e.hash & oldCap) == 0) {
+                                //如果低位链表尾结点为空,说明低位链表为空，第一次进这个if
+                                if (loTail == null)
+                                    //将当前链表节点赋值给低位链表的头结点
+                                    loHead = e;
+                                else
+                                    //这里至少是第二次及以上进入低位链表的if
+                                    //低位链表的尾结点的next指向当前节点e
+                                    //低位链表的尾结点只是临时变量的称呼
+                                    //实际上loHead及loTail都是指向同一个链表的内存地址
+                                    //loTail一直在更新临时变量的指向，而loHead的指针是没有变的
+                                    //所以loTail.next实际上就是低位链表的next执行了当前节点e,一直遍历给低位链表next赋值
+                                    //这里loTail还是之前的节点，之前的节点指向当前节点e
+                                    loTail.next = e;
+                                //更新临时变量低位链表的尾结点的指针，指向当前节点e,循环遍历
+                                //这里会导致每次loTail.next和loTail都指向同一个节点，让人感到迷惑
+                                //实际上loTail.next是低位链表的引用，而loTail是临时变量
+                                //临时变量是用来帮助遍历的，loTail.next才是重要的链表指针指向
+                                //这里更新之前的节点位置更新为当前节点
+                                //这里loTail每次都是最新节点，所以loTail叫做尾结点没毛病，结束循环后loTail指向的e必然是低位链表尾结点
+                                loTail = e;
+                            }
+                            else {
+                                //这里是高位链表
+                                //同低位链表的遍历逻辑，将原链表的节点指针更新到高位链表
+                                if (hiTail == null)
+                                    hiHead = e;
+                                else
+                                    hiTail.next = e;
+                                hiTail = e;
+                            }
+                         //当前节点e重新指向next，如果为空则跳出循环
+                       	 //其实链表还是那个链表，内存地址没有改变
+                         //该循环的作用就是通过改变原链表指针的互相引用，将原来的链表分为两部分，低位链表和高位链表
+                        } while ((e = next) != null);
+                        //如果低位链表不为空
+                        if (loTail != null) {
+                            //这里其实就是将低位链表和高位链表分开
+                            //低位链表和高位链表本来就是一个链表的指针
+                            //loTail.next不一定有值，有值得话，必然是高位链表的某一个节点
+                            //所以将loTail.next引用置为空，低位链表和高位链表就断开了
+                            //当然表象是低位链表的尾结点的next置为空
+                            loTail.next = null;
+                            //低位链表放在原数组下标位置
+                            newTab[j] = loHead;
+                        }
+                        //如果高位链表不为空
+                        if (hiTail != null) {
+                            //这里也是同理
+                            //将低位链表和高位链表分开
+                            //表象是高位链表的尾结点的next置为空
+                            hiTail.next = null;
+                            //高位数组放在原数组下标+元素组长度的位置
+                            newTab[j + oldCap] = hiHead;
+                        }
+                    }
+                }
+            }
+        }
+        //返回新数组
+        return newTab;
+    }
+```
+
+ **if ((e.hash & oldCap) == 0) 详解**
+
+​	1 该代码为数组扩容最精华最核心的代码，高性能rehash算法
+
+​	2 可以将链表分割为还在原有数组位置的低位链表，和 oldCap(旧数组长度)+原数组位置下标 的高位链表，两部分
+
+​	3 因为oldCap(旧数组长度)，一定为2的次方，所以转换为二进制为01000(这里是举例，2的次方转换为二进制就只有一个1，其他位肯定都是0)
+
+​	4 所以e.hash & oldCap，hash值与oldCap进行与运算，那么只有hash值与oldCap唯一是1的那一位都为1，结果才为1，否则就是0
+
+​	旧数组			新数组		旧数组		新数组	
+
+​	01000			10000		01000		10000		(数组长度)
+
+​	00111			 01111		00111		 01111		(数组长度-1)
+
+​	比对为0		比对为0	比对不为0	比对不为0
+
+​	10100			10100		01101		01101		(hash值低位)
+
+​	00100			00100		00101		01101   (数组长度-1和hash值低位进行与运算也就是取模的结果)
+
+​	**通过以上比对，得出结论，当e.hash & oldCap，hash值与oldCap进行与运算的结果为0的时候，hash值对oldCap和oldCap*2(也就是新数组)的取模结果是一样的。**
+
+​	**而hash值与oldCap进行与运算的结果不为0，为1的时候，hash值对oldCap*2(也就是新数组)的取模结果为 oldCap(旧数组长度)+原数组位置下标**
+
+​	**PS:说白了，对应hash值在旧数组的为1的位置是0的时候，hash值需要和新数组扩容后-1高位多了个1对比的那个位置为0。导致新数组扩容与hash值对比的话，高位为1为0的结果都是0，所以寻址下标没有改变。若对比的那个位置为1的话，相当于新数组高位多了个1，对于二进制来说就是加上了原有数组的长度，其他没变。**
+
+引用：https://blog.csdn.net/u010425839/article/details/106620440/
+
+​	https://blog.csdn.net/u013494765/article/details/77837338?spm=1001.2101.3001.6650.1&utm_medium=distribute.pc_relevant.none-task-blog-2%7Edefault%7ECTRLIST%7Edefault-1.no_search_link&depth_1-utm_source=distribute.pc_relevant.none-task-blog-2%7Edefault%7ECTRLIST%7Edefault-1.no_search_link
+
+​	**rehash算法的好处：**
+
+​		1 只需要遍历一次链表就能拆分低位和高位两个链表，分别放在对应位置
+
+​		2 如果是遍历链表重新进行hash寻址的话(取模)，还需要创建新链表节点，每次都再遍历，再挂在后面，效率相对较低，而且麻烦
 
 # 4 LinkedHashMap与TreeMap
 
