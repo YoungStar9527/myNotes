@@ -1207,7 +1207,12 @@ public class HashMap<K,V> extends AbstractMap<K,V>
 **getNode方法，根据hash取下标 **
 
 ```java
-    final Node<K,V> getNode(int hash, Object key) {
+    public V get(Object key) {
+        Node<K,V> e;
+        return (e = getNode(hash(key), key)) == null ? null : e.value;
+    }
+	
+	final Node<K,V> getNode(int hash, Object key) {
         Node<K,V>[] tab; Node<K,V> first, e; int n; K k;
         //(n - 1) & hash就是取Node<K,V>[] tab数组的下标
         //Node为链表，tab就是为数组链表的数据结构
@@ -1624,13 +1629,74 @@ https://www.zhihu.com/question/20733617
 
 ### 3.2.5 数组扩容及高性能的rehash算法
 
-hashmap扩容的原理
+**hashmap扩容的原理**
 
 ​	1 2倍扩容 + rehash，每个key-value对，都会基于key的hash值重新寻址找到新数组的新的位置 
 
 ​	2 本来所有的key的hash，对16取模是一个位置，比如说是index = 5；但是如果对32取模，可能就是index = 11,，位置可能变化	
 
 ​	3 以上原理大体上是JDK 1.7以前的原理，现在的话呢，**JDK 1.8以后，都是数组大小是2的n次方扩容(其实也是每次两倍，一样的)，用的是与操作符来实现hash寻址的算法，来进行扩容的时候，rehash**
+
+**PS:关于 |= 运算符：|= 运算符和 += 这一类的运算符一样，拆解开就是 a = a | b；**
+
+**生成hashmap数组长度原理**
+
+```java
+/**
+ * Returns a power of two size for the given target capacity.
+ * @param cap 传入自定义的hashmap长度
+ * 该方法的作用就是找到大于或等于自定义map长度最近的2的n次方的长度，并返回
+ */
+static final int tableSizeFor(int cap) {
+    int n = cap - 1;
+    n |= n >>> 1;
+    n |= n >>> 2;
+    n |= n >>> 4;
+    n |= n >>> 8;
+    n |= n >>> 16;
+    return (n < 0) ? 1 : (n >= MAXIMUM_CAPACITY) ? MAXIMUM_CAPACITY : n + 1;
+}
+```
+
+位运算说明
+
+样例：cap=6,n=6-1=5
+
+0000000000000000000000000000101  n =5
+
+0000000000000000000000000000010 n >>1(右移一位)
+
+0000000000000000000000000000111  n |= n >>> 1(n与右移一位进行或运算的结果)
+
+0000000000000000000000000000001 n >>2(右移两位)
+
+0000000000000000000000000000111  n |= n >>> 2(n之前运算的结果与现在右移两位的结果)
+
+0000000000000000000000000000000  n >>> 4(右移4位)
+
+.........................以此类推
+
+根据上面样例可以得出说明:
+
+​	1 经过多次右移后最后右移的位数为31位
+
+​	2 每次右移一定位数，将高位与低位进行或运算
+
+​	3 最后肯定会生成从最高位(最高为1的位数)开始到后面都为1的结果
+
+​	最高位(最高为1的位数)开始到后面都为1的结果也就是 1111(这里肯定都是1，具体几个1就看大小了)，再+1的话就是 10000正好为2的次方，也就是**大于输入参数且最近的2的整数次幂的数**
+
+现在回来看看第一条语句：
+
+```
+int n = cap - 1;
+```
+
+　　让cap-1再赋值给n的目的是另找到的目标值大于或**等于**原值。例如二进制1000，十进制数值为8。如果不对它减1而直接操作，将得到答案10000，即16。显然不是结果。减1后二进制为111，再进行操作则会得到原来的数值1000，即8。
+
+引用：https://www.cnblogs.com/loading4/p/6239441.html
+
+**数组扩容原理**
 
 ```java
     /**
@@ -1830,6 +1896,157 @@ hashmap扩容的原理
 ​		1 只需要遍历一次链表就能拆分低位和高位两个链表，分别放在对应位置
 
 ​		2 如果是遍历链表重新进行hash寻址的话(取模)，还需要创建新链表节点，每次都再遍历，再挂在后面，效率相对较低，而且麻烦
+
+### 3.2.6 get与remove源码分析
+
+get方法
+
+```java
+  	
+	public V get(Object key) {
+        Node<K,V> e;
+        //根据优化后的hash，寻找对应数组位置节点，找到value值并返回
+        return (e = getNode(hash(key), key)) == null ? null : e.value;
+    }
+	
+	//核心是getNode方法，通过优化后的hash值及key寻址对应节点
+	final Node<K,V> getNode(int hash, Object key) {
+        Node<K,V>[] tab; Node<K,V> first, e; int n; K k;
+        //(n - 1) & hash就是取Node<K,V>[] tab数组的下标
+        //Node为链表，tab就是为数组链表的数据结构
+        //如果数组不为空，数组长度大于0，对应hash值所在的数组节点不为空
+        if ((tab = table) != null && (n = tab.length) > 0 &&
+            (first = tab[(n - 1) & hash]) != null) {
+            //对应数组的链表第一个节点key就找到了，直接返回
+            //这里的代码意思就是判断key是否为同一个Key
+            if (first.hash == hash && // always check first node
+                ((k = first.key) == key || (key != null && key.equals(k))))
+                return first;
+            //判断下链表的下一个节点不为空
+            if ((e = first.next) != null) {
+                //走到这里说明对应链表第一个不是，且链表有1个以上的值，需要继续往下找
+                //如果为红黑树的话，则进入红黑树相关方法寻找对应节点
+                if (first instanceof TreeNode)
+                    return ((TreeNode<K,V>)first).getTreeNode(hash, key);
+                do {
+                    //不是红黑树，则进行链表遍历，直到找到对应链表节点的key
+                    if (e.hash == hash &&
+                        ((k = e.key) == key || (key != null && key.equals(k))))
+                        return e;
+                } while ((e = e.next) != null);
+            }
+        }
+        //如果找不到，说明hashmap中没有这个key，直接返回null
+        return null;
+    }
+```
+
+remove方法
+
+​	如果链表已经转换为红黑树结构的话，删除是较为复杂的，牵扯到变色旋转等一些情况的处理
+
+```java
+    /**
+     * Removes the mapping for the specified key from this map if present.
+     *
+     * @param  key key whose mapping is to be removed from the map
+     * @return the previous value associated with <tt>key</tt>, or
+     *         <tt>null</tt> if there was no mapping for <tt>key</tt>.
+     *         (A <tt>null</tt> return can also indicate that the map
+     *         previously associated <tt>null</tt> with <tt>key</tt>.)
+     */
+    public V remove(Object key) {
+        Node<K,V> e;
+        //删除的话实际上是调用removeNode方法
+        return (e = removeNode(hash(key), key, null, false, true)) == null ?
+            null : e.value;
+    }
+
+    /**
+     * Implements Map.remove and related methods.
+     *
+     * @param hash hash for key 优化后的hash值
+     * @param key the key 对应删除的key
+     * @param value the value to match if matchValue, else ignored
+     * @param matchValue if true only remove if value is equal
+     * @param movable if false do not move other nodes while removing
+     * @return the node, or null if none
+     */
+    final Node<K,V> removeNode(int hash, Object key, Object value,
+                               boolean matchValue, boolean movable) {
+        //初始化 数组 链表节点p 数组长度 数组下标  这几个临时变量
+        Node<K,V>[] tab; Node<K,V> p; int n, index;
+        //这里判断下，数组及对应寻址的节点不为空
+        //并且给 数组 数组长度 链表节点p 赋值
+        if ((tab = table) != null && (n = tab.length) > 0 &&
+            (p = tab[index = (n - 1) & hash]) != null) {
+            //初始化链表节点Node Key value 几个临时变量
+            Node<K,V> node = null, e; K k; V v;
+            //如果要删除的key就是对应链表节点的第一个节点的时候
+            if (p.hash == hash &&
+                ((k = p.key) == key || (key != null && key.equals(k))))
+                //将临时变量node指向链表节点p
+                node = p;
+            //如果链表节点p.next不为空
+			//并且给链表节点e赋值p.next
+            else if ((e = p.next) != null) {
+                //走到这里说明要删除的元素不是对应链表节点的一个元素，且链表长度大于1
+                //判断下如果是红黑树
+                if (p instanceof TreeNode)
+                    //这里走红黑树的逻辑，将临时变量node指向返回的红黑树节点
+                    node = ((TreeNode<K,V>)p).getTreeNode(hash, key);
+                else {
+                    //这里走链表遍历的逻辑
+                    do {
+                        //如果当前e就是需要删除的节点
+                        if (e.hash == hash &&
+                            ((k = e.key) == key ||
+                             (key != null && key.equals(k)))) {
+                            //将临时变量node指向e节点,并跳出循环
+                            node = e;
+                            break;
+                        }
+                        //这里也更新节点p的指针
+                        //如果找到e就是要删除的节点,p就为e/node在链表位置的的上一个节点
+                        //如果没找到要删除的节点，p就是链表的最后一个节点
+                        p = e;
+                        //利用e来作为更新链表节点的临时变量，遍历链表e每次都更新指向next
+                    } while ((e = e.next) != null);
+                }
+            }
+            //这里判断下如果要删除的节点不为空，也就是说找到了要删除的节点
+            if (node != null && (!matchValue || (v = node.value) == value ||
+                                 (value != null && value.equals(v)))) {
+                //如果该节点为红黑树，则走红黑树删除的逻辑
+                //这里是hashmap源码中最复杂的逻辑，红黑树的删除
+                if (node instanceof TreeNode)
+                    ((TreeNode<K,V>)node).removeTreeNode(this, tab, movable);
+                //如果node等于p说明要删除的节点就是链表的第一个节点
+                else if (node == p)
+                    //这里直接更新对应数组的指针，执行node.next
+                    //跳过node要删除的节点，如果没有地方引用删除的节点的话，gc会去回收
+                    tab[index] = node.next;
+                else
+                    //根据上文，如果在链表中找到到e就是要删除的节点,p就为e/node在链表位置的的上一个节点
+                    //那么p.next直接就指向node.next，就跳过了要删除的节点node
+                    //如果没有地方引用删除的节点的话，gc会去回收
+                    p.next = node.next;
+                //更新操作次数
+                ++modCount;
+                //map长度-1
+                --size;
+                //模板方法模式，空方法
+                afterNodeRemoval(nod);
+                //返回要删除的节点
+                return node;
+            }
+        }
+        //返回空说明，需要删除的key在map中没有
+        return null;
+    }
+```
+
+
 
 # 4 LinkedHashMap与TreeMap
 
