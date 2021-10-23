@@ -2046,17 +2046,509 @@ remove方法
     }
 ```
 
+### 3.2.7 迭代相关
+
+还有lambda及迭代器这里就不做扩展了
+
+HashMap内部有entrySet及keySet两个方法来提供循环迭代，一般是用foreach来进行遍历的
+
+```java
+..................
+   transient Set<Map.Entry<K,V>> entrySet;
+..................
+    transient Set<K>        keySet;
+..................
+    //entrySet在hashMap中只有这里进行赋值了，所以返回的就是EntrySet的实例
+    public Set<Map.Entry<K,V>> entrySet() {
+        Set<Map.Entry<K,V>> es;
+        return (es = entrySet) == null ? (entrySet = new EntrySet()) : es;
+    }
+..................
+    //同理keySet也只有在这里进行赋值了，所以这里返回的就是KeySet实例
+    public Set<K> keySet() {
+        Set<K> ks = keySet;
+        if (ks == null) {
+            ks = new KeySet();
+            keySet = ks;
+        }
+        return ks;
+    }
+..................
+```
+
+可见KeySet实现了迭代器的foreach循环
+
+```java
+    final class KeySet extends AbstractSet<K> {
+        public final int size()                 { return size; }
+        public final void clear()               { HashMap.this.clear(); }
+        public final Iterator<K> iterator()     { return new KeyIterator(); }
+        public final boolean contains(Object o) { return containsKey(o); }
+        public final boolean remove(Object key) {
+            return removeNode(hash(key), key, null, false, true) != null;
+        }
+        public final Spliterator<K> spliterator() {
+            return new KeySpliterator<>(HashMap.this, 0, -1, 0, 0);
+        }
+        public final void forEach(Consumer<? super K> action) {
+            Node<K,V>[] tab;
+            if (action == null)
+                throw new NullPointerException();
+            //在内部实际上就是将数组链表中的key值拿出来遍历
+            if (size > 0 && (tab = table) != null) {
+                int mc = modCount;
+                for (int i = 0; i < tab.length; ++i) {
+                    for (Node<K,V> e = tab[i]; e != null; e = e.next)
+                        action.accept(e.key);
+                }
+                if (modCount != mc)
+                    throw new ConcurrentModificationException();
+            }
+        }
+    }
+```
+
+可见EntrySet实现了迭代器的foreach循环
+
+```java
+    final class EntrySet extends AbstractSet<Map.Entry<K,V>> {
+        public final int size()                 { return size; }
+        public final void clear()               { HashMap.this.clear(); }
+        public final Iterator<Map.Entry<K,V>> iterator() {
+            return new EntryIterator();
+        }
+        public final boolean contains(Object o) {
+            if (!(o instanceof Map.Entry))
+                return false;
+            Map.Entry<?,?> e = (Map.Entry<?,?>) o;
+            Object key = e.getKey();
+            Node<K,V> candidate = getNode(hash(key), key);
+            return candidate != null && candidate.equals(e);
+        }
+        public final boolean remove(Object o) {
+            if (o instanceof Map.Entry) {
+                Map.Entry<?,?> e = (Map.Entry<?,?>) o;
+                Object key = e.getKey();
+                Object value = e.getValue();
+                return removeNode(hash(key), key, value, true, true) != null;
+            }
+            return false;
+        }
+        public final Spliterator<Map.Entry<K,V>> spliterator() {
+            return new EntrySpliterator<>(HashMap.this, 0, -1, 0, 0);
+        }
+        public final void forEach(Consumer<? super Map.Entry<K,V>> action) {
+            Node<K,V>[] tab;
+            if (action == null)
+                throw new NullPointerException();
+            if (size > 0 && (tab = table) != null) {
+                int mc = modCount;
+                 //在内部实际上就是将数组链表中的node节点拿出来遍历(都实现了Map.Entry接口，getKey/value)
+                for (int i = 0; i < tab.length; ++i) {
+                    for (Node<K,V> e = tab[i]; e != null; e = e.next)
+                        action.accept(e);
+                }
+                if (modCount != mc)
+                    throw new ConcurrentModificationException();
+            }
+        }
+    }
+```
+
 
 
 # 4 LinkedHashMap与TreeMap
 
+## 4.1 LinkedHashMap
+
+**概述：**
+
+​	1 LinkedHashMap，他会记录你插入key-value的顺序， 如果你在遍历的时候，他是按照插入key-value对的顺序给你遍历出来的
+
+​	2 LinkedHashMap其实原则上来说一些基本的原理和操作跟HashMap是差不多的，唯一主要的区别就是你在插入、覆盖、删除，他会记录一下key-value对的顺序，用一个链表来记录，在遍历的时候，就可以按照这个顺序来遍历
+
+​	3 可以通过指向accessOrder为true,来实现LRU
+
+​	4 覆盖插入不混影响顺序，还是之前的位置覆盖
+
+**LinkedHashMap和TreeMap的区别：**
+
+​	1 他们都可以维持key的顺序，只是LinkedHashMap底层是基于链表来实现的，TreeMap是基于红黑树来实现顺序的
+
+**对应源码解析：**
+
+LinedHashMap核心变量及构造
+
+```java
+public class LinkedHashMap<K,V>
+    extends HashMap<K,V>
+    implements Map<K,V>
+	
+    //核心链表内部类，就是靠这个链表来维护遍历顺序的
+    //继承了Hashmap的Node节点
+    static class Entry<K,V> extends HashMap.Node<K,V> {
+        //内部维护了before after来实现链表的顺序
+        Entry<K,V> before, after;
+        //主要就是多了before after来实现顺序
+        Entry(int hash, K key, V value, Node<K,V> next) {
+        	//实际上还是利用父类的Node    
+            super(hash, key, value, next);
+        }
+    }
+	//指向内部顺序链表头结点
+    transient LinkedHashMap.Entry<K,V> head;
+
+	//指向内部顺序链表尾结点
+    transient LinkedHashMap.Entry<K,V> tail;
+	
+	//核心参数，默认false
+	//是否允许get对应key的时候改变链表顺序
+    final boolean accessOrder;
+	
+
+	//这里是无参构造，其他有参构造就不一一列举了
+	//核心逻辑是一样的，都是调用父类HashMap的构造，然后设置相关参数
+    public LinkedHashMap() {
+        super();
+        accessOrder = false;
+    }
+
+	//该构造可以指定accessOrder的参数
+	//如果accessOrder设置为true的话，get也会影响链表排序，可以用来实现LRU
+    public LinkedHashMap(int initialCapacity,
+                         float loadFactor,
+                         boolean accessOrder) {
+        super(initialCapacity, loadFactor);
+        this.accessOrder = accessOrder;
+    }
+```
+
+LinedHashMap的核心就是HashMap中模板方法模式，给子类实现的几个空方法及重写的newNode方法，如下
+
+```java
+public class LinkedHashMap<K,V>
+    extends HashMap<K,V>
+    implements Map<K,V>
+...................
+    //这里是重写hashmap新建节点的方法，每次新建节点，都放在链表顺序的最后一位
+   Node<K,V> newNode(int hash, K key, V value, Node<K,V> e) {
+    	//创建对应Node节点
+        LinkedHashMap.Entry<K,V> p =
+            new LinkedHashMap.Entry<K,V>(hash, key, value, e);
+    	//维护顺序链表的方法
+        linkNodeLast(p);
+        return p;
+    }
+...................
+    //将新增节点p添加到顺序链表的最后
+    private void linkNodeLast(LinkedHashMap.Entry<K,V> p) {
+    	//last临时变量指向尾结点，保存尾结点指针
+        LinkedHashMap.Entry<K,V> last = tail;
+    	//尾结点指向当前新增的节点
+        tail = p;
+    	//如果之前的尾结点为空，说明map为空
+        if (last == null)
+            //直接头结点指向新增节点
+            head = p;
+        else {
+            //新增节点p.before指向之前尾结点
+            p.before = last;
+            //之前尾结点last.after指向新增节点
+            last.after = p;
+        }
+    }
+...................
+```
+
+HashMap中模板方法模式，给子类实现的几个空方法
+
+```java
+public class LinkedHashMap<K,V>
+    extends HashMap<K,V>
+    implements Map<K,V>
+    
+...................
+    //这是在hashmap的remove方法最后，确认删除的时候回调的方法
+   void afterNodeRemoval(Node<K,V> e) { // unlink
+    	//初始化被删除节点的几个临时变量
+        LinkedHashMap.Entry<K,V> p =
+            (LinkedHashMap.Entry<K,V>)e, b = p.before, a = p.after;
+    	//将被删除节点的before after的指针置为空
+        p.before = p.after = null;
+    	//如果b也是p.before为空的话，说明当前节点的位置在第一位
+        if (b == null)
+            //这里直接将头指针指向a，也就是p.after，跳过删除节点
+            head = a;
+        else
+            //说明当前节点的位置大于第一位
+            //b.after也就是删除节点e的上一个节点的after，指向a也就是p.after
+            //直接跳过删除节点
+            b.after = a;
+    	//如果a也就是p.after为空，说明当前节点位置在最后一位
+        if (a == null)
+            //tail尾指针指向b(p.before)
+            //直接跳过删除节点,指向删除的节点的before
+            tail = b;
+        else
+            //a.before也就是p.after的before，指向了b也就是p.before
+            //也就是删除节点的下一个节点的上一个节点跳过删除节点，直接指向删除节点的before
+            a.before = b;
+    }
+...................
+    //这里evict一般都是true
+    //在put最后会调用次方法
+    //那么removeEldestEntry这个方法有什么用呢，看名字可以知道是删除最久远的节点，也就是head节点，这个方法实际是给我们自己扩展的。默认是没有用的，接下来实现LRU的代码中将可以看到它的作用。
+    void afterNodeInsertion(boolean evict) { // possibly remove eldest
+        LinkedHashMap.Entry<K,V> first;
+    	//removeEldestEntry(first)方法直接写死返回false，所以该方法默认情况什么都不会干
+        if (evict && (first = head) != null && removeEldestEntry(first)) {
+            K key = first.key;
+            removeNode(hash(key), key, null, false, true);
+        }
+    }
+...................
+    //该方法是如果assessOrder设置为true后，get访问改变顺序的核心方法
+    //在get及put覆盖value的情况会调用此方法
+    void afterNodeAccess(Node<K,V> e) { // move node to last
+        LinkedHashMap.Entry<K,V> last;
+    	//前提是assessOrder为true，且需要改变顺序的节点不为尾结点
+        if (accessOrder && (last = tail) != e) {
+            //初始化需要改变顺序节点的几个临时变量
+            LinkedHashMap.Entry<K,V> p =
+                (LinkedHashMap.Entry<K,V>)e, b = p.before, a = p.after;
+            //这里将p.after指针置为空，因为p需要放到链表的尾结点after指针就不需要了
+            //下面一段代码会将p的前后节点，在不同情况都跳过p节点，然后再将p节点放到链表的尾部
+            p.after = null;
+            //b(p.before)为空，说明p在第一位
+            if (b == null)
+                //头指针指向a(p.after)
+                //头指针引用跳过p
+                head = a;
+            else
+                //b(p.before).after指向a(p.after)
+                //p的上一个节点的引用跳过p
+                b.after = a;
+            //a(p.after)不为空
+            if (a != null)
+                //a(p.after).before指向b(p.before)
+                //p的下一个节点的引用跳过p
+                a.before = b;
+            else
+                //如果a(p.after)为空，说明p在最后一位
+                //b(p.before)，尾指针的引用跳过p
+                last = b;
+            //如果尾指针为空，说明map只有一个节点
+            if (last == null)
+                //这里改变顺序没意义，直接头节点指向p
+                head = p;
+            else {
+                //尾指针不为空，说明map至少有1个以上的节点
+			   //p.before指向之前的尾结点
+                p.before = last;
+                //last.after之前的尾结点的after执行p
+                last.after = p;
+                //这里相当于把p放到了链表最后一位
+            }
+            //尾结点指向p
+            tail = p;
+            //操作次数加一
+            ++modCount;
+        }
+    }
+...................
+```
+
+利用LinkedHashMap实现LRU
+
+```java
+class LRUCache extends LinkedHashMap {
+
+    //LRU长度限制，如果超过该长度就清理LRUCache
+    private int capacity;
+
+    public LRUCache(int capacity) {
+        //直接将accessOrder为true
+        super(capacity, 0.75F, true);
+        this.capacity = capacity;
+    }
+
+    //这里实际上是调用父类的get，改get作用就是为空的时候返回默认值-1,其他都是正常逻辑
+    public int get(int key) {
+        return (int)super.getOrDefault(key, -1);
+    }
+	
+    //调用父类
+    public void put(int key, int value) {
+        super.put(key, value);
+    }
+
+    //这个方法就是上面afterNodeInsertion方法中，写死返回false的方法
+    //这里重写了removeEldestEntry方法，然后removeEldestEntry方法在afterNodeInsertion中被调用
+    //如果这个方法返回真，那么就会删除head指向的节点。
+    //根据每次get的节点都会放到尾部的特性，所以head指向的节点就是最久没有使用到的节点，所以可以删除。
+    //由于我们每次put完（HashMap#putVal()）都会调用这个afterNodeInsertion方法，所以可以上面的设计可以使put过后如果size超了
+    //将删除最久没有使用的一个节点，从而腾出空间给新的节点。
+    protected boolean removeEldestEntry(Map.Entry eldest) {
+        return size() > capacity;
+    }
+}
+
+```
+
+引用：https://blog.csdn.net/qq_40050586/article/details/105851970
+
+## 4.2 TreeMap
+
+**概述：**
+
+​	底层是基于红黑树做的数据结构，不是传统意义上的那红HashMap，他天然就可以按照你的key的自然顺序来排序，既然人家是按照key的大小来进行排序和迭代输出的
+
+红黑树相关略
+
+```java
+    static final class Entry<K,V> implements Map.Entry<K,V> 
+        K key;
+        V value;
+        Entry<K,V> left;
+        Entry<K,V> right;
+        Entry<K,V> parent;
+        boolean color = BLACK;
+```
 
 
-# 5 Set
 
-## 
+# 5 Set源码剖析
+
+## 5.1 HashSet
+
+概述：
+
+​	1 HashSet，他其实就是说一个集合，里面的元素是无序的，他里面的元素是没有重复
+
+​	2 HashSet就是基于HashMap来实现的，利用hashmap哈希表特性实现，主要是key,value的话都指向内部的一个默认对象PRESENT
+
+```java
+public class HashSet<E>
+    extends AbstractSet<E>
+    implements Set<E>, Cloneable, java.io.Serializable
+
+    static final long serialVersionUID = -5024744406713321676L;
+
+    private transient HashMap<E,Object> map;
+
+    // Dummy value to associate with an Object in the backing Map
+    private static final Object PRESENT = new Object();
+
+	//内部就是hashmap
+    public HashSet() {
+        map = new HashMap<>();
+    }
+
+
+    public boolean add(E e) {
+        return map.put(e, PRESENT)==null;
+    }
+
+    public boolean remove(Object o) {
+        return map.remove(o)==PRESENT;
+    }
+```
+
+ 
+
+## 5.2 LinkedHashSet
+
+**概述：**
+
+​	LinkedHashSet，他是有顺序的set，也就是维持了插入set的这个顺序，你迭代LinkedHashSet的顺序跟你插入的顺序是一样的，底层是不是直接就可以基于LinkedHashMap来实现的
+
+​	LinkedHashSet.add()方法，底层会调用LinkedHashMap.put()方法，此时在这个方法里就会记住加入元素的顺序，在一个链表中，后面你遍历的时候，是从LinkedHashMap里遍历元素，人家是直接遍历维护好的链表的
+
+```java
+public class LinkedHashSet<E>
+    extends HashSet<E>
+    implements Set<E>, Cloneable, java.io.Serializable 
+    
+    //构造实际上是通过父类构建
+    public LinkedHashSet() {
+        super(16, .75f, true);
+    }
+```
 
 
 
+```java
+public class HashSet<E>
+    extends AbstractSet<E>
+    implements Set<E>, Cloneable, java.io.Serializable
+    //实际上是构造了LinkedHashMap来实现Set集合的排序
+   HashSet(int initialCapacity, float loadFactor, boolean dummy) {
+        map = new LinkedHashMap<>(initialCapacity, loadFactor);
+    }
+```
 
+
+
+## 5.3 TreeSet
+
+**概述：**
+
+​	TreeSet，默认是根据你插入进去的元素的值来排序的，而且可以定制Comparator，自己决定排序的算法和逻辑，他底层是不是可以基于TreeMap来实现
+
+ 
+
+```java
+public class TreeSet<E> extends AbstractSet<E>
+    implements NavigableSet<E>, Cloneable, java.io.Serializable
+    
+	//实际上就是构造了TreeMap，利用TreeMap来实现Set以及顺序的特性
+    public TreeSet() {
+        this(new TreeMap<E,Object>());
+    }
+```
+
+# 6 Iterator迭代器应对多线程并发修改的fail fast机制
+
+**fail fast机制概述：**
+
+​	**1 java集合中，迭代器在迭代的时候，他的fail-fast机制**
+
+​	2 ConcurrentModificationException，并发修改的异常，这个机制就叫做fail fast
+
+​	**3 modCount就是用来实现fail fast机制的**，各个集合里面其实都有这个modCount的概念，只要这个集合被修改了，那么就会对modCount++
+
+​	4 modificationCount，修改次数，只要你修改一次，就会更新这个，add、remove、set
+
+ **场景：**
+
+​	1 比如说在迭代一个ArrayList之前，已经插入了4个元素，此时modCount = 4，在你获取和初始化一个迭代器的时候，里面的expectedModCount就会被初始化为modCount
+
+​	2  throw new ConcurrentModificationException();，并发修改冲突异常
+
+**PS:java集合包下的类，都是非线程安全的，所以说里面都设计了针对并发修改集合的问题，有fail fast机制，modCount**
+
+```java
+public class HashMap<K,V> extends AbstractMap<K,V>
+    implements Map<K,V>, Cloneable, Serializable 
+
+    
+    @Override
+    public void forEach(BiConsumer<? super K, ? super V> action) {
+        Node<K,V>[] tab;
+        if (action == null)
+            throw new NullPointerException();
+        if (size > 0 && (tab = table) != null) {
+            //mc指向modCount
+            int mc = modCount;
+            for (int i = 0; i < tab.length; ++i) {
+                for (Node<K,V> e = tab[i]; e != null; e = e.next)
+                    action.accept(e.key, e.value);
+            }
+            //如果遍历的时候，modCount和之前的mc不一致就会抛出异常
+            if (modCount != mc)
+                throw new ConcurrentModificationException();
+        }
+    }
+
+```
 
