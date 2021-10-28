@@ -1934,3 +1934,110 @@ ulimit -a
 ​	**PS:在磁盘文件末尾追加不停的写自己数据就是磁盘顺序写，在磁盘某个随机位置找到一个redo log block去修改其中几个字节数据，就是磁盘随机写**
 
 ![image-20211015141709300](儒猿MySql专栏.assets/image-20211015141709300.png)
+
+## 6.4 redo log buffer中的缓冲日志，到底什么时候可以写入磁盘
+
+**概述：**
+
+​	**写入redo log buffer的时候，是写入里面提取划分好的一个一个的redo log block的，选择有空闲空间的redo log block去写入的，然后redo log block写满之后，会在某个时机刷入到磁盘里去**
+
+redo log block刷入磁盘文件的时机
+	1 如果写入redo log buffer的日志已经占据了redo log buffer总容量的一半，也就是超过8M的redo log在缓冲里了，此时就会把它们刷入磁盘文件里去
+
+​	2 一个事务提交的时候，把redo log所在的redo log block刷入磁盘文件(看参数级别，可能是os cache或者其他)
+
+​	3 后台线程定时刷新，有一个后台线程每隔一秒就会把redo log buffer里的redo log block刷到磁盘文件里去
+
+​	4 mysql关闭的时候，redo log block都会刷入到磁盘里去
+
+**场景：**
+
+​	1 如果瞬间执行大量高并发的SQL语句，1秒内就产生了超过8M的redo log，此时占据了redo log buffer一半的空间，就会直接把redo log刷入到磁盘
+
+​	2 时机1情况比较少，不太常见，第二种比较常见
+
+​	3 最关键的是时机2，保证事务提交成功刷入到磁盘了。数据才不会丢
+
+**redo log目录**
+
+​	1 redo 都会写入一个目录中的文件里，这个目录可以通过show variables like 'datadir'来查看，可以通过innodb_log_group_home_dir参数来设置和这个目录
+
+​	2 对应redo log是有多个的，写满了一个就会写下一个redo log,而且可以限制redo log文件的数量，通过innodb_log_file_size可以指定每个redo log文件的大小，默认是48M，通过innodb_log_files_in_group可以指定日志文件的数量，默认两个
+
+​	3 默认情况，目录就两个日志文件，分别为ib_logfile0和ib_logfile1，每个48MB,最多就这两个日志文件，写满了第一个写第二个，第二个写满了再回过头来写第一个，覆盖第一个日志文件里原来的redo log
+
+​	4 所以mysql默认情况下最多保留了最近的96M的redo log，redo log一般很小，一条通常几个字节到几十字节不等，96M足够存储上百万条redo log了
+
+
+
+![image-20211021170108397](儒猿MySql专栏.assets/image-20211021170108397.png)
+
+# 7 undo log日志
+
+## 7.1 如果事务执行到一半要回滚怎么办？再探undo log回滚日志原理
+
+**执行事务的时候，除了redo log的另外一种日志，undo log回滚日志:**
+
+​	1 记录的东西比较简单，比如在缓存页执行了一个insert语句，此时在undo log日志里，对这个操作记录的回滚日志就为一个主键和对应的delete操作
+
+​	2 执行的是delete语句，记录被删除数据，同理就回滚对应的操作的是insert操作语句
+
+​	3 执行的是update语句，记录的修改之前的数据,回滚对应操作update语句
+
+​	4 select语句不会对Buffer pool修改，没有undo log
+
+
+
+![image-20211022150017895](儒猿MySql专栏.assets/image-20211022150017895.png)
+
+
+
+## 7.2 一起来看看INSRET语句的undo log回滚日志长什么样
+
+**INSERT语句的undo log的类型是TRX_UNDO_INSERT_REC,这个undo log里包含了以下一些东西**
+
+这条日志的开始位置
+主键的各列长度和值
+表id
+undo log日志编号
+undo log日志类型
+这条日志的结束位置
+
+**场景：**
+
+​	1 在Bufffer pool的一个缓存页插入了一条数据，执行了Insert语句，写了一条上面的undo log,现在事务回滚，直接把Insert语句的undo log拿出来
+​	2 通过undo log知道了主键，定位到表和主键对应的缓存页，从里面删除掉之前insert的数据就可以实现事务回滚的效果了
+
+**PS:delete和update套路是一样的，这里就不展开了**
+
+![image-20211026163622746](儒猿MySql专栏.assets/image-20211026163622746.png)
+
+
+
+# 8 事务与锁
+
+## 8.1 MySQL运行时多个事务同时执行是什么场景
+
+**事务的基本概念：**
+
+​	一个事务里面有多个SQL语句，要不一起成功都提交了，要不有一个SQL失败，那么事务就回滚了，所有SQL做的修改都撤销了
+
+**事务执行原理回顾：**
+
+​	从磁盘加载数据页到buffer pool的缓存页中，更新buffer pool缓存页，同时记录redo log和undo log
+
+**并发场景的问题：**
+
+​	1 多个事务并发执行的时候，可能会同时对缓存页里的一行护具进行更新，这个冲突怎么处理？是否要加锁？
+​	2 可能有的事务在对一行数据做更新，有的事务在查询这行数据，这里的冲突怎么处理？
+
+
+
+![image-20211026171259731](儒猿MySql专栏.assets/image-20211026171259731.png)
+
+## 8.2 多个事务并发更新以及查询数据，为什么会有脏写和脏读的问题
+
+
+
+
+
