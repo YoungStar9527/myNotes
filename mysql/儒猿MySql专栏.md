@@ -2139,10 +2139,6 @@ undo log日志类型
 
 ​	在MySQL的文档的隔离级别（[innodb transaction isolation](https://link.zhihu.com/?target=https%3A//dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html)）的介绍里，只有说read committed（RC）有幻像（phantom），serializable下不会有幻像，但 RC， RR下可以允许幻像。
 
-？？快照，间隙锁，next key啥玩意，后面搞定定了再补充这里
-
-引用：https://www.zhihu.com/question/372905832
-
 **spring设置**
 
 ```
@@ -2173,3 +2169,94 @@ isolation参数的，里面是可以设置事务隔离级别的，具体的设�
 ​	**每多个事务串联执行的时候，每修改一行数据都会更新隐藏字段trx_id和roll_pointer，同时之前多个数据快照对应的undo log会通过roll_pinter指针串联起来，形成一个重要的版本链**
 
 ![image-20211029174831222](儒猿MySql专栏.assets/image-20211029174831222.png)
+
+## 8.8 基于undo log多版本链条实现的ReadView机制，到底是什么
+
+**ReadView核心信息：**
+
+​	m_ids:表示此时有哪些事务在MySql里执行还没有提交的
+
+​	min_trx_id:就是m_ids里最小的值
+
+​	max_trx_id:mysql下一个要生成的事务id,就是最大事务id
+
+​	creator_trx_id:就是当前事务id
+​	
+
+**ReadView核心流程**
+
+​	**1 事务A当前事务在读取数据的时候的时候，会开启一个ReadView**
+
+​	**2 事务A就会去比对当前这行数据的txr_id(事务id)**
+
+​		**如果小于ReadView中的min_trx_id：**说明事务开启之前修改这行数据的事务就提交了，所以可以直接查这行数据
+
+​		**如果大于ReadView中的min_trx_id，同时小于ReadView里的max_trx_id：**说明更新这条数据的事务，就是和当前事务A差不多时间开启的，会看下是否在m_ids列表中，这行数据是不能查询的
+​			这时候应该顺着这条数据的roll_printer的undo log日志链表往下找，找到最近一条的undo log且trx_id小于min_trx_id的数据，就可以直接拿来用了
+
+​		**如果等于ReadView中的max_trx_id：**说明这行数据就是事务A自己修改的，是可以查询的
+
+​		**如果大于ReadView中的max_trx_id：**后面这个事务开启之后，有一个事务更新并提交了数据，这个数据也是不能查的，也会根据undo log版本链条去查，查出小于或等于的trx_id的数据来用
+
+**总结：**
+
+​	**通过undo log多版本链条，加上开启事务时候生产的一个ReadView,然后查询的时候根据ReadView进行判断的机制，就知道应该读取哪个版本的数据**
+
+​	主要是保证，事务开启的时候别的事务更新的值是读不到的，可以实现多个事务并发执行时候的数据隔离
+
+![image-20211101111841227](儒猿MySql专栏.assets/image-20211101111841227.png)
+
+## 8.9 Read Committed隔离级别是如何基于ReadView机制实现的
+
+RC隔离级别：读已提交
+
+也是基于ReadView机制的，与RR级别最主要的实现区别在于，**每次发起查询，都会重新生成一个ReadView**
+
+这样m_ids的值就会去除已经提交的事务，就能实现都已提交了
+
+![image-20211108173515175](儒猿MySql专栏.assets/image-20211108173515175.png)
+
+## 8.10 MySQL最牛的RR隔离级别，是如何基于ReadView机制实现的
+
+​	**RR级别事务A开启的时候的ReadView的值是不会变的，不管其他事务如何修改数据，都不影响事务A的ReadView，这样就可以根据MVCC机制解决不可重复读问题，以及快照读查询的幻读问题**
+
+**快照读与当前读：**
+
+​	**快照读/普通读：**
+
+​	1 就是没有加锁的普通查询，比如 select * from xxx where xxx
+
+​	2 快照读的意思就是根据MVCC ReadView机制，读取对应的快照数据，不一定是最新数据
+
+​	**当前读：**
+
+​	1 select...lock in share mode (共享读锁/共享锁/S锁)
+​		select.... for update(排他锁/独占锁/X锁)
+​		update delete insert(这几个操作都是加 排他锁)
+
+​	2 当前读，**读的是最新版本的数据，并对读取的数据加锁，避免出现安全问题**(比如update数据的时候，又delete而且提交了，不加锁肯定冲突，所以update肯定是当前读加锁)
+
+引用：https://www.cnblogs.com/wwcom123/p/10727194.html
+
+**RR级别的幻读问题：**
+
+​	1 事务开启的时候就会开启快照读，这个时候只会读取当前事务开启的时候的快照读的数据，不会产生幻读
+
+​	2 都是当前读，也就是都加锁了，也会通过行锁+间隙锁(GAP),也就是next-key-locks的方式去避免幻读
+
+​	3 产生幻读的情况一般是在当前读(lock read)的情况，这种情况往往是一个快照读(non-locking read)后面跟着一个当前读(locking read)的查询，这个时候是可能产生幻读的。
+
+**PS:间隙锁是在可重复读隔离级别下才会生效的。所以，你如果把隔离级别设置为读提交的话，就没有间隙锁了**
+
+引用：https://www.zhihu.com/question/372905832
+
+引用：mysql45讲-(20讲幻读是什么，幻读有什么问题)
+
+扩展：insert into锁相关：https://blog.csdn.net/and1kaney/article/details/51214001
+
+![image-20211112142435806](儒猿MySql专栏.assets/image-20211112142435806.png)
+
+## 8.11 停一停脚步：梳理一下数据库的多事务并发运行的隔离机制
+
+总结：
+
