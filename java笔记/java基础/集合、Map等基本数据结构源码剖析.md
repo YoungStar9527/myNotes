@@ -2552,3 +2552,12 @@ public class HashMap<K,V> extends AbstractMap<K,V>
 
 ```
 
+# 7 其他
+
+## 7.1 HashTable
+
+https://www.cnblogs.com/williamjie/p/9099141.html
+
+https://blog.csdn.net/ns_code/article/details/36191279
+
+https://zhuanlan.zhihu.com/p/268025265

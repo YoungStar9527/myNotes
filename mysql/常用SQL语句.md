@@ -57,3 +57,12 @@ AND A.assess_event_cooperate_label_id NOT IN (
 https://blog.csdn.net/anya/article/details/6407280
 
 https://www.jianshu.com/p/ba80e1a1b7dc
+
+# 2 修改字符串中对应内容
+
+```sql
+UPDATE assess_event_cooperate_label_copy_copy SET dept_id_str=REPLACE(dept_id_str, '484', '514');
+-- 将dept_id_str字段中的484改为514
+```
+
+引用：https://www.cnblogs.com/duanxz/p/3936732.html
