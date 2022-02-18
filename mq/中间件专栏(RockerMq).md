@@ -476,12 +476,207 @@ OA系统、CRM系统、财务系统或者其他任何看起来很普通的系统
 问题：
 
 - 假设如果没有RocketMQ 4.5新版本引入的Dledger技术，仅仅是靠之前的Master-Slave主从同步机制，那么在Master崩溃的时候，可能会造成多长时间的系统不可用？这个时候如何能够尽快的恢复集群运行？依赖手工运维的话，如何能尽快的去完成这个运维操作？
-
 - 在RocketMQ 4.5之后引入了Dledger技术可以做到自动选举新的Master，那么在Master崩溃一直到新的Master被选举出来的这个过程中，你觉得对于使用MQ的系统而言，会处于一个什么样的状态呢？
-
 - 希望大家去研究一下Kafka和RabbitMQ的多副本和高可用机制，Kafka是如何在集群里维护多个副本的？出现故障的时候能否实现自动切换？RabbitMQ是如何在集群里维护多个数据副本的？出现故障的时候能否实现自动切换？
-
 - 既然有主从同步机制，那么有没有主从数据不一致的问题？Slave永远落后Master一些数据，这就是主从不一致。那么这种不一致有没有什么问题？有办法保证主从数据强制一致吗？这样做又会有什么缺点呢？
+
+## 3.4  RocketMq基本模式
+
+**同步发送消息（sync message ）**
+
+​	概念：producer向 broker 发送消息，执行 API 时同步等待， 直到broker 服务器返回发送结果 
+
+​	实操：
+
+1）在test下编写测试类，发送同步消息。
+
+```java
+
+ @RunWith(SpringRunner.class)
+ @SpringBootTest
+ public class ProducerSimpleTest {
+ 
+     @Autowired
+     private ProducerSimple producerSimple;
+ 
+     //测试发送同步消息
+     @Test
+     public void testSendSyncMsg(){
+         this.producerSimple.sendSyncMsg("my-topic", "第一条同步消息");
+         System.out.println("end...");
+     }
+ 
+ }
+```
+
+2）启动NameServer、Broker、管理端
+
+3）执行testSendSyncMsg方法
+
+4）观察控制台和管理端
+
+控制台出现end... 表示消息发送成功。
+
+进入管理端，查询消息。
+
+**异步发送消息（async message）**
+
+​	producer向 broker 发送消息时指定消息发送成功及发送异常的回调方法，调用 API 后立即返回，producer发送消息线程不阻塞 ，消息发送成功或失败的回调任务在一个新的线程中执行 。
+
+```java
+/**
+  * 发送异步消息
+  * @param topic
+  * @param msg
+  */
+ public void sendASyncMsg(String topic, String msg){
+     rocketMQTemplate.asyncSend(topic,msg,new SendCallback() {
+         @Override
+         public void onSuccess(SendResult sendResult) {
+             //成功回调
+             System.out.println(sendResult.getSendStatus());
+         }
+         @Override
+         public void onException(Throwable e) {
+             //异常回调
+             System.out.println(e.getMessage());
+         }
+     });
+ }
+  /**
+  * 测试类
+  * @version 1.0
+  **/
+@Test
+ public void testSendASyncMsg() throws InterruptedException {
+     this.producerSimple.sendASyncMsg("my-topic", "第一条异步步消息");
+     System.out.println("end...");
+     //异步消息，为跟踪回调线程这里加入延迟
+     Thread.sleep(3000);
+ }
+```
+
+**发送单向消息（oneway message）**
+
+​	producer向 broker 发送消息，执行 API 时直接返回，不等待broker 服务器的结果 。
+
+```java
+ /**
+  * 发送单向消息
+  * @param topic
+  * @param msg
+  */
+ public void sendOneWayMsg(String topic, String msg){
+     this.rocketMQTemplate.sendOneWay(topic,msg);
+ }
+```
+
+**Push消费模式**
+
+​	push，主动推送给消费者
+
+​	push方式里，consumer把轮询过程封装了，并注册MessageListener监听器，取到消息后，唤醒MessageListener的consumeMessage()来消费，对用户而言，感觉消息是被推送过来的
+
+​	优缺点：实时性高，但增加服务端负载，消费端能力不同，如果push的速度过快，消费端会出现很多问题
+
+```java
+import cn.hutool.core.lang.Console;
+import org.apache.rocketmq.client.consumer.DefaultMQPushConsumer;
+import org.apache.rocketmq.client.consumer.listener.ConsumeConcurrentlyStatus;
+import org.apache.rocketmq.client.consumer.listener.MessageListenerConcurrently;
+import org.apache.rocketmq.common.consumer.ConsumeFromWhere;
+import org.apache.rocketmq.common.protocol.heartbeat.MessageModel;
+
+public class PushConsumer {
+    public static void main(String[] args) throws Exception {
+        DefaultMQPushConsumer consumer = new DefaultMQPushConsumer("PushConsumerGroupName");
+        consumer.setNamesrvAddr("127.0.0.1:9876");
+        //一个GroupName第一次消费时的位置
+        consumer.setConsumeFromWhere(ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET);
+        consumer.setConsumeThreadMin(20);
+        consumer.setConsumeThreadMax(20);
+        //要消费的topic，可使用tag进行简单过滤
+        consumer.subscribe("TestTopic", "*");
+        //一次最大消费的条数
+        consumer.setConsumeMessageBatchMaxSize(100);
+        //消费模式，广播或者集群，默认集群。
+        consumer.setMessageModel(MessageModel.CLUSTERING);
+        //在同一jvm中 需要启动两个同一GroupName的情况需要这个参数不一样。
+        consumer.setInstanceName("InstanceName");
+        //配置消息监听
+        consumer.registerMessageListener((MessageListenerConcurrently) (msgs, context) -> {
+            try {
+                //业务处理
+                msgs.forEach(msg -> {
+                    Console.log(msg);
+                });
+            } catch (Exception e) {
+                System.err.println("接收异常" + e);
+                return ConsumeConcurrentlyStatus.RECONSUME_LATER;
+            }
+            return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
+        });
+        consumer.start();
+        System.out.println("Consumer Started.");
+    }
+}
+```
+
+**Pull消费模式**
+
+​	pull，消费者主动去broker拉取
+
+​	pull方式里，取消息的过程需要用户自己写，首先通过打算消费的Topic拿到MessageQueue的集合，遍历MessageQueue集合，然后针对每个MessageQueue批量取消息，一次取完后，记录该队列下一次要取的开始offset，直到取完了，再换另一个MessageQueue
+
+​	优缺点：消费者从server端拉消息，主动权在消费端，可控性好，但是时间间隔不好设置，间隔太短，则空请求会多，浪费资源，间隔太长，则消息不能及时处理
+
+```java
+import cn.hutool.core.collection.CollUtil;
+import cn.hutool.core.lang.Console;
+import org.apache.rocketmq.client.consumer.DefaultLitePullConsumer;
+import org.apache.rocketmq.common.message.MessageExt;
+
+import java.util.List;
+
+public class PullConsumer {
+    private static boolean runFlag = true;
+    public static void main(String[] args) throws Exception {
+        DefaultLitePullConsumer consumer = new DefaultLitePullConsumer("PullConsumerGroupName");
+        consumer.setNamesrvAddr("127.0.0.1:9876");
+        //要消费的topic，可使用tag进行简单过滤
+        consumer.subscribe("TestTopic", "*");
+        //一次最大消费的条数
+        consumer.setPullBatchSize(100);
+        //无消息时，最大阻塞时间。默认5000 单位ms
+        consumer.setPollTimeoutMillis(5000);
+        consumer.start();
+        while (runFlag){
+            try {
+                //拉取消息，无消息时会阻塞 
+                List<MessageExt> msgs = consumer.poll();
+                if (CollUtil.isEmpty(msgs)){
+                    continue;
+                }
+                //业务处理
+                msgs.forEach(msg-> Console.log(new String(msg.getBody())));
+                //同步消费位置。不执行该方法，应用重启会存在重复消费。
+                consumer.commitSync();
+            }catch (Exception e){
+                e.printStackTrace();
+            }
+        }
+        consumer.shutdown();
+    }
+}
+```
+
+引用：
+
+https://zhuanlan.zhihu.com/p/138652070
+
+https://www.cnblogs.com/enenen/p/12773099.html
+
+https://blog.csdn.net/qq_21383435/article/details/101113808
 
 # 4 RocketMq落地及设计
 
@@ -553,4 +748,795 @@ OA系统、CRM系统、财务系统或者其他任何看起来很普通的系统
 - 路由中心、MQ集群、生产者和消费者分别是怎么部署的？为什么要那样部署？
 - 那样部署可以实现高并发、海量消息、高可用和线性可伸缩吗？
 - RabbitMQ和Kafka他们两个是如何实现生产架构部署，来支撑高并发、海量消息、高可用和可伸缩的呢？他们能实现这些吗？
+
+## 4.2 部署一个小规模的 RocketMQ 集群
+
+**前置条件**
+
+​	1 jdk 1.7及以上(一般是1.8)
+
+​	2 maven 3.5 及以上
+
+​	3 git
+
+​	4 4g内存及以上的虚拟机(linux服务器)
+
+**部署流程**
+
+​	**构建Dledger**
+
+```sh
+git clone https://github.com/openmessaging/openmessaging-storage-dledger.git
+#需要网络环境良好才能clone
+#不能从windows拷贝过来，拷贝过来会有很多window目录的不兼容问题
+cd openmessaging-storage-dledger
+
+mvn clean install -DskipTests
+```
+
+​	**构建RocketMQ**
+
+```sh
+git clone https://github.com/apache/rocketmq.git
+#需要网络环境良好才能clone
+#不能从windows拷贝过来，拷贝过来会有很多window目录的不兼容问题
+cd rocketmq
+
+git checkout -b store_with_dledger origin/store_with_dledger
+
+mvn -Prelease-all -DskipTests clean install -U
+```
+
+​	**编辑相关文件**
+
+```sh
+cd distribution/target/apache-rocketmq
+# 本地配好的目录/home/mq/rocketmq/distribution/target/apache-rocketmq
+# 在这个目录中，需要编辑三个文件，一个是bin/runserver.sh，一个是bin/runbroker.sh，另外一个是bin/tools.sh
+#在里面找到如下三行，然后将第二行和第三行都删了，同时将第一行的值修改为你自己的JDK的主目录
+#[ ! -e "$JAVA_HOME/bin/java" ] && JAVA_HOME=$HOME/jdk/java
+#[ ! -e "$JAVA_HOME/bin/java" ] && JAVA_HOME=/usr/java
+#[ ! -e "$JAVA_HOME/bin/java" ] && error_exit "Please set the JAVA_HOME variable in your environment, We need java(x64)!"
+[ ! -e "$JAVA_HOME/bin/java" ] && JAVA_HOME=/usr/java/jdk1.8.0_202-amd64
+#本地配好的，参考用
+#
+```
+
+​	**本地配好的目录**
+
+![image-20220117171143431](中间件专栏(RockerMq).assets/image-20220117171143431.png)
+
+**PS:如果本地虚拟机内存不大，需要讲对应bin/runserver.sh等3个文件的jvm内存都改小(最好1g及一下)，才能正常启动**
+
+**快速启动RocketMQ集群**
+
+```sh
+sh bin/dledger/fast-try.sh start
+#这个命令会在当前这台机器上启动一个NameServer和三个Broker，三个Broker其中一个是Master，另外两个是Slave，瞬间就可以组成一个最小可用的RocketMQ集群。
+```
+
+**常用命令**
+
+​	检查Broker集群的状态
+
+```sh
+sh bin/mqadmin clusterList -n 127.0.0.1:9876
+# 检查一下RocketMQ集群的状态
+```
+
+![image-20220117171851912](中间件专栏(RockerMq).assets/image-20220117171851912.png)
+
+​	**PS:BID为0的就是Master，BID大于0的就都是Slave，其实在这里也可以叫做Leader和Follower**
+
+​	NameServer相关
+
+```sh
+nohup sh mqnamesrv &
+#启动NameServer
+#这个NameServer监听的接口默认就是9876，所以如果你在三台机器上都启动了NameServer，那么他们的端口都是9876，此时我们就成功的启动了三个NameServer了
+```
+
+​	Broker相关
+
+```sh
+nohup sh bin/mqbroker -c conf/dledger/broker-n0.conf &
+#bin/mqbroker为启动broker 
+#conf/dledger/broker-n0.conf 为指定配置文件
+#第一个Broker的配置文件是broker-n0.conf，第二个broker的配置文件可以是broker-n1.conf，第三个broker的配置文件可以是broker-n2.conf
+```
+
+**配置文件说明**
+
+```sh
+# 这个是集群的名称，你整个broker集群都可以用这个名称
+brokerClusterName=RaftCluster
+
+# 这是Broker的名称，比如你有一个Master和两个Slave，那么他们的Broker名称必须是一样的，因为他们三个是一个分组，如果你有另外一组Master和两个Slave，你可以给他们起个别的名字，比如说RaftNode01
+brokerName=RaftNode00
+
+# 这个就是你的Broker监听的端口号，如果每台机器上就部署一个Broker，可以考虑就用这个端口号，不用修改
+listenPort=30911
+
+# 这里是配置NameServer的地址，如果你有很多个NameServer的话，可以在这里写入多个NameServer的地址
+namesrvAddr=127.0.0.1:9876
+
+# 下面两个目录是存放Broker数据的地方，你可以换成别的目录，类似于是/usr/local/rocketmq/node00之类的
+storePathRootDir=/tmp/rmqstore/node00
+storePathCommitLog=/tmp/rmqstore/node00/commitlog
+
+# 这个是非常关键的一个配置，就是是否启用DLeger技术，这个必须是true
+enableDLegerCommitLog=true
+
+# 这个一般建议和Broker名字保持一致，一个Master加两个Slave会组成一个Group
+dLegerGroup=RaftNode00
+
+# 这个很关键，对于每一组Broker，你得保证他们的这个配置是一样的，在这里要写出来一个组里有哪几个Broker，比如在这里假设有三台机器部署了Broker，要让他们作为一个组，那么在这里就得写入他们三个的ip地址和监听的端口号
+dLegerPeers=n0-127.0.0.1:40911;n1-127.0.0.1:40912;n2-127.0.0.1:40913
+
+# 这个是代表了一个Broker在组里的id，一般就是n0、n1、n2之类的，这个你得跟上面的dLegerPeers中的n0、n1、n2相匹配
+dLegerSelfId=n0
+
+# 这个是发送消息的线程数量，一般建议你配置成跟你的CPU核数一样，比如我们的机器假设是24核的，那么这里就修改成24核
+sendMessageThreadPoolNums=24
+```
+
+**主备切换测试**
+
+​	此时我们可以用命令（lsof -i:30921）找出来占用30921端口的进程PID，接着就用kill -9的命令给他杀了，比如我这里占用30921端口的进程PID是4344，那么就执行命令：kill -9 4344
+
+​	接着等待个10s，再次执行命令查看集群状态：
+
+​	sh bin/mqadmin clusterList -n 127.0.0.1:9876
+
+​	此时就会发现作为Leader的BID为0的节点，变成另外一个Broker了，这就是说Slave切换为Master了。
+
+**流程总结：**
+
+​	其实最关键的是，你的**Broker是分为多组的，每一组是三个Broker，一个Master和两个Slave。**
+
+​	对**每一组Broker，他们的Broker名称、Group名称都是一样的，然后你得给他们配置好一样的dLegerPeers（里面是组内三台Broker的地址）**
+
+​	然后他们得配置好对应的NameServer的地址，最后还有就是**每个Broker有自己的ID，在组内是唯一的就可以了，比如说不同的组里都有一个ID为n0的broker，这个是可以的。**
+
+​	所以按照这个思路就可以轻松的配置好一组Broker，在三台机器上分别用命令启动Broker即可。启动完成过后，可以跟NameServer进行通信，检查Broker集群的状态
+
+**代码测试**
+
+​	pom
+
+```xml
+        <dependency>
+            <groupId>org.apache.rocketmq</groupId>
+            <artifactId>rocketmq-client</artifactId>
+            <version>4.5.1</version>
+        </dependency>
+```
+
+​	producer
+
+```java
+    public static void main(String[] args) throws MQClientException, InterruptedException {
+        final DefaultMQProducer defaultMQProducer = new DefaultMQProducer("test_producer");
+        defaultMQProducer.setNamesrvAddr("192.168.21.101:9876");
+        defaultMQProducer.setSendMsgTimeout(60000);
+        defaultMQProducer.start();
+        for(int i=0;i<10;i++){
+            new Thread(()->{
+                while (true){
+                    try {
+                        Message message = new Message("TopicTest","TagA",("Test").getBytes(RemotingHelper.DEFAULT_CHARSET));
+                        SendResult send = defaultMQProducer.send(message);
+                        System.out.println(send);
+                        //10秒发一次
+                        Thread.sleep(10000);
+                    } catch (UnsupportedEncodingException e) {
+                        e.printStackTrace();
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    } catch (RemotingException e) {
+                        e.printStackTrace();
+                    } catch (MQClientException e) {
+                        e.printStackTrace();
+                    } catch (MQBrokerException e) {
+                        e.printStackTrace();
+                    }
+                }
+            }).start();
+        }
+    }
+```
+
+​	consumer
+
+```java
+    public static void main(String[] args) throws MQClientException {
+        DefaultMQPushConsumer consumer = new DefaultMQPushConsumer("test_consumer");
+        consumer.setNamesrvAddr("192.168.21.101:9876");
+        consumer.subscribe("TopicTest","*");
+        //注册回调接口，消费消息
+        consumer.registerMessageListener(new MessageListenerConcurrently() {
+            @Override
+            public ConsumeConcurrentlyStatus consumeMessage(List<MessageExt> list,
+                                                            ConsumeConcurrentlyContext consumeConcurrentlyContext) {
+                for (MessageExt messageExt : list) {
+                    System.out.println("接收消息："+new String(messageExt.getBody()));
+                }
+                return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
+            }
+        });
+        consumer.start();
+    }
+```
+
+## 4.3 如何对RocketMQ集群进行可视化的监控和管理
+
+**监控-部署流程：**
+
+```sh
+git clone https://github.com/apache/rocketmq-dashboard
+#下载对应监控项目
+cd rocketmq-externals/rocketmq-dashboard
+mvn package -DskipTests
+#打成jar包
+java -jar rocketmq-console-ng-1.0.1.jar --server.port=8080 --rocketmq.config.namesrvAddr=127.0.0.1:9876
+#启动项目并指定监控的nameserver地址,如果有多个地址可以用分号隔开
+```
+
+**监控界面相关**
+
+​	在这个界面里可以让你看到Broker的大体消息负载，还有各个Topic的消息负载，另外还可以选择日期要看哪一天的监控数据，都可以看到。
+
+![image-20220120140050383](中间件专栏(RockerMq).assets/image-20220120140050383.png)
+
+​	可以看到各个Broker的分组，哪些是Master，哪些是Slave，他们各自的机器地址和端口号，还有版本号
+
+​	包括最重要的，就是他们每台机器的生产消息TPS和消费消息TPS，还有消息总数。
+
+​	这是非常重要的，通过这个TPS统计，就是每秒写入或者被消费的消息数量，就可以看出RocketMQ集群的TPS和并发访问量。
+
+​	另外在界面右侧有两个按钮，一个是“状态”，一个是“配置”。其中点击状态可以看到这个Broker更加细节和具体的一些统计项，点击配置可以看到这个Broker具体的一些配置参数的值。
+
+![image-20220120140122494](中间件专栏(RockerMq).assets/image-20220120140122494.png)
+
+​	可以在这里创建、删除和管理Topic，查看Topic的一些装填、配置，等等，可以对Topic做各种管理。
+
+![image-20220120140131880](中间件专栏(RockerMq).assets/image-20220120140131880.png)
+
+消费者
+
+![image-20220120140147474](中间件专栏(RockerMq).assets/image-20220120140147474.png)
+
+生产者
+
+![image-20220120140437711](中间件专栏(RockerMq).assets/image-20220120140437711.png)
+
+消息查询
+
+![image-20220120140458536](中间件专栏(RockerMq).assets/image-20220120140458536.png)
+
+死信消息
+
+![image-20220120140507727](中间件专栏(RockerMq).assets/image-20220120140507727.png)
+
+消息轨迹
+
+![image-20220120140526458](中间件专栏(RockerMq).assets/image-20220120140526458.png)
+
+## 4.4 进行OS内核参数和JVM参数的调整
+
+**OS内核调整**
+
+​	vm.overcommit_memory
+
+```sh
+#vm.overcommit_memory”这个参数有三个值可以选择，0、1、2。
+#如果值是0的话，在你的中间件系统申请内存的时候，os内核会检查可用内存是否足够，如果足够的话就分配内存给你，如果感觉剩余内存不是太够了，干脆就拒绝你的申请，导致你申请内存失败，进而导致中间件系统异常出错。
+
+#因此一般需要将这个参数的值调整为1，意思是把所有可用的物理内存都允许分配给你，只要有内存就给你来用，这样可以避免申请内存失败的问题。
+
+#比如我们曾经线上环境部署的Redis就因为这个参数是0，导致在save数据快照到磁盘文件的时候，需要申请大内存的时候被拒绝了，进而导致了异常报错。
+
+#可以用如下命令修改：
+echo 'vm.overcommit_memory=1' >> /etc/sysctl.conf。
+```
+
+​	vm.max_map_count
+
+```sh
+#这个参数的值会影响中间件系统可以开启的线程的数量，同样也是非常重要的
+
+#如果这个参数过小，有的时候可能会导致有些中间件无法开启足够的线程，进而导致报错，甚至中间件系统挂掉。
+
+#他的默认值是65536，但是这个值有时候是不够的，比如我们大数据团队的生产环境部署的Kafka集群曾经有一次就报出过这个异常，说无法开启足够多的线程，直接导致Kafka宕机了。
+
+#因此建议可以把这个参数调大10倍，比如655360这样的值，保证中间件可以开启足够多的线程。
+
+#可以用如下命令修改：
+echo 'vm.max_map_count=655360' >> /etc/sysctl.conf。
+```
+
+​	vm.swappiness
+
+```sh
+#这个参数是用来控制进程的swap行为的，这个简单来说就是os会把一部分磁盘空间作为swap区域，然后如果有的进程现在可能不是太活跃，就会被操作系统把进程调整为睡眠状态，把进程中的数据放入磁盘上的swap区域，然后让这个进程把原来占用的内存空间腾出来，交给其他活跃运行的进程来使用。
+
+#如果这个参数的值设置为0，意思就是尽量别把任何一个进程放到磁盘swap区域去，尽量大家都用物理内存。
+
+#如果这个参数的值是100，那么意思就是尽量把一些进程给放到磁盘swap区域去，内存腾出来给活跃的进程使用。
+
+#默认这个参数的值是60，有点偏高了，可能会导致我们的中间件运行不活跃的时候被迫腾出内存空间然后放磁盘swap区域去。
+
+#因此通常在生产环境建议把这个参数调整小一些，比如设置为10，尽量用物理内存，别放磁盘swap区域去。
+
+#可以用如下命令修改：
+echo 'vm.swappiness=10' >> /etc/sysctl.conf。
+```
+
+​	ulimit
+
+```sh
+#对于一个中间件系统而言肯定是不能使用默认值的，如果你采用默认值，很可能在线上会出现如下错误：error: too many open files。
+
+#因此通常建议用如下命令修改这个值
+echo 'ulimit -n 1000000' >> /etc/profile。
+```
+
+​	OS参数总结
+
+​	磁盘文件IO、网络通信、内存管理、线程数量有关系的
+
+- 中间件系统肯定要开启大量的线程**（跟vm.max_map_count有关）**
+- 而且要进行大量的网络通信和磁盘IO**（跟ulimit有关）**
+- 然后大量的使用内存**（跟vm.swappiness和vm.overcommit_memory有关）**
+
+**JVM相关参数调整**
+
+​	脚本参数
+
+```sh
+#在rocketmq/distribution/target/apache-rocketmq/bin目录下，就有对应的启动脚本，比如mqbroker是用来启动Broker的，mqnamesvr是用来启动NameServer的。
+
+#用mqbroker来举例，我们查看这个脚本里的内容，最后有如下一行：
+
+sh ${ROCKETMQ_HOME}/bin/runbroker.sh org.apache.rocketmq.broker.BrokerStartup $@
+
+#这一行内容就是用runbroker.sh脚本来启动一个JVM进程，JVM进程刚开始执行的main类就是org.apache.rocketmq.broker.BrokerStartup
+
+#我们接着看runbroker.sh脚本，在里面可以看到如下内容：
+
+JAVA_OPT="${JAVA_OPT} -server -Xms8g -Xmx8g -Xmn4g"
+
+JAVA_OPT="${JAVA_OPT} -XX:+UseG1GC -XX:G1HeapRegionSize=16m -XX:G1ReservePercent=25 -XX:InitiatingHeapOccupancyPercent=30 -XX:SoftRefLRUPolicyMSPerMB=0"
+
+JAVA_OPT="${JAVA_OPT} -verbose:gc -Xloggc:/dev/shm/mq_gc_%p.log -XX:+PrintGCDetails -XX:+PrintGCDateStamps -XX:+PrintGCApplicationStoppedTime -XX:+PrintAdaptiveSizePolicy"
+
+JAVA_OPT="${JAVA_OPT} -XX:+UseGCLogFileRotation -XX:NumberOfGCLogFiles=5 -XX:GCLogFileSize=30m"
+
+JAVA_OPT="${JAVA_OPT} -XX:-OmitStackTraceInFastThrow"
+
+JAVA_OPT="${JAVA_OPT} -XX:+AlwaysPreTouch"
+
+JAVA_OPT="${JAVA_OPT} -XX:MaxDirectMemorySize=15g"
+
+JAVA_OPT="${JAVA_OPT} -XX:-UseLargePages -XX:-UseBiasedLocking"
+
+JAVA_OPT="${JAVA_OPT} -Djava.ext.dirs=${JAVA_HOME}/jre/lib/ext:${BASE_DIR}/lib"
+
+#JAVA_OPT="${JAVA_OPT} -Xdebug -Xrunjdwp:transport=dt_socket,address=9555,server=y,suspend=n"
+
+JAVA_OPT="${JAVA_OPT} ${JAVA_OPT_EXT}"
+
+JAVA_OPT="${JAVA_OPT} -cp ${CLASSPATH}"
+```
+
+​	JVM启动参数说明
+
+```sh
+#这个参数就是说用服务器模式启动，这个没什么可说的，现在一般都是如此
+-server：
+
+#这个就是很关键的一块参数了，也是重点需要调整的，就是默认的堆大小是8g内存，新生代是4g内存，如果物理机是48g内存的所以这里完全可以给他们翻几倍，比如给堆内存20g，其中新生代给10g，甚至可以更多一些，当然要留一些内存给操作系统来用
+-Xms8g -Xmx8g -Xmn4g：
+
+#这几个参数也是至关重要的，这是选用了G1垃圾回收器来做分代回收，对新生代和老年代都是用G1来回收，这里把G1的region大小设置为了16m，这个因为机器内存比较多，所以region大小可以调大一些给到16m，不然用2m的region，会导致region数量过多的
+-XX:+UseG1GC -XX:G1HeapRegionSize=16m：
+
+#这个参数是说，在G1管理的老年代里预留25%的空闲内存，保证新生代对象晋升到老年代的时候有足够空间，避免老年代内存都满了，新生代有对象要进入老年代没有充足内存了，默认值是10%，略微偏少，这里RocketMQ给调大了一些
+-XX:G1ReservePercent=25：
+
+#这个参数是说，当堆内存的使用率达到30%之后就会自动启动G1的并发垃圾回收，开始尝试回收一些垃圾对象，默认值是45%，这里调低了一些，也就是提高了GC的频率，但是避免了垃圾对象过多，一次垃圾回收耗时过长的问题
+-XX:InitiatingHeapOccupancyPercent=30：
+
+#这个参数默认设置为0了，在JVM优化专栏中，救火队队长讲过这个参数引发的案例，其实建议这个参数不要设置为0，避免频繁回收一些软引用的Class对象，这里可以调整为比如1000
+-XX:SoftRefLRUPolicyMSPerMB=0：
+
+#这一堆参数都是控制GC日志打印输出的，确定了gc日志文件的地址，要打印哪些详细信息，然后控制每个gc日志文件的大小是30m，最多保留5个gc日志文件
+-verbose:gc -Xloggc:/dev/shm/mq_gc_%p.log -XX:+PrintGCDetails -XX:+PrintGCDateStamps -XX:+PrintGCApplicationStoppedTime -XX:+PrintAdaptiveSizePolicy -XX:+UseGCLogFileRotation -XX:NumberOfGCLogFiles=5 -XX:GCLogFileSize=30m：
+
+#这个参数是说，有时候JVM会抛弃一些异常堆栈信息，因此这个参数设置之后，就是禁用这个特性，要把完整的异常堆栈信息打印出来
+-XX:-OmitStackTraceInFastThrow：
+
+#这个参数的意思是我们刚开始指定JVM用多少内存，不会真正分配给他，会在实际需要使用的时候再分配给他，所以使用这个参数之后，就是强制让JVM启动的时候直接分配我们指定的内存，不要等到使用内存的时候再分配
+-XX:+AlwaysPreTouch：
+
+#这是说RocketMQ里大量用了NIO中的direct buffer，这里限定了direct buffer最多申请多少，如果你机器内存比较大，可以适当调大这个值
+-XX:MaxDirectMemorySize=15g：
+
+#这两个参数的意思是禁用大内存页和偏向锁
+-XX:-UseLargePages -XX:-UseBiasedLocking：
+
+#总结
+#RocketMQ默认的JVM参数是采用了G1垃圾回收器，默认堆内存大小是8G。这个其实完全可以根据大家的机器内存来调整，你可以增大一些也是没有问题的，然后就是一些G1的垃圾回收的行为参数做了调整，这个一般我们不用去动，然后就是对GC日志打印做了设置，这个一般也不用动。其余的就是禁用一些特性，开启一些特性，这些都直接维持RocketMQ的默认值即可。
+```
+
+**对RocketMQ核心参数进行调整**
+
+```sh
+#在下面的目录里有dledger的示例配置文件：
+rocketmq/distribution/target/apache-rocketmq/conf/dledger
+
+#在这里主要是有一个较为核心的参数：
+#这个参数的意思就是RocketMQ内部用来发送消息的线程池的线程数量，默认是16
+#其实这个参数可以根据你的机器的CPU核数进行适当增加，比如机器CPU是24核的，可以增加这个线程数量到24或者30，都是可以的。
+sendMessageThreadPoolNums=16
+```
+
+**总结：**
+
+**（1）**中间件系统在压测或者上生产之前，需要对三大块参数进行调整：**OS内核参数、JVM参数以及中间件核心参数**
+
+**（2）**OS内核参数主要调整的地方都是跟磁盘IO、网络通信、内存管理以及线程管理有关的，需要适当调节大小
+
+**（3）**JVM参数需要我们去中间件系统的启动脚本中寻找他的默认JVM参数，然后根据机器的情况，对JVM的堆内存大小，新生代大小，Direct Buffer大小，等等，做出一些调整，发挥机器的资源
+
+**（4）**中间件核心参数主要也是关注其中跟网络通信、磁盘IO、线程数量、内存 管理相关的，根据机器资源，适当可以增加网络通信线程，控制同步刷磁盘或者异步刷磁盘，线程数量有多少，内存中一些队列的大小
+
+## 4.5 对小规模RocketMQ集群进行压测，同时为生产集群进行规划
+
+**压测思路：**
+
+​	平时做压测，主要关注的还是要压测出来一个最合适的最高负载。
+
+​	什么叫最合适的最高负载呢？
+
+​	意思就是**在RocketMQ的TPS和机器的资源使用率和负载之间取得一个平衡。**
+
+​	比如RocketMQ集群在机器资源使用率极高的极端情况下可以扛到10万TPS，但是当他仅仅抗下8万TPS的时候，你会发现cpu负载、内存使用率、IO负载和网卡流量，都负载较高，但是可以接受，机器比较安全，不至于宕机。
+
+​	那么这个8万TPS实际上就是最合适的一个最高负载，也就是说，哪怕生产环境中极端情况下，RocketMQ的TPS飙升到8万TPS，你知道机器资源也是大致可以抗下来的，不至于出现机器宕机的情况。
+
+​	所以我们做压测，其实最主要的是综合TPS以及机器负载，尽量找到一个最高的TPS同时机器的各项负载在可承受范围之内，这才是压测的目的。
+
+**压测测试样例：**
+
+（1）RocketMQ的TPS和消息延时
+
+​	两个Producer不停的往RocketMQ集群发送消息，每个Producer所在机器启动了80个线程，相当于每台机器有80个线程并发的往RocketMQ集群写入消息。
+
+​	而RocketMQ集群是1主2从组成的一个dledger模式的高可用集群，只有一个Master Broker会接收消息的写入。
+
+​	然后有2个Cosumer不停的从RocketMQ集群消费数据。
+
+​	每条数据的大小是500个字节，**这个非常关键**，因为这个数字是跟后续的网卡流量有关的。
+
+​	一条消息从Producer生产出来到经过RocketMQ的Broker存储下来，再到被Consumer消费，基本上这个时间跨度不会超过1秒钟，这些这个性能是正常而且可以接受的。
+
+​	同时在RocketMQ的管理工作台中可以看到，Master Broker的TPS（也就是每秒处理消息的数量），可以稳定的达到7万左右，也就是每秒可以稳定处理7万消息。
+
+（2）cpu负载情况
+
+​	可以通过top、uptime等命令来查看
+
+​	比如执行top命令就可以看到cpu load和cpu使用率，这就代表了cpu的负载情况。
+
+​	在你执行了top命令之后，往往可以看到如下一行信息：
+
+​	load average：12.03，12.05，12.08
+
+​	类似上面那行信息代表的是cpu在1分钟、5分钟和15分钟内的cpu负载情况
+
+​	比如我们一台机器是24核的，那么上面的12意思就是有12个核在使用中。换言之就是还有12个核其实还没使用，cpu还是有很大余力的。
+
+（3）内存使用率
+
+​	free命令就可以查看到内存的使用率，根据当时的测试结果，机器上48G的内存，仅仅使用了一部分，还剩下很大一部分内存都是空闲可用的，或者是被RocketMQ用来进行磁盘数据缓存了。所以内存负载是很低的。
+
+（4）JVM GC频率
+
+​	使用jstat命令就可以查看RocketMQ的JVM的GC频率，基本上新生代每隔几十秒会垃圾回收一次，每次回收过后存活的对象很少，几乎不进入老年代
+
+​	因此测试过程中，Full GC几乎一次都没有。
+
+（5）磁盘IO负载
+
+​	可以用top命令查看一下IO等待占用CPU时间的百分比，你执行top命令之后，会看到一行类似下面的东西：
+
+​	Cpu(s): 0.3% us, 0.3% sy, 0.0% ni, 76.7% id, 13.2% wa, 0.0% hi, 0.0% si。
+
+​	在这里的13.2% wa，说的就是磁盘IO等待在CPU执行时间中的百分比
+
+​	如果这个比例太高，说明CPU执行的时候大部分时间都在等待执行IO，也就说明IO负载很高，导致大量的IO等待。
+
+​	这个当时我们压测的时候，是在40%左右，说明IO等待时间占用CPU执行时间的比例在40%左右，这是相对高一些，但还是可以接受的，只不过如果继续让这个比例提高上去，就很不靠谱了，因为说明磁盘IO负载可能过高了。
+
+（6）网卡流量
+
+使用如下命令可以查看服务器的网卡流量：
+
+```sh
+sar -n DEV 1 2
+#通过这个命令就可以看到每秒钟网卡读写数据量了。当时我们的服务器使用的是千兆网卡，千兆网卡的理论上限是每秒传输128M数据，但是一般实际最大值是每秒传输100M数据。
+
+#因此当时我们发现的一个问题就是，在RocketMQ处理到每秒7万消息的时候，每条消息500字节左右的大小的情况下，每秒网卡传输数据量已经达到100M了，就是已经达到了网卡的一个极限值了。
+#因为一个Master Broker服务器，每秒不光是通过网络接收你写入的数据，还要把数据同步给两个Slave Broker，还有别的一些网络通信开销。
+#因此实际压测发现，每条消息500字节，每秒7万消息的时候，服务器的网卡就几乎打满了，无法承载更多的消息了。
+```
+
+![image-20220121172101586](中间件专栏(RockerMq).assets/image-20220121172101586.png)
+
+**压测样例总结：**
+
+​	最后针对本次压测做一点小的总结，实际上经过压测，最终发现我们的服务器的性能瓶颈在网卡上，因为网卡每秒能传输的数据是有限的
+
+​	因此当我们使用平均大小为500字节的消息时，最多就是做到RocketMQ单台服务器每秒7万的TPS，而且这个时候cpu负载、内存负载、jvm gc负载、磁盘io负载，基本都还在正常范围内。
+
+​	只不过这个时候网卡流量基本已经打满了，无法再提升TPS了。
+
+​	因此在这样的一个机器配置下，RocketMQ一个比较靠谱的TPS就是7万左右
+
+**总结**
+
+1. 到底应该如何压测：应该在TPS和机器的cpu负载、内存使用率、jvm gc频率、磁盘io负载、网络流量负载之间取得一个平衡，尽量让TPS尽可能的提高，同时让机器的各项资源负载不要太高。
+2. 实际压测过程：采用几台机器开启大量线程并发读写消息，然后观察TPS、cpu load（使用top命令）、内存使用率（使用free命令）、jvm gc频率（使用jstat命令）、磁盘io负载（使用top命令）、网卡流量负载（使用sar命令），不断增加机器和线程，让TPS不断提升上去，同时观察各项资源负载是否过高。
+3. 生产集群规划：根据公司的后台整体QPS来定，稍微多冗余部署一些机器即可，实际部署生产环境的集群时，使用高配置物理机，同时合理调整os内核参数、jvm参数、中间件核心参数，如此即可
+
+# 5 基于RocketMq改造订单系统
+
+## 5.1 基于MQ实现订单系统的核心流程异步化改造
+
+订单系统面临的技术问题包括以下一些环节：
+
+1. 下单核心流程环节太多，性能较差
+2. 订单退款的流程可能面临退款失败的风险
+3. 关闭过期订单的时候，存在扫描大量订单数据的问题
+4. 跟第三方物流系统耦合在一起，性能存在抖动的风险
+5. 大数据团队要获取订单数据，存在不规范直接查询订单数据库的问题
+6. 做秒杀活动时订单数据库压力过大
+
+在订单系统中引入MQ技术来实现订单核心流程中的部分环节的异步化改造
+
+支付完一个订单后，都需要执行一系列的动作，包括：
+
+- 更新订单状态
+- 扣减库存
+- 增加积分
+- 发优惠券
+- 发短信
+- 通知发货
+
+订单核心流程的改造图
+
+![image-20220124150601743](中间件专栏(RockerMq).assets/image-20220124150601743.png)
+
+**PS:集群部署的话，Topic是一个逻辑上的概念，实际上他的数据是分布式存储在多个Master Broker中的**
+
+**思考：**
+
+​	谓的核心链路，不是说查询链路，即并不是一次请求全部是查询。而是说的是数据更新链路，即一次请求过后会对你的各种核心数据进行更新，同时还会调用其他服务或者系统进行数据更新或者查询，这样的一个链路叫做系统的核心链路。
+
+​	有没有可能引入MQ技术把一些耗时的步骤做成异步化的方式，来优化核心数据链路的性能？
+
+​	如果可以的话，你应该如何设计这个技术方案？哪些环节同步执行？哪些环节要异步执行？
+
+## 5.2 基于MQ实现订单系统的第三方系统异步对接改造
+
+实际上订单系统现在已经不需要直接调用推送系统和仓储系统了，仅仅只是发送一个消息到RocketMQ而已
+
+![image-20220125163847148](中间件专栏(RockerMq).assets/image-20220125163847148.png)
+
+问题：
+
+​	系统是否跟第三方系统存在耦合的问题？尤其是在核心数据链路中，是否存在因为耦合了第三方系统导致性能经常出现抖动的问题？
+
+​	能否在核心链路中引入MQ来跟第三方系统进行解耦？如果解耦之后能对你们核心链路的性能有多高的提升？
+
+​	Kafka和RabbitMQ在使用的时候，有几种消息发送模式？有几种消息消费模式？
+
+​	系统如果使用了MQ技术的话，那么你们平时使用的哪种消息发送模式？你们平时使用的是哪种消息消费模式？为什么？
+
+​	几种消息发送模式下，在什么场景应该选用什么消息发送模式？几种消息消费模式下，在什么场景下应该选用什么消息消费模式？
+
+## 5.3 基于MQ实现订单数据同步给大数据团队
+
+**问题：**订单系统应该如何将订单数据发送到RocketMQ里去呢？
+
+**方案1：**
+
+​	比较简单的办法，就是在订单系统中但凡对订单执行增删改类的操作，就把这种对订单增删改的操作发送到RocketMQ里去。
+
+​	但是这种方案的一个问题就是订单系统为了将数据同步给大数据团队，必须在自己的代码里耦合大量的代码去发送增删改操作到RocketMQ，这会导致订单系统的代码出现严重的污染，因为这些发送增删改操作到RocketMQ里的代码是跟订单业务没关系的。
+
+**方案2：**
+
+​	**就是用Canal、Databus这样的MySQL Binlog同步系统，监听订单数据库的binlog发送到RocketMQ里**
+
+​	然后大数据团队的数据同步系统从RocketMQ里获取订单数据的增删改binlog日志，还原到自己的数据存储中去，可以是自己的数据库，或者是Hadoop之类的大数据生态技术。
+
+​	然后大数据团队将完整的订单数据还原到自己的数据存储中，就可以根据自己的技术能力去出数据报表了，不会再影响订单系统的数据库了。
+
+**Canal：**译意为水道/管道/沟渠，主要用途是基于 **MySQL 数据库增量日志解析**，提供**增量数据订阅和消费**。
+
+​		https://blog.csdn.net/yehongzhi1994/article/details/107880162
+
+**Databus：**是一个实时的低延时数据抓取系统。它将数据库作为唯一真实数据来源，并将变更从事务或提交日志中提取出来，然后通知相关的衍生数据库或缓存。
+
+​		https://blog.csdn.net/acm_lkl/article/details/78645406
+
+**问题：**是否有可能有其他团队需要从你这里获取数据？如果要从你这里获取数据，你又应该如何设计数据同步方案？
+
+## 5.4 秒杀系统的技术难点以及秒杀商品详情页系统的架构设计
+
+**PS:类似亿级流量的模式**
+
+**第一个问题**，秒杀活动目前压力过大，应该如何解决？是不是简单的堆机器或者加机器就可以解决的？
+
+**第二个问题**，那么数据库呢？是不是也要部署更多的服务器，进行分库分表，然后让更多的数据库服务器来抗超高的数据库高并发访问？
+
+​	如果用堆机器的方法来解决这个问题，必然存在一个问题，就是随着你的用户量越来越大，你的并发请求越来越多，会导致你要不停的增加更多的机器，所以解决问题往往不能用这种简单粗暴堆机器的方案！
+
+**方案：**
+
+​	秒杀活动主要涉及到的并发压力就是两块，**一个是高并发的读，一个是高并发的写。**
+
+​	1 **页面数据静态化+多级缓存**
+
+​	2 多级缓存的架构，我们会使用**CDN + Nginx + Redis**的多级缓存架构
+
+![image-20220125172735742](中间件专栏(RockerMq).assets/image-20220125172735742.png)
+
+问题：
+
+​	**你们有没有类似秒杀的业务场景？如果没有，自己想一个出来！例子，比如说一个考勤系统，可能每天就是早上上班时间并发访问量特别的大，或者是工资系统，每个月到发工资的时候公司发短信提醒了员工，马上大量的人登录上来进行查询。**
+
+## 5.5 基于MQ实现秒杀订单系统的异步化架构以及精准扣减库存的技术方案
+
+
+
+1. 在前端/客户端设置秒杀答题，错开大量人下单的时间，阻止作弊器刷单
+2. 独立出来一套秒杀系统，专门负责处理秒杀请求
+3. 优先基于Redis进行高并发的库存扣减，一旦库存扣完则秒杀结束
+4. 秒杀结束之后，Nginx层过滤掉无效的请求，大幅度削减转发到后端的流量
+5. 瞬时生成的大量下单请求直接进入RocketMQ进行削峰，订单系统慢慢拉取消息完成下单操作
+
+
+
+对于瞬时超高并发抢购商品的场景，**首先必须要避免直接基于数据库进行高并发的库存扣减**，因为那样会对库存数据库造成过大的压力
+
+问题：那么在你的系统中如果要应对瞬时超高并发，应该怎么处理？应该如何设计架构来抗下瞬时超高的并发？
+
+## 5.6 MQ的订单系统架构阶段总结
+
+![image-20220209165145721](中间件专栏(RockerMq).assets/image-20220209165145721.png)
+
+# 6 RocketMq核心原理
+
+## 6.1 深入研究一下生产者到底如何发送消息的
+
+**MessageQueue**
+
+​	**在创建Topic的时候需要指定一个很关键的参数，就是MessageQueue**。
+
+​	RocketMQ引入了MessageQueue的概念，本质上就是一个数据分片的机制。
+
+​	假设你的Topic有1万条数据，然后你的Topic有4个MessageQueue，那么大致可以认为会在每个MessageQueue中放入2500条数据
+
+​	当然，这个不是绝对的，有可能有的MessageQueue的数据多，有的数据少，这个要根据你的消息写入MessageQueue的策略来定。
+
+​	可能就是在2个Broker上，每个Broker放两个MessageQueue
+
+​	总结：**MessageQueue就是RocketMQ中非常关键的一个数据分片机制，他通过MessageQueue将一个Topic的数据拆分为了很多个数据分片，然后在每个Broker机器上都存储一些MessageQueue**。通过这个方法，就可以实现Topic数据的分布式存储
+
+![image-20220210172949270](中间件专栏(RockerMq).assets/image-20220210172949270.png)
+
+**sendLatencyFaultEnable**
+
+​	一旦打开了这个开关，那么他会有一个**自动容错机制**，比如如果某次访问一个Broker发现网络延迟有500ms，然后还**无法访问**，那么就会**自动回避访问这个Broker一段时间**，比如接下来3000ms内，就不会访问这个Broker了。
+
+​	这样的话，就可以避免一个Broker故障之后，短时间内生产者频繁的发送消息到这个故障的Broker上去，出现较多次数的异常。而是在一个Broker故障之后，自动回避一段时间不要访问这个Broker，过段时间再去访问他。
+
+​	那么这样过一段时间之后，可能这个Master Broker就已经恢复好了，比如他的Slave Broker切换为了Master可以让别人访问了。
+
+问题：
+
+- Kafka、RabbitMQ他们有类似的数据分片机制吗？
+- 他们是如何把一个逻辑上的数据集合概念（比如一个Topic）给在物理上拆分为多个数据分片的？
+- 拆分后的多个数据分片又是如何在物理的多台机器上分布式存储的？
+- 为什么一定要让MQ实现数据分片的机制？
+- 如果不实现数据分片机制，让你来设计MQ中一个数据集合的分布式存储，你觉得好设计吗？
+
+## 6.2 深入研究一下Broker是如何持久化存储消息的
+
+​	**Broker数据存储实际上才是一个MQ最核心的环节**，他决定了生产者消息写入的吞吐量，决定了消息不能丢失，决定了消费者获取消息的吞吐量，这些都是由他决定的。
+
+**CommitLog消息顺序写入机制**
+
+​	**生产者的消息发送到一个Broker**上的时候，他会把这个**消息直接写入磁盘上的一个日志文件，叫做CommitLog，直接顺序写入这个**文件
+
+​	这个CommitLog是很多磁盘文件，每个文件限定最多1GB，Broker收到消息之后就直接追加写入这个文件的末尾，就跟上面的图里一样。如果一个CommitLog写满了1GB，就会创建一个新的CommitLog文件
+
+**MessageQueue在数据存储**
+
+​	ConsumeQueue中存储的每条数据不只是消息在CommitLog中的offset偏移量，还包含了消息的长度，以及tag hashcode，一条数据是20个字节，每个ConsumeQueue文件保存30万条数据，大概每个文件是5.72MB。
+
+​	所以实际上**Topic的每个MessageQueue都对应了Broker机器上的多个ConsumeQueue文件，保存了这个MessageQueue的所有消息在CommitLog文件中的物理位置，也就是offset偏移量**。
+
+![image-20220211171407712](中间件专栏(RockerMq).assets/image-20220211171407712.png)
+
+**同步刷盘与异步刷盘**
+
+​	**异步刷盘：**
+
+​	Broker是基于OS操作系统的**PageCache**和**顺序写**两个机制，来提升写入CommitLog文件的性能的
+
+​	数据写入CommitLog文件的时候，其实不是直接写入底层的物理磁盘文件的，而是先进入OS的PageCache内存缓存中，然后后续由OS的后台线程选一个时间，异步化的将OS PageCache内存缓冲中的数据刷入底层的磁盘文件
+
+​	用**磁盘文件顺序写+OS PageCache写入+OS异步刷盘的策略**，基本上可以让消息写入CommitLog的性能跟你直接写入内存里是差不多的，所以正是如此，才可以让Broker高吞吐的处理每秒大量的消息写入
+
+​	缺点：如果生产者认为消息写入成功了，但是实际上那条消息此时是在Broker机器上的os cache中的，如果此时Broker直接宕机，那么是不是os cache中的这条数据就会丢失了
+
+​	**同步刷盘：**
+
+​	使用同步刷盘模式的话，那么生产者发送一条消息出去，broker收到了消息，必须直接强制把这个消息刷入底层的物理磁盘文件中，然后才会返回ack给producer，此时你才知道消息写入成功了
+
+​	优缺点：如果你强制每次消息写入都要直接进入磁盘中，必然导致每条消息写入性能急剧下降，导致消息写入吞吐量急剧下降，但是可以保证数据不会丢失
+
+问题：
+
+​		**同步刷盘和异步刷盘两种策略，分别适用于什么不同的场景呢？**
+
+## 6.3 基于DLedger技术的Broker主从同步原理
+
+**基于DLedger技术替换Broker的CommitLog**
+
+​	基于DLedger技术来实现Broker高可用架构，实际上就是用DLedger先替换掉原来Broker自己管理的CommitLog，由DLedger来管理CommitLog
+
+​	然后Broker还是可以基于DLedger管理的CommitLog去构建出来机器上的各个ConsumeQueue磁盘文件
+
+**Raft协议选举Leader Broker**
+
+​	发起多伦的投票，通过三台机器互相投票选出来一个人作为Leader
+
+​	**确保有人可以成为Leader的核心机制就是一轮选举不出来Leader的话，就让大家随机休眠一下，先苏醒过来的人会投票给自己，其他人苏醒过后发现自己收到选票了，就会直接投票给那个人**
+
+**基于Raft协议进行多副本同步**
+
+​	**数据同步会分为两个阶段，一个是uncommitted阶段，一个是commited阶段**
+
+​	Leader Broker上的DLedger收到一条数据之后，会标记为uncommitted状态，然后他会通过自己的DLedgerServer组件把这个uncommitted数据发送给Follower Broker的DLedgerServer。
+
+​	接着Follower Broker的DLedgerServer收到uncommitted消息之后，必须返回一个ack给Leader Broker的DLedgerServer，然后如果Leader Broker收到超过半数的Follower Broker返回ack之后，就会将消息标记为committed状态。
+
+​	然后Leader Broker上的DLedgerServer就会发送commited消息给Follower Broker机器的DLedgerServer，让他们也把消息标记为comitted状态
+
+**PS:如果Leader Broker挂了，此时剩下的两个Follower Broker就会重新发起选举，他们会基于DLedger还是采用Raft协议的算法，去选举出来一个新的Leader Broker继续对外提供服务，而且会对没有完成的数据同步进行一些恢复性的操作，保证数据不会丢失。**
+
+![image-20220211175444261](中间件专栏(RockerMq).assets/image-20220211175444261.png)
+
+问题：**采用Raft协议进行主从数据同步，会影响TPS吗？**
+
+问题概述：
+
+​	在Leader接收消息写入的时候，基于DLedger技术写入本地CommitLog中，这个其实跟之前让Broker自己直接写入CommitLog是没什么区别的。
+
+​	但是有区别的一点在于，Leader Broker上的DLedger在收到一个消息，将uncommitted消息写入自己本地存储之后，还需要基于Raft协议的算法，去采用两阶段的方式把uncommitted消息同步给其他Follower Broker
+
+## 6.4 深入研究一下消费者是如何获取消息处理以及进行ACK的
+
+
+
+
+
+
+
+
 
