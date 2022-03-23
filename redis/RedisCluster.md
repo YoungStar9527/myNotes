@@ -286,9 +286,41 @@ https://www.pianshen.com/article/4185403605/
 
 ## 4.1 知识扩展
 
-![image-20210525125856842](RedisCluster.assets/image-20210525125856842.png)
+**1、实验多master写入 -> 海量数据的分布式存储**
 
-![image-20210525125938333](RedisCluster.assets/image-20210525125938333.png)
+你在redis cluster写入数据的时候，其实是你可以将请求发送到任意一个master上去执行
+
+但是，每个master都会计算这个key对应的CRC16值，然后对16384个hashslot取模，找到key对应的hashslot，找到hashslot对应的master
+
+如果对应的master就在自己本地的话，set mykey1 v1，mykey1这个key对应的hashslot就在自己本地，那么自己就处理掉了
+
+但是如果计算出来的hashslot在其他master上，那么就会给客户端返回一个moved error，告诉你，你得到哪个master上去执行这条写入的命令
+
+什么叫做多master的写入，就是每条数据只能存在于一个master上，不同的master负责存储不同的数据，分布式的数据存储
+
+100w条数据，5个master，每个master就负责存储20w条数据，分布式数据存储
+
+大型的java系统架构，还专注在大数据系统架构，分布式，分布式存储，hadoop hdfs，分布式资源调度，hadoop yarn，分布式计算，hadoop mapreduce/hive
+
+分布式的nosql数据库，hbase，分布式的协调，zookeeper，分布式通用计算引擎，spark，分布式的实时计算引擎，storm
+
+如果你要处理海量数据，就涉及到了一个名词，叫做大数据，只要涉及到大数据，那么其实就会涉及到分布式
+
+redis cluster，分布式
+
+redis，高并发、高性能、每日上亿流量的大型电商网站的商品详情页系统的缓存架构，来讲解的，redis是作为大规模缓存架构中的底层的核心存储的支持 
+
+高并发、高性能、每日上亿流量，redis持久化 -> 灾难的时候，做数据恢复，复制 -> 读写分离，扩容slave，支撑更高的读吞吐，redis怎么支撑读QPS超过10万，几十万; 哨兵，在redis主从，一主多从，怎么保证99.99%可用性; redis cluster，海量数据
+
+redis AOF，fsync
+
+elasticsearch建立索引的时候，先写内存缓存，每秒钟把数据刷入os cache，接下来再每隔一定时间fsync到磁盘上去
+
+redis cluster，写可以到任意master，任意master计算key的hashslot以后，告诉client，重定向，路由到其他mater去执行，分布式存储的一个经典的做法
+
+elasticsearch，建立索引的时候，也会根据doc id/routing value，做路由，路由到某个其他节点，重定向到其他节点去执行
+
+分布式的一些，hadoop，spark，storm里面很多核心的思想都是类似的
 
 ## 4.2 不同master的读写操作
 
@@ -313,13 +345,45 @@ redis-cli -h 192.168.31.103 -p 7006 -c
 
 ## 4.2.2 思路及扩展
 
-![image-20210525141700628](RedisCluster.assets/image-20210525141700628.png)
+实验redis cluster的读写分离的时候，会发现有一定的限制性，默认情况下，redis cluster的核心的理念，主要是用slave做高可用的，每个master挂一两个slave，主要是做数据的热备，还有master故障时的主备切换，实现高可用的
 
-![image-20210525141731149](RedisCluster.assets/image-20210525141731149.png)
+redis cluster默认是不支持slave节点读或者写的，跟我们手动基于replication搭建的主从架构不一样的
 
-**PS:下图实验，经过验证是可以实现的。通过redis-cli --cluster check 命令可以查看自动切换状态，是否成功恢复等信息**
+slave node，readonly，get，这个时候才能在slave node进行读取
 
-![image-20210525141819179](RedisCluster.assets/image-20210525141819179.png)
+redis cluster，主从架构是出来，读写分离，复杂了点，也可以做，jedis客户端，对redis cluster的读写分离支持不太好的
+
+默认的话就是读和写都到master上去执行的
+
+如果你要让最流行的jedis做redis cluster的读写分离的访问，那可能还得自己修改一点jedis的源码，成本比较高
+
+要不然你就是自己基于jedis，封装一下，自己做一个redis cluster的读写分离的访问api
+
+核心的思路，就是说，redis cluster的时候，就没有所谓的读写分离的概念了
+
+读写分离，是为了什么，主要是因为要建立一主多从的架构，才能横向任意扩展slave node去支撑更大的读吞吐量
+
+redis cluster的架构下，实际上本身master就是可以任意扩展的，你如果要支撑更大的读吞吐量，或者写吞吐量，或者数据量，都可以直接对master进行横向扩展就可以了
+
+也可以实现支撑更高的读吞吐的效果
+
+不会去跟大家直接讲解的，很多东西都要带着一些疑问，未知，实际经过一些实验和操作之后，让你体会的更加深刻一些
+
+redis cluster，主从架构，读写分离，没说错，没有撒谎
+
+redis cluster，不太好，server层面，jedis client层面，对master做扩容，所以说扩容master，跟之前扩容slave，效果是一样的
+
+**PS:下列实验，经过验证是可以实现的。通过redis-cli --cluster check 命令可以查看自动切换状态，是否成功恢复等信息**
+
+**实验自动故障切换 -> 高可用性**
+
+redis-trib.rb check 192.168.31.187:7001
+
+比如把master1，187:7001，杀掉，看看它对应的19:7004能不能自动切换成master，可以自动切换
+
+切换成master后的19:7004，可以直接读取数据
+
+再试着把187:7001给重新启动，恢复过来，自动作为slave挂载到了19:7004上面去
 
 **PS:redis clusert配置好之后，相关的信息都在node.conf的对应文件中，如果配置错误，或者误操作导致node.conf文件生成错误信息，需要删除node.conf文件，然后重新使用redis-cli --cluster create的命令来生成node.conf相关信息**
 
@@ -406,7 +470,7 @@ redis-cli --cluster del-node 192.168.31.101:7001 be4666507e38a9845a2556feec6de52
 
 ### 5.1.1 基础通信原理
 
-**1 rediss cluster节点间采取gossip协议进行通信**
+**1 redis cluster节点间采取gossip协议进行通信**
 
 ​	跟集中式不同，不是将集群元数据(节点信息，故障等等)集中存储在某个节点上，而是互相之间不断通信，保持整个集群所有节点的数据是完整的
 
